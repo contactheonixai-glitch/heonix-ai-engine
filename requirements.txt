@@ -1,8 +1,61 @@
-# HEONIX Ultra Engine v5.0 — Python Dependencies
-# Install: pip install -r requirements.txt
+# HEONIX Ultra Engine v8.0 — Requirements
+# Silicon Valley Enterprise Edition
 
-flask==3.0.3
-flask-limiter==3.7.0
-google-generativeai==0.7.2
-requests==2.32.3
-gunicorn==21.2.0
+# ══════════════════════════════════════════════════════
+# CORE FRAMEWORK
+# ══════════════════════════════════════════════════════
+flask>=3.0.0
+flask-cors>=4.0.0
+flask-limiter>=3.5.0
+pydantic>=2.5.0
+requests>=2.31.0
+gunicorn>=21.2.0           # Production WSGI server
+
+# ══════════════════════════════════════════════════════
+# DATABASE — PostgreSQL + Read Replica (FIX #4)
+# ══════════════════════════════════════════════════════
+psycopg2-binary>=2.9.9     # PostgreSQL driver (binary = no C compiler needed)
+# asyncpg>=0.29.0          # Uncomment for async FastAPI migration
+
+# ══════════════════════════════════════════════════════
+# DISTRIBUTED CACHE — Redis
+# ══════════════════════════════════════════════════════
+redis>=5.0.0               # Redis client (Upstash / Redis Cloud compatible)
+
+# ══════════════════════════════════════════════════════
+# AI PROVIDERS — Multi-fallback chain
+# ══════════════════════════════════════════════════════
+google-generativeai>=0.7.0  # Gemini (Primary)
+openai>=1.35.0              # OpenAI GPT-4o (Fallback #1)
+anthropic>=0.29.0           # Anthropic Claude (Fallback #2)
+
+# ══════════════════════════════════════════════════════
+# SECURITY
+# ══════════════════════════════════════════════════════
+cryptography>=42.0.0        # AES-256-GCM PII encryption (DPDP/HIPAA/GDPR)
+PyJWT>=2.8.0                # JWT token auth + RBAC
+bcrypt>=4.1.0               # v8 FIX #7: secure password hashing (replaces plaintext)
+
+# ══════════════════════════════════════════════════════
+# DEPLOYMENT NOTES
+# ══════════════════════════════════════════════════════
+# Install:
+#   pip install -r requirements_v8.txt
+#
+# Production WSGI (Render / Railway / Fly.io / AWS ECS):
+#   gunicorn heonix_ultra_engine_v8:app \
+#     --workers 4 \
+#     --threads 2 \
+#     --bind 0.0.0.0:$PORT \
+#     --timeout 60 \
+#     --graceful-timeout 30 \
+#     --access-logfile - \
+#     --log-level info
+#
+# Kubernetes: set terminationGracePeriodSeconds=30 so SIGTERM drain completes.
+#
+# Required env vars (minimum for production):
+#   DATABASE_URL, ENCRYPTION_KEY, JWT_SECRET_KEY, SECRET_KEY
+#   At least one AI key: GENAI_API_KEY or OPENAI_API_KEY or ANTHROPIC_API_KEY
+#   WHATSAPP_TOKEN + WHATSAPP_PHONE_ID (for WhatsApp features)
+#   REDIS_URL (for distributed cache + distributed rate limiting)
