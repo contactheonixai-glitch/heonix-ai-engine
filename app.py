@@ -1937,7 +1937,7 @@ def whatsapp_webhook():
                 (from_phone, True if isinstance(_db_pool, PostgreSQLPool) else 1))
             row = cur.fetchone()
 
-      if not row:
+        if not row:
             log.info(f"👑 CEO Bypass Activated for: {from_phone}")
             customer_id = make_customer_id("CEO Haroon")
             ceo_prompt = (
