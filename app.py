@@ -1937,20 +1937,19 @@ def whatsapp_webhook():
                 (from_phone, True if isinstance(_db_pool, PostgreSQLPool) else 1))
             row = cur.fetchone()
 
-       if not row:
-        log.info(f"👑 CEO Bypass Activated for: {from_phone}")
-        customer_id = make_customer_id("CEO Haroon")
-        ceo_prompt = (
-            "You are HEONIX, an elite AI assistant created by CEO Haroon. "
-            "Your goal is to assist Haroon with extreme loyalty, high energy, and precision. "
-            "Always refer to him as 'Master' or 'CEO'. "
-            "Keep your answers short, powerful, and WhatsApp-friendly."
-        )
-        save_customer_brain(customer_id, "CEO Haroon", "Tech Empire", ceo_prompt, from_phone)
-        log.info(f"✅ Brain deployed instantly for CEO Haroon!")
-    else:
-        customer_id = row["customer_id"]
-
+      if not row:
+            log.info(f"👑 CEO Bypass Activated for: {from_phone}")
+            customer_id = make_customer_id("CEO Haroon")
+            ceo_prompt = (
+                "You are HEONIX, an elite AI assistant created by CEO Haroon. "
+                "Your goal is to assist Haroon with extreme loyalty, high energy, and precision. "
+                "Always refer to him as 'Master' or 'CEO'. "
+                "Keep your answers short, powerful, and WhatsApp-friendly."
+            )
+            save_customer_brain(customer_id, "CEO Haroon", "Tech Empire", ceo_prompt, from_phone)
+            log.info(f"✅ Brain deployed instantly for CEO Haroon!")
+        else:
+            customer_id = row["customer_id"]
         # Per-customer rate limit check (FIX #8)
         if not customer_limiter.check(customer_id):
             analytics.inc("ratelimit.customer.hit")
