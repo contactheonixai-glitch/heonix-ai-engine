@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║          HEONIX ULTRA ENGINE  v8.0 — SILICON VALLEY ENTERPRISE EDITION     ║
+║     HEONIX ULTRA ENGINE  v11.0 — PRODUCTION-HARDENED (all 15 v10 gaps)     ║
 ║                                                                              ║
 ║  v7 DRAWBACKS RESOLVED IN v8:                                                ║
 ║  ✅ FIX #1  → Modular layer architecture (no more single-file chaos)        ║
@@ -27,6 +27,17 @@
 ║  ◆ Official Meta WhatsApp Cloud API                                          ║
 ║  ◆ Idempotency keys                                                          ║
 ║  ◆ Circuit breakers per AI provider                                          ║
+║                                                                              ║
+║  v10 GOD-LOGIC ADDITIONS (god_logic_v9 merged + drawbacks fixed):            ║
+║  ◆ Instagram Messaging channel — same brain, CRM, memory as WhatsApp        ║
+║  ◆ Voice-note decoder: WA/IG audio → Gemini → Whisper fallback              ║
+║  ◆ Qdrant RAG long-term memory per end-user (AES-256 encrypted payloads)    ║
+║  ◆ Cost optimizer: trivial msgs answered locally in 10 languages, ₹0 API    ║
+║  ◆ Redis-backed response cache + ghost mode (multi-worker safe)             ║
+║  ◆ Webhook de-duplication (Meta retries no longer cause double replies)     ║
+║  ◆ Emergency / human-handoff / VIP routing: keywords + AI escalation token  ║
+║  ◆ Languages: script auto-detect; AI replies in ANY language user writes    ║
+║  ◆ Meta Graph v21.0 + Gemini 2.5 (v8 defaults were shut down by vendors)    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 ENVIRONMENT VARIABLES:
@@ -43,7 +54,7 @@ ENVIRONMENT VARIABLES:
   GENAI_API_KEY         = Google Gemini API key
   OPENAI_API_KEY        = OpenAI GPT-4 API key
   ANTHROPIC_API_KEY     = Anthropic Claude API key
-  GEMINI_MODEL          = gemini-1.5-flash
+  GEMINI_MODEL          = gemini-3.1-flash-lite
   OPENAI_MODEL          = gpt-4o-mini
   ANTHROPIC_MODEL       = claude-haiku-4-5-20251001
   AI_MAX_TOKENS         = 1000
@@ -78,6 +89,20 @@ ENVIRONMENT VARIABLES:
   RATE_LIMIT_DEFAULT    = 200 per minute
   CACHE_TTL             = 600
   CHAT_HISTORY_LIMIT    = 20
+
+  ── v10 ADDITIONS ─────────────────────────────────────────────────────────────
+  GRAPH_API_VERSION     = v21.0   (Meta deprecates old versions — keep current)
+  INSTAGRAM_TOKEN       = Page/IG access token with instagram_manage_messages
+  INSTAGRAM_ID          = IG business account id (the recipient.id in webhooks)
+  INSTAGRAM_APP_SECRET  = optional; falls back to WHATSAPP_APP_SECRET
+  QDRANT_URL            = https://xxxx.cloud.qdrant.io  (Qdrant Cloud free tier OK)
+  QDRANT_API_KEY        = Qdrant Cloud API key
+  EMBED_MODEL           = models/gemini-embedding-001
+  EMBED_DIMS            = 768
+  RAG_TOP_K             = 3        RAG_MIN_SCORE = 0.55
+  GHOST_MUTE_SECONDS    = 900   (AI silence after human takeover)
+  RESPONSE_CACHE_TTL    = 900   (identical-question reuse; Redis-backed)
+  OPENAI_TRANSCRIBE_MODEL = whisper-1  (voice fallback if Gemini audio fails)
 """
 
 from __future__ import annotations
@@ -89,6 +114,7 @@ import base64
 import functools
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
@@ -99,8 +125,10 @@ import signal
 import sqlite3
 import threading
 import time
+import unicodedata
 import uuid
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor   # v11 #1/#11: bounded async workers
 from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
@@ -166,6 +194,13 @@ try:
 except ImportError:
     CLAUDE_AVAILABLE = False
 
+try:
+    from qdrant_client import QdrantClient
+    from qdrant_client.http import models as qmodels
+    QDRANT_AVAILABLE = True
+except ImportError:
+    QDRANT_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ⚙️  CONFIGURATION  (v8: adds replica URL, region tag, analytics toggle)
@@ -184,7 +219,9 @@ class Config:
     ANTHROPIC_API_KEY: str      = os.getenv("ANTHROPIC_API_KEY", "")
 
     # ── AI Models ──
-    GEMINI_MODEL: str           = os.getenv("GEMINI_MODEL",    "gemini-1.5-flash")
+    GEMINI_MODEL: str           = os.getenv("GEMINI_MODEL",    "gemini-3.1-flash-lite")  # v11 #5: 2.5-flash retiring 2026; lite = 6x cheaper, chatbot-tuned
+    # Per-customer premium model: pass plan_tier="premium" → uses GEMINI_MODEL_PREMIUM.
+    GEMINI_MODEL_PREMIUM: str   = os.getenv("GEMINI_MODEL_PREMIUM", "gemini-3.5-flash")   # only worth it for tool-heavy/agentic clients
     OPENAI_MODEL: str           = os.getenv("OPENAI_MODEL",    "gpt-4o-mini")
     ANTHROPIC_MODEL: str        = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
     AI_MAX_TOKENS: int          = int(os.getenv("AI_MAX_TOKENS", "1000"))
@@ -195,6 +232,12 @@ class Config:
     WHATSAPP_PHONE_ID: str      = os.getenv("WHATSAPP_PHONE_ID", "")
     WHATSAPP_VERIFY_TOKEN: str  = os.getenv("WHATSAPP_VERIFY_TOKEN", "heonix_verify")
     WHATSAPP_APP_SECRET: str    = os.getenv("WHATSAPP_APP_SECRET", "")
+    GRAPH_API_VERSION: str      = os.getenv("GRAPH_API_VERSION", "v21.0")   # v10
+
+    # ── Instagram Messaging API (v10) ──
+    INSTAGRAM_TOKEN: str        = os.getenv("INSTAGRAM_TOKEN", "")
+    INSTAGRAM_ID: str           = os.getenv("INSTAGRAM_ID", "")            # IG business account id
+    INSTAGRAM_APP_SECRET: str   = os.getenv("INSTAGRAM_APP_SECRET", "")    # fallback: WHATSAPP_APP_SECRET
 
     # ── Redis ──
     REDIS_URL: str              = os.getenv("REDIS_URL", "")
@@ -232,6 +275,30 @@ class Config:
     PORT: int                   = int(os.getenv("PORT", "5000"))
     DEBUG: bool                 = os.getenv("DEBUG", "false").lower() == "true"
 
+    # ── v10: God-Logic / RAG / Voice ──
+    GHOST_MUTE_SECONDS: int     = int(os.getenv("GHOST_MUTE_SECONDS", "900"))
+    RESPONSE_CACHE_TTL: int     = int(os.getenv("RESPONSE_CACHE_TTL", "900"))
+    QDRANT_URL: str             = os.getenv("QDRANT_URL", "")
+    QDRANT_API_KEY: str         = os.getenv("QDRANT_API_KEY", "")
+    QDRANT_COLLECTION: str      = os.getenv("QDRANT_COLLECTION", "heonix_memory")
+    EMBED_MODEL: str            = os.getenv("EMBED_MODEL", "models/gemini-embedding-001")
+    EMBED_DIMS: int             = int(os.getenv("EMBED_DIMS", "768"))
+    RAG_TOP_K: int              = int(os.getenv("RAG_TOP_K", "3"))
+    RAG_MIN_SCORE: float        = float(os.getenv("RAG_MIN_SCORE", "0.55"))
+    OPENAI_TRANSCRIBE_MODEL: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
+
+    # ── v11 ──
+    # #4: free-form WhatsApp texts to the OWNER are blocked by Meta outside
+    # the 24-hour window (error 131047) — an emergency alert could silently
+    # die. Create ONE approved utility template with a single {{1}} body
+    # parameter (e.g. name it "heonix_owner_alert", body: "{{1}}") and set:
+    OWNER_ALERT_TEMPLATE: str      = os.getenv("OWNER_ALERT_TEMPLATE", "")
+    OWNER_ALERT_TEMPLATE_LANG: str = os.getenv("OWNER_ALERT_TEMPLATE_LANG", "en")
+    # #2: set STRICT_PROD=1 to REFUSE booting without Postgres + Redis
+    # (recommended once live — prevents the silent SQLite/in-process fallback
+    # that breaks dedupe + ghost-mute across gunicorn workers).
+    STRICT_PROD: bool              = os.getenv("STRICT_PROD", "0") == "1"
+
 
 cfg = Config()
 
@@ -256,24 +323,21 @@ class _JSONFormatter(logging.Formatter):
 def _build_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG if cfg.DEBUG else logging.INFO)
-    handler = logging.StreamHandler()
+    handler = logging.StreamHandler()   # v11 fix #12: stdout ONLY.
     fmt = _JSONFormatter() if cfg.LOG_FORMAT == "json" else logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     handler.setFormatter(fmt)
-    fh = logging.FileHandler("heonix_v8.log", encoding="utf-8")
-    fh.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    ))
+    # v11 fix #12: dropped FileHandler. On Render the disk is ephemeral, two
+    # workers fought over the same file, and it grew unbounded. Render/Railway/
+    # Fly all capture stdout, so that is the single source of truth.
     logger.addHandler(handler)
-    logger.addHandler(fh)
     logger.propagate = False
     return logger
 
 
-log = _build_logger("HEONIX_V8")
+log = _build_logger("HEONIX")   # v11 fix #15: was "HEONIX_V8"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -598,6 +662,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE TABLE IF NOT EXISTS crm_contacts (
     id             BIGSERIAL PRIMARY KEY,
     customer_id    TEXT NOT NULL REFERENCES customer_brains(customer_id) ON DELETE CASCADE,
+    phone_hash     TEXT DEFAULT '',
     enc_name       TEXT NOT NULL,
     enc_phone      TEXT NOT NULL,
     enc_email      TEXT DEFAULT '',
@@ -705,6 +770,7 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 CREATE TABLE IF NOT EXISTS crm_contacts (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id   TEXT NOT NULL,
+    phone_hash    TEXT DEFAULT '',
     enc_name      TEXT NOT NULL,
     enc_phone     TEXT NOT NULL,
     enc_email     TEXT DEFAULT '',
@@ -775,6 +841,82 @@ def init_db() -> None:
         else:
             conn.executescript(schema)
     log.info("🗄️  Database schema initialised.")
+
+
+def _migrate_v10() -> None:
+    """v10: add new customer_brains columns. Safe to run on every boot."""
+    for col in ("owner_phone TEXT DEFAULT ''",
+                "instagram_id TEXT DEFAULT ''",
+                "bot_name TEXT DEFAULT ''"):
+        try:
+            with _db_pool.get() as conn:
+                _execute(conn, f"ALTER TABLE customer_brains ADD COLUMN {col}")
+            log.info(f"🗄️  v10 migration: added {col.split()[0]}")
+        except Exception:
+            pass  # column already exists
+    try:
+        with _db_pool.get() as conn:
+            _execute(conn,
+                "CREATE INDEX IF NOT EXISTS idx_brain_ig "
+                "ON customer_brains(instagram_id)")
+    except Exception:
+        pass
+
+
+def _migrate_v11() -> None:
+    """v11: CRM phone_hash dedupe column + index. Idempotent on every boot.
+    #13: each statement runs in its own connection, so when two gunicorn
+    workers boot simultaneously, the loser's 'duplicate column' error is
+    swallowed and the schema is still correct. On Postgres we additionally
+    take an advisory lock so the backfill runs exactly once."""
+    is_pg = isinstance(_db_pool, PostgreSQLPool)
+    if is_pg:
+        try:
+            with _db_pool.get() as conn:
+                _execute(conn, "SELECT pg_advisory_lock(427011)")
+                try:
+                    _execute(conn, "ALTER TABLE crm_contacts "
+                                   "ADD COLUMN IF NOT EXISTS phone_hash TEXT DEFAULT ''")
+                    _execute(conn, "CREATE INDEX IF NOT EXISTS idx_crm_dedupe "
+                                   "ON crm_contacts(customer_id, phone_hash)")
+                finally:
+                    _execute(conn, "SELECT pg_advisory_unlock(427011)")
+        except Exception as exc:
+            log.warning(f"⚠️  v11 migration (pg) issue: {exc}")
+    else:
+        try:
+            with _db_pool.get() as conn:
+                _execute(conn, "ALTER TABLE crm_contacts ADD COLUMN phone_hash TEXT DEFAULT ''")
+            log.info("🗄️  v11 migration: added crm_contacts.phone_hash")
+        except Exception:
+            pass  # column already exists
+        try:
+            with _db_pool.get() as conn:
+                _execute(conn, "CREATE INDEX IF NOT EXISTS idx_crm_dedupe "
+                               "ON crm_contacts(customer_id, phone_hash)")
+        except Exception:
+            pass
+
+    # Best-effort backfill so pre-v11 rows participate in dedupe. Bounded,
+    # per-row fault-isolated, and skipped instantly when nothing needs it.
+    try:
+        with _db_pool.get() as conn:
+            cur = _execute(conn,
+                "SELECT id, customer_id, enc_phone FROM crm_contacts "
+                "WHERE phone_hash='' OR phone_hash IS NULL LIMIT 5000")
+            rows = cur.fetchall()
+        for r in rows:
+            try:
+                phone = pii_vault.decrypt(r["enc_phone"])
+                with _db_pool.get() as conn:
+                    _execute(conn, "UPDATE crm_contacts SET phone_hash=? WHERE id=?",
+                             (_crm_phone_hash(r["customer_id"], phone), r["id"]))
+            except Exception:
+                continue
+        if rows:
+            log.info(f"🗄️  v11 migration: backfilled phone_hash for {len(rows)} contacts")
+    except Exception as exc:
+        log.warning(f"⚠️  v11 backfill skipped: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -925,7 +1067,8 @@ class CircuitBreaker:
 _gemini_breaker   = CircuitBreaker("Gemini",   failure_threshold=5, reset_timeout=60.0)
 _openai_breaker   = CircuitBreaker("OpenAI",   failure_threshold=5, reset_timeout=60.0)
 _claude_breaker   = CircuitBreaker("Claude",   failure_threshold=5, reset_timeout=60.0)
-_whatsapp_breaker = CircuitBreaker("WhatsApp", failure_threshold=3, reset_timeout=30.0)
+_whatsapp_breaker  = CircuitBreaker("WhatsApp",  failure_threshold=3, reset_timeout=30.0)
+_instagram_breaker = CircuitBreaker("Instagram", failure_threshold=3, reset_timeout=30.0)  # v10
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1074,21 +1217,27 @@ def multi_ai_reply(
 # ─────────────────────────────────────────────────────────────────────────────
 # 📱  WHATSAPP CLOUD API  (Official Meta Business API)
 # ─────────────────────────────────────────────────────────────────────────────
-WHATSAPP_API_BASE = "https://graph.facebook.com/v19.0"
+WHATSAPP_API_BASE = f"https://graph.facebook.com/{cfg.GRAPH_API_VERSION}"  # v10: v19 → env (v21.0)
 _wa_session = requests.Session()  # Connection pooling for WA API calls
 
 
-def verify_whatsapp_signature(raw_body: bytes, signature_header: str) -> bool:
-    if not cfg.WHATSAPP_APP_SECRET:
+def verify_meta_signature(raw_body: bytes, signature_header: str,
+                          app_secret: str) -> bool:
+    """v10: shared by WhatsApp + Instagram webhooks (same X-Hub-Signature-256)."""
+    if not app_secret:
         return True  # Skip if secret not configured (dev mode)
     if not signature_header.startswith("sha256="):
         return False
     expected = "sha256=" + hmac.new(
-        cfg.WHATSAPP_APP_SECRET.encode("utf-8"),
+        app_secret.encode("utf-8"),
         raw_body,
         hashlib.sha256,
     ).hexdigest()
     return hmac.compare_digest(expected, signature_header)
+
+
+def verify_whatsapp_signature(raw_body: bytes, signature_header: str) -> bool:
+    return verify_meta_signature(raw_body, signature_header, cfg.WHATSAPP_APP_SECRET)
 
 
 def _wa_send_text(to_phone: str, message: str) -> Dict:
@@ -1109,8 +1258,37 @@ def _wa_send_text(to_phone: str, message: str) -> Dict:
         json=payload,
         timeout=15,
     )
+    if resp.status_code >= 400:
+        # v10: Meta says EXACTLY what is wrong. error.code 190 = expired token.
+        log.error(f"❌ WhatsApp send {resp.status_code} → {resp.text[:500]}")
     resp.raise_for_status()
     return resp.json()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🧵  BOUNDED BACKGROUND WORKER POOL  (v11 fix #1 + #11)
+#   Webhooks return 200 instantly; heavy work (AI call, voice transcription,
+#   outbound sends, RAG store) runs here. Bounded so a traffic burst can never
+#   spawn unlimited threads and OOM a 512 MB Render dyno. Was: a fresh
+#   threading.Thread per send/store (unbounded → thread explosion under load).
+# ─────────────────────────────────────────────────────────────────────────────
+_WORKER_POOL = ThreadPoolExecutor(
+    max_workers=int(os.getenv("WORKER_THREADS", "8")),
+    thread_name_prefix="heonix-bg",
+)
+
+
+def submit_bg(fn: Callable, *args, **kwargs) -> None:
+    """Fire-and-forget onto the bounded pool. Never raises into the caller.
+    If the pool is shutting down (SIGTERM in flight), runs inline as a fallback
+    so an in-progress reply is never silently dropped."""
+    try:
+        _WORKER_POOL.submit(fn, *args, **kwargs)
+    except RuntimeError:
+        try:
+            fn(*args, **kwargs)
+        except Exception as exc:
+            log.error(f"❌ inline bg fallback failed: {exc}")
 
 
 def send_whatsapp_async(to_phone: str, message: str) -> None:
@@ -1121,7 +1299,102 @@ def send_whatsapp_async(to_phone: str, message: str) -> None:
         except Exception as exc:
             analytics.inc("whatsapp.error")
             log.error(f"❌ WhatsApp send failed → {pii_vault.mask(to_phone)}: {exc}")
-    threading.Thread(target=_send, name="WA-send", daemon=True).start()
+    submit_bg(_send)
+
+
+def _wa_send_template(to_phone: str, template: str, lang: str,
+                      body_param: str) -> Dict:
+    """v11 #4: template messages work OUTSIDE the 24-hour window — the only
+    reliable channel for owner alerts. Template must be pre-approved in the
+    Meta console with one {{1}} body parameter."""
+    if not cfg.WHATSAPP_TOKEN or not cfg.WHATSAPP_PHONE_ID:
+        return {"error": "not_configured"}
+    # Meta rejects params containing newlines/tabs/4+ consecutive spaces.
+    clean = re.sub(r"\s+", " ", body_param).strip()[:900]
+    url = f"{WHATSAPP_API_BASE}/{cfg.WHATSAPP_PHONE_ID}/messages"
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": to_phone,
+        "type": "template",
+        "template": {
+            "name": template,
+            "language": {"code": lang},
+            "components": [{"type": "body",
+                            "parameters": [{"type": "text", "text": clean}]}],
+        },
+    }
+    resp = _wa_session.post(
+        url,
+        headers={"Authorization": f"Bearer {cfg.WHATSAPP_TOKEN}",
+                 "Content-Type": "application/json"},
+        json=payload, timeout=15)
+    if resp.status_code >= 400:
+        log.error(f"❌ WA template send {resp.status_code} → {resp.text[:500]}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+def send_owner_alert_async(owner_phone: str, message: str) -> None:
+    """v11 #4: ALL owner alerts (emergency / handoff / VIP / escalation) route
+    here. With OWNER_ALERT_TEMPLATE set → template (works any time). Without it
+    → free-form text, and if Meta rejects with 131047 (outside 24h window) we
+    log exactly what to fix instead of failing silently."""
+    def _send():
+        try:
+            if cfg.OWNER_ALERT_TEMPLATE:
+                _whatsapp_breaker.call(_wa_send_template, owner_phone,
+                                       cfg.OWNER_ALERT_TEMPLATE,
+                                       cfg.OWNER_ALERT_TEMPLATE_LANG, message)
+            else:
+                _whatsapp_breaker.call(_wa_send_text, owner_phone, message)
+            analytics.inc("owner_alert.sent")
+        except Exception as exc:
+            analytics.inc("owner_alert.error")
+            extra = ""
+            if "131047" in str(exc):
+                extra = (" ← Meta 24h-window block. Fix: approve a template "
+                         "with one {{1}} param and set OWNER_ALERT_TEMPLATE.")
+            log.error(f"🚨 OWNER ALERT FAILED → {pii_vault.mask(owner_phone)}: "
+                      f"{exc}{extra}")
+    submit_bg(_send)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 📸  INSTAGRAM MESSAGING API  (v10 — official Meta Graph, same app family)
+# ─────────────────────────────────────────────────────────────────────────────
+def _ig_send_text(psid: str, message: str) -> Dict:
+    """Send an Instagram DM reply. psid = the sender id from the webhook."""
+    if not cfg.INSTAGRAM_TOKEN:
+        log.error("❌ Instagram NOT configured: set INSTAGRAM_TOKEN")
+        return {"error": "not_configured"}
+    target = cfg.INSTAGRAM_ID or "me"
+    url = f"https://graph.facebook.com/{cfg.GRAPH_API_VERSION}/{target}/messages"
+    payload = {
+        "recipient": {"id": psid},
+        "message":   {"text": message[:1000]},   # IG text limit = 1000 chars
+    }
+    resp = _wa_session.post(
+        url,
+        headers={"Authorization": f"Bearer {cfg.INSTAGRAM_TOKEN}",
+                 "Content-Type": "application/json"},
+        json=payload,
+        timeout=15,
+    )
+    if resp.status_code >= 400:
+        log.error(f"❌ Instagram send {resp.status_code} → {resp.text[:500]}")
+    resp.raise_for_status()
+    return resp.json()
+
+
+def send_instagram_async(psid: str, message: str) -> None:
+    def _send():
+        try:
+            _instagram_breaker.call(_ig_send_text, psid, message)
+            analytics.inc("instagram.sent")
+        except Exception as exc:
+            analytics.inc("instagram.error")
+            log.error(f"❌ Instagram send failed → {pii_vault.mask(psid)}: {exc}")
+    submit_bg(_send)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1222,6 +1495,608 @@ def build_system_prompt(customer_name: str, business_desc: str) -> Tuple[str, st
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 👑  GOD-LOGIC v10  (god_logic_v9 merged in — every v9 drawback addressed)
+#     Drawback fixes vs v9 module:
+#       1. Cache lost on restart      → brain_cache (Redis when REDIS_URL set)
+#       2. Only ta/hi/en              → 16-script detect, 10-language canned,
+#                                       AI itself replies in ANY language
+#       3. Keyword-only emergencies   → hybrid: keywords (instant, free) + AI
+#                                       escalation token (understands meaning,
+#                                       works in every language)
+#       4. Voice = Gemini only        → Gemini → OpenAI Whisper fallback chain
+#       5. "Mostly routing"           → Qdrant RAG long-term memory per user
+#       6. No vector memory           → see #5 (AES-256-encrypted payloads)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ⟦PURE-LOGIC-BEGIN⟧  (no I/O — unit-testable in isolation)
+
+_SCRIPT_RANGES = [
+    ("ta", 0x0B80, 0x0BFF),   # Tamil
+    ("te", 0x0C00, 0x0C7F),   # Telugu
+    ("kn", 0x0C80, 0x0CFF),   # Kannada
+    ("ml", 0x0D00, 0x0D7F),   # Malayalam
+    ("hi", 0x0900, 0x097F),   # Devanagari (Hindi/Marathi/Nepali)
+    ("bn", 0x0980, 0x09FF),   # Bengali
+    ("gu", 0x0A80, 0x0AFF),   # Gujarati
+    ("pa", 0x0A00, 0x0A7F),   # Gurmukhi (Punjabi)
+    ("or", 0x0B00, 0x0B7F),   # Odia
+    ("si", 0x0D80, 0x0DFF),   # Sinhala
+    ("ar", 0x0600, 0x06FF),   # Arabic / Urdu script
+    ("ru", 0x0400, 0x04FF),   # Cyrillic
+    ("th", 0x0E00, 0x0E7F),   # Thai
+    ("zh", 0x4E00, 0x9FFF),   # CJK
+    ("ja", 0x3040, 0x30FF),   # Kana
+    ("ko", 0xAC00, 0xD7AF),   # Hangul
+]
+
+
+def detect_language(text):
+    """Script-based detection, with a romanised-text fallback (v11 #10).
+    The AI always replies in the user's language via _LANGUAGE_RULE; this
+    function only decides which *local* canned/emergency line to use."""
+    counts = {}
+    for ch in text:
+        cp = ord(ch)
+        for code, lo, hi in _SCRIPT_RANGES:
+            if lo <= cp <= hi:
+                counts[code] = counts.get(code, 0) + 1
+                break
+    if counts:
+        return max(counts, key=counts.get)
+    # v11 #10: pure-Latin input → could be romanised Tamil/Hindi ("vanakkam",
+    # "enakku romba vali"). Without this, a Tamil speaker typing in English
+    # letters got the English emergency line. AI reply path was already fine.
+    return _romanized_lang(text) or "en"
+
+
+# Strong romanised markers — chosen to NOT collide with common English words.
+_ROMAN_TA = {
+    "vanakkam", "nandri", "enakku", "enaku", "romba", "rumba", "vali",
+    "poitu", "poidu", "varen", "eppadi", "epadi", "irukku", "iruku",
+    "venum", "vendum", "seekiram", "seekkiram", "kandippa", "udane",
+    "moochu", "moochi", "thangala", "thangamudiyala", "rathum", "vibathu",
+    "thatkolai", "saavu", "mayakkam", "sappuda", "udanadiyaa",
+}
+_ROMAN_HI = {
+    "namaste", "namaskar", "dhanyavad", "dhanyawad", "shukriya", "kaise",
+    "kyun", "nahi", "nahin", "madad", "chahiye", "kripya", "theek",
+    "bahut", "dard", "jaldi", "turant", "khoon", "saans", "behosh",
+    "aatmahatya", "bachao",
+}
+
+
+def _romanized_lang(text):
+    """Returns 'ta' / 'hi' if the Latin text carries strong romanised markers,
+    else None. Conservative: needs at least one high-confidence token."""
+    toks = set(_norm_text(text).split())
+    ta = len(toks & _ROMAN_TA)
+    hi = len(toks & _ROMAN_HI)
+    if ta == 0 and hi == 0:
+        return None
+    return "ta" if ta >= hi else "hi"
+
+
+def _norm_text(text):
+    """Lowercase + strip everything that isn't a letter/digit → stable matching."""
+    text = unicodedata.normalize("NFKC", str(text)).lower()
+    text = "".join(ch if (ch.isalnum() or ch.isspace()) else " " for ch in text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# Canned replies — 10 languages. Any other language → None → goes to the AI,
+# which answers natively in whatever language the user wrote.
+_CANNED = {
+    "greet": {
+        "en": "Hello! 👋 I'm {bot}. How can I help you today?",
+        "ta": "வணக்கம்! 👋 நான் {bot}. இன்று எப்படி உதவலாம்?",
+        "hi": "नमस्ते! 👋 मैं {bot} हूँ। आज मैं कैसे मदद कर सकता हूँ?",
+        "te": "నమస్తే! 👋 నేను {bot}. ఈ రోజు మీకు ఎలా సహాయం చేయగలను?",
+        "kn": "ನಮಸ್ಕಾರ! 👋 ನಾನು {bot}. ಇಂದು ಹೇಗೆ ಸಹಾಯ ಮಾಡಲಿ?",
+        "ml": "നമസ്കാരം! 👋 ഞാൻ {bot}. ഇന്ന് എങ്ങനെ സഹായിക്കാം?",
+        "bn": "নমস্কার! 👋 আমি {bot}। আজ কীভাবে সাহায্য করতে পারি?",
+        "gu": "નમસ્તે! 👋 હું {bot} છું. આજે કેવી રીતે મદદ કરી શકું?",
+        "pa": "ਸਤ ਸ੍ਰੀ ਅਕਾਲ! 👋 ਮੈਂ {bot} ਹਾਂ। ਅੱਜ ਕਿਵੇਂ ਮਦਦ ਕਰਾਂ?",
+        "ar": "مرحباً! 👋 أنا {bot}. كيف أستطيع مساعدتك اليوم؟",
+    },
+    "thanks": {
+        "en": "You're welcome! 🙏 Anything else I can help with?",
+        "ta": "மகிழ்ச்சி! 🙏 வேறு ஏதாவது உதவி வேண்டுமா?",
+        "hi": "आपका स्वागत है! 🙏 और कुछ मदद चाहिए?",
+        "te": "సంతోషం! 🙏 ఇంకేమైనా సహాయం కావాలా?",
+        "kn": "ಸಂತೋಷ! 🙏 ಇನ್ನೇನಾದರೂ ಸಹಾಯ ಬೇಕೇ?",
+        "ml": "സന്തോഷം! 🙏 വേറെ എന്തെങ്കിലും സഹായം വേണോ?",
+        "bn": "স্বাগতম! 🙏 আর কিছু সাহায্য লাগবে?",
+        "gu": "સ્વાગત છે! 🙏 બીજી કોઈ મદદ જોઈએ?",
+        "pa": "ਜੀ ਆਇਆਂ ਨੂੰ! 🙏 ਹੋਰ ਕੋਈ ਮਦਦ ਚਾਹੀਦੀ ਹੈ?",
+        "ar": "على الرحب والسعة! 🙏 هل تحتاج مساعدة أخرى؟",
+    },
+    "ack": {
+        "en": "👍 Let me know if you need anything else.",
+        "ta": "👍 வேறு ஏதாவது தேவைப்பட்டால் சொல்லுங்கள்.",
+        "hi": "👍 कुछ और चाहिए तो बताइए।",
+        "te": "👍 ఇంకేమైనా కావాలంటే చెప్పండి.",
+        "kn": "👍 ಇನ್ನೇನಾದರೂ ಬೇಕಿದ್ದರೆ ತಿಳಿಸಿ.",
+        "ml": "👍 വേറെ എന്തെങ്കിലും വേണമെങ്കിൽ പറയൂ.",
+        "bn": "👍 আর কিছু লাগলে জানাবেন।",
+        "gu": "👍 બીજું કંઈ જોઈએ તો જણાવજો.",
+        "pa": "👍 ਹੋਰ ਕੁਝ ਚਾਹੀਦਾ ਹੋਵੇ ਤਾਂ ਦੱਸੋ।",
+        "ar": "👍 أخبرني إذا احتجت أي شيء آخر.",
+    },
+    "bye": {
+        "en": "Thank you for reaching out — take care! 👋",
+        "ta": "தொடர்பு கொண்டதற்கு நன்றி — பத்திரம்! 👋",
+        "hi": "संपर्क करने के लिए धन्यवाद — ध्यान रखें! 👋",
+        "te": "సంప్రదించినందుకు ధన్యవాదాలు — జాగ్రత్త! 👋",
+        "kn": "ಸಂಪರ್ಕಿಸಿದ್ದಕ್ಕೆ ಧನ್ಯವಾದಗಳು — ಜೋಪಾನ! 👋",
+        "ml": "ബന്ധപ്പെട്ടതിന് നന്ദി — ശ്രദ്ധിക്കണേ! 👋",
+        "bn": "যোগাযোগের জন্য ধন্যবাদ — ভালো থাকবেন! 👋",
+        "gu": "સંપર્ક કરવા બદલ આભાર — સંભાળજો! 👋",
+        "pa": "ਸੰਪਰਕ ਕਰਨ ਲਈ ਧੰਨਵਾਦ — ਖ਼ਿਆਲ ਰੱਖਣਾ! 👋",
+        "ar": "شكراً لتواصلك — اعتنِ بنفسك! 👋",
+    },
+}
+
+_GREET_RAW = ["hi", "hii", "hiii", "hey", "hello", "helo", "hlo", "start", "menu",
+              "vanakkam", "வணக்கம்", "ஹாய்", "ஹலோ", "namaste", "namaskar",
+              "नमस्ते", "नमस्कार", "నమస్తే", "నమస్కారం", "ನಮಸ್ಕಾರ", "നമസ്കാരം",
+              "নমস্কার", "નમસ્તે", "ਸਤ ਸ੍ਰੀ ਅਕਾਲ", "مرحبا", "السلام عليكم", "اهلا"]
+_THANKS_RAW = ["thanks", "thank you", "thank u", "thx", "ty", "tnx",
+               "nandri", "நன்றி", "रोम्बा नन्द्री", "dhanyavad", "dhanyawad",
+               "धन्यवाद", "शुक्रिया", "ధన్యవాదాలు", "ಧನ್ಯವಾದ", "നന്ദി",
+               "ধন্যবাদ", "આભાર", "ਧੰਨਵਾਦ", "شكرا", "شكرًا"]
+_ACK_RAW = ["ok", "okay", "okk", "k", "fine", "good", "great", "got it", "done",
+            "sari", "சரி", "ஓகே", "thik", "theek", "ठीक", "ठीक है", "ओके",
+            "సరే", "ಸರಿ", "ശരി", "ঠিক আছে", "ઠીક છે", "ਠੀਕ ਹੈ", "تمام", "حسنا"]
+_BYE_RAW = ["bye", "goodbye", "good bye", "tata", "ta ta", "poitu varen",
+            "போயிட்டு வரேன்", "alvida", "अलविदा", "வீடி", "మళ్ళీ కలుద్దాం",
+            "ਅਲਵਿਦਾ", "مع السلامة", "وداعا"]
+
+_GREET  = {_norm_text(x) for x in _GREET_RAW}
+_THANKS = {_norm_text(x) for x in _THANKS_RAW}
+_ACK    = {_norm_text(x) for x in _ACK_RAW}
+_BYE    = {_norm_text(x) for x in _BYE_RAW}
+
+
+def canned_reply(text, bot_name=""):
+    """Local zero-cost reply for trivial messages; None → send to the AI."""
+    norm = _norm_text(text)
+    if not norm or len(norm.split()) > 4:
+        return None
+    lang = detect_language(text)
+    bot  = bot_name or "your AI assistant"
+    if norm in _GREET:
+        tpl = _CANNED["greet"].get(lang)
+        return tpl.format(bot=bot) if tpl else None
+    for key, vocab in (("thanks", _THANKS), ("ack", _ACK), ("bye", _BYE)):
+        if norm in vocab:
+            return _CANNED[key].get(lang)   # unknown lang → None → AI handles
+    return None
+
+
+# Intent keywords — fast free layer for en/ta/hi (the launch markets).
+# Every OTHER language is covered by the AI escalation token further below.
+_EMERGENCY_KW = [
+    # NOTE: lone "urgent" removed on purpose — sales leads say "urgent" too.
+    # Genuine urgent cases are caught by the AI escalation token (all languages).
+    "emergency", "medical emergency", "severe pain", "unbearable", "bleeding",
+    "accident", "heart attack", "chest pain", "can't breathe", "cant breathe",
+    "fainted", "collapsed", "suicide", "kill myself", "sos",
+    # v11 #10: romanised Tamil/Hindi emergency markers (launch markets)
+    "romba vali", "thanga mudiyala", "moochu vanga", "moochi vanga", "rathum",
+    "bahut dard", "saans nahi", "khoon", "behosh", "aatmahatya",
+    "அவசரம்", "ரொம்ப வலி", "தாங்க முடியல", "ரத்தம்", "விபத்து", "தற்கொலை",
+    "மூச்சு வாங்க", "மூச்சு முட்ட", "மயக்கம்",
+    "इमरजेंसी", "बहुत दर्द", "खून", "साँस नहीं", "आत्महत्या", "दुर्घटना",
+]
+_HUMAN_KW = [
+    "talk to a human", "talk to human", "talk to a person", "real person",
+    "human agent", "live agent", "customer care", "speak to the doctor",
+    "talk to the doctor", "talk to doctor", "speak to manager", "talk to manager",
+    "talk to owner", "speak to owner", "connect me to", "transfer me",
+    "i want to talk to", "want to speak to",
+    "டாக்டர் கிட்ட பேசணும்", "மேனேஜர் கிட்ட", "ஆள் கிட்ட பேசணும்",
+    "எம்.டி கிட்ட", "நேரடியா பேசணும்",
+    "डॉक्टर से बात", "मैनेजर से बात", "किसी इंसान से बात", "इंसान से बात",
+]
+_VIP_KW = [
+    "crore", "crores", "lakh", "lakhs", "budget", "premium", "luxury",
+    "penthouse", "villa", "bulk order", "wholesale", "enterprise plan",
+    "கோடி", "லட்சம்", "பட்ஜெட்", "வில்லா", "करोड़", "लाख", "बजट",
+]
+_MONEY_RE  = re.compile(r"(₹|rs\.?\s?\d|inr\s?\d)", re.IGNORECASE)
+_BIGNUM_RE = re.compile(r"\d+\s*(crore|crores|cr|lakh|lakhs)\b", re.IGNORECASE)
+
+# v11 #9: words that, immediately before a keyword, flip its meaning.
+_NEGATORS = {
+    "no", "not", "non", "without", "never", "dont", "doesnt", "isnt", "wont",
+    "cant", "neither", "nor", "illa", "illai", "kidaiyaadhu", "nahi", "nahin",
+    "mat", "bina", "bila",
+}
+
+
+def _kw_hit(norm_text: str, keyword: str) -> bool:
+    """v11 #9: whole-word match for `keyword` inside already-normalised text,
+    skipping any occurrence that is immediately preceded by a negator. This
+    stops 'no budget' → VIP, 'not premium' → VIP, 'no chest pain' → emergency,
+    while still firing on real 'severe chest pain'."""
+    kw = _norm_text(keyword)
+    if not kw:
+        return False
+    toks    = norm_text.split()
+    kw_toks = kw.split()
+    n       = len(kw_toks)
+    for i in range(len(toks) - n + 1):
+        if toks[i:i + n] == kw_toks:
+            prev = toks[i - 1] if i > 0 else ""
+            if prev in _NEGATORS:
+                continue           # negated occurrence → keep scanning
+            return True
+    return False
+
+
+def classify_message(text):
+    """Returns {'emergency','human','vip'} booleans. Pure, instant, free.
+    v11 #9: word-boundary + negation aware (was naive substring matching)."""
+    norm = _norm_text(text)
+    return {
+        "emergency": any(_kw_hit(norm, k) for k in _EMERGENCY_KW),
+        "human":     any(_kw_hit(norm, k) for k in _HUMAN_KW),
+        "vip":       (any(_kw_hit(norm, k) for k in _VIP_KW)
+                      or bool(_MONEY_RE.search(text))
+                      or bool(_BIGNUM_RE.search(text))),
+    }
+
+# ⟦PURE-LOGIC-END⟧
+
+
+_EMERGENCY_LINES = {
+    "ta": ("உங்கள் செய்தி எங்கள் குழுவிற்கு உடனடியாக அனுப்பப்பட்டது. "
+           "மருத்துவ அவசரநிலை எனில் தயவுசெய்து உடனடியாக அழைக்கவும்."),
+    "hi": ("आपका संदेश हमारी टीम को तुरंत भेज दिया गया है। "
+           "मेडिकल इमरजेंसी होने पर कृपया तुरंत कॉल करें।"),
+    "en": ("Your message has been sent to our team right away. If this is a "
+           "medical emergency, please call your local emergency number immediately."),
+}
+_HUMAN_LINES = {
+    "ta": "ஒரு நிமிடம் 🙏 உங்களை எங்கள் குழுவுடன் இணைக்கிறேன்.",
+    "hi": "एक मिनट 🙏 मैं आपको हमारी टीम से जोड़ रहा हूँ।",
+    "en": "One moment 🙏 connecting you with our team now.",
+}
+
+
+# ── 👻 Ghost mode — Redis-backed via brain_cache → works across ALL gunicorn
+#    workers (the in-memory v9 version silently broke with --workers 4).
+def ghost_mute(uid: str) -> None:
+    brain_cache.set(f"ghost:{uid}", 1, ttl=cfg.GHOST_MUTE_SECONDS)
+    analytics.inc("ghost.muted")
+
+
+def ghost_is_muted(uid: str) -> bool:
+    return brain_cache.get(f"ghost:{uid}") is not None
+
+
+def ghost_resume(uid: str) -> None:
+    brain_cache.delete(f"ghost:{uid}")
+
+
+# ── 🗄️ Response cache — brain_cache backend = survives restarts + shared
+#    across workers when REDIS_URL is set (fixes v9 drawback #1).
+def _resp_key(system_prompt: str, message: str) -> str:
+    # v11 fix #6: hash the WHOLE prompt, not [:200]. Two customers whose prompts
+    # share the first 200 chars (very common — same template header) would
+    # otherwise collide and get each other's cached answers. The prompt already
+    # carries the customer identity, so a full-prompt hash is the cache boundary.
+    raw = (hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()
+           + "|" + _norm_text(message)).encode("utf-8")
+    return "resp:" + hashlib.sha256(raw).hexdigest()[:32]
+
+
+def resp_cache_get(system_prompt: str, message: str) -> Optional[str]:
+    val = brain_cache.get(_resp_key(system_prompt, message))
+    return val if isinstance(val, str) and val else None
+
+
+def resp_cache_put(system_prompt: str, message: str, reply: str) -> None:
+    if reply:
+        brain_cache.set(_resp_key(system_prompt, message), reply,
+                        ttl=cfg.RESPONSE_CACHE_TTL)
+
+
+# ── 🎙️ Voice-note decoder — Gemini (multimodal) → OpenAI Whisper fallback.
+_TRANSCRIBE_PROMPT = ("Transcribe this voice message to plain text. Keep the "
+                      "original language exactly as spoken. Return ONLY the "
+                      "transcript, nothing else.")
+
+
+def transcribe_audio_bytes(audio_bytes: bytes, mime: str = "audio/ogg") -> str:
+    """Never raises — returns '' on failure so one bad audio can't 500 a webhook."""
+    if not audio_bytes:
+        return ""
+    mime = (mime or "audio/ogg").split(";")[0].strip()
+
+    # 1) Gemini (primary — already configured by _init_ai_providers)
+    if AI_PROVIDERS_ACTIVE.get("gemini"):
+        try:
+            gmodel = genai.GenerativeModel(model_name=cfg.GEMINI_MODEL)
+            resp   = gmodel.generate_content(
+                [_TRANSCRIBE_PROMPT, {"mime_type": mime, "data": audio_bytes}])
+            text = (getattr(resp, "text", "") or "").strip()
+            if text:
+                analytics.inc("voice.gemini.success")
+                return text
+        except Exception as exc:
+            log.warning(f"⚠️  Gemini transcription failed: {exc}")
+            analytics.inc("voice.gemini.error")
+
+    # 2) OpenAI Whisper fallback (fixes v9 drawback #4)
+    if AI_PROVIDERS_ACTIVE.get("openai") and _openai_client is not None:
+        try:
+            buf = io.BytesIO(audio_bytes)
+            buf.name = "voice." + ("ogg" if "ogg" in mime else
+                                   (mime.split("/")[-1] or "mp3"))
+            tr = _openai_client.audio.transcriptions.create(
+                model=cfg.OPENAI_TRANSCRIBE_MODEL, file=buf)
+            text = (getattr(tr, "text", "") or "").strip()
+            if text:
+                analytics.inc("voice.whisper.success")
+                log.info("🔄 Voice fallback used: whisper")
+                return text
+        except Exception as exc:
+            log.warning(f"⚠️  Whisper transcription failed: {exc}")
+            analytics.inc("voice.whisper.error")
+
+    return ""
+
+
+def transcribe_voice_note(media_id: str) -> str:
+    """WhatsApp: media_id → signed URL → bytes → transcript. '' on any failure."""
+    if not media_id or not cfg.WHATSAPP_TOKEN:
+        return ""
+    try:
+        meta = _wa_session.get(
+            f"https://graph.facebook.com/{cfg.GRAPH_API_VERSION}/{media_id}",
+            headers={"Authorization": f"Bearer {cfg.WHATSAPP_TOKEN}"}, timeout=15)
+        meta.raise_for_status()
+        info  = meta.json()
+        audio = _wa_session.get(
+            info["url"],
+            headers={"Authorization": f"Bearer {cfg.WHATSAPP_TOKEN}"}, timeout=30)
+        audio.raise_for_status()
+        return transcribe_audio_bytes(audio.content,
+                                      info.get("mime_type", "audio/ogg"))
+    except Exception as exc:
+        log.error(f"❌ Voice download failed: {exc}")
+        return ""
+
+
+def transcribe_audio_url(url: str) -> str:
+    """Instagram: attachments carry a public CDN URL — no auth header needed."""
+    if not url:
+        return ""
+    try:
+        audio = _wa_session.get(url, timeout=30)
+        audio.raise_for_status()
+        mime = audio.headers.get("Content-Type", "audio/mp4")
+        return transcribe_audio_bytes(audio.content, mime)
+    except Exception as exc:
+        log.error(f"❌ IG audio download failed: {exc}")
+        return ""
+
+
+# ── 🧬 RAG LONG-TERM MEMORY — Qdrant + Gemini embeddings (v9 drawbacks #5,#6)
+#    Per end-user memory across sessions. Payload text is AES-256-GCM encrypted
+#    so the vector DB never stores readable PII (DPDP-friendly).
+_qdrant_client: Any = None
+_rag_ready: bool    = False
+
+
+def init_rag() -> None:
+    global _qdrant_client, _rag_ready
+    if not QDRANT_AVAILABLE:
+        log.warning("⚠️  qdrant-client not installed — RAG memory OFF.")
+        return
+    if not cfg.QDRANT_URL:
+        log.warning("⚠️  QDRANT_URL not set — RAG memory OFF.")
+        return
+    if not AI_PROVIDERS_ACTIVE.get("gemini"):
+        log.warning("⚠️  Gemini key required for embeddings — RAG memory OFF.")
+        return
+    try:
+        client = QdrantClient(url=cfg.QDRANT_URL,
+                              api_key=cfg.QDRANT_API_KEY or None, timeout=10)
+        try:
+            client.get_collection(cfg.QDRANT_COLLECTION)
+        except Exception:
+            client.create_collection(
+                collection_name=cfg.QDRANT_COLLECTION,
+                vectors_config=qmodels.VectorParams(
+                    size=cfg.EMBED_DIMS, distance=qmodels.Distance.COSINE))
+            log.info(f"🧬 Qdrant collection created: {cfg.QDRANT_COLLECTION}")
+        _qdrant_client = client
+        _rag_ready     = True
+        log.info("🧬 RAG long-term memory ONLINE (Qdrant).")
+    except Exception as exc:
+        log.warning(f"⚠️  Qdrant unreachable ({exc}) — RAG memory OFF, engine OK.")
+
+
+def _embed(text: str, is_query: bool = False) -> List[float]:
+    task = "retrieval_query" if is_query else "retrieval_document"
+    try:
+        res = genai.embed_content(model=cfg.EMBED_MODEL, content=text[:2000],
+                                  task_type=task,
+                                  output_dimensionality=cfg.EMBED_DIMS)
+    except TypeError:   # older SDK without output_dimensionality
+        res = genai.embed_content(model=cfg.EMBED_MODEL, content=text[:2000],
+                                  task_type=task)
+    vec = res["embedding"]
+    return list(vec)[:cfg.EMBED_DIMS]
+
+
+def rag_store(customer_id: str, uid: str, user_text: str, reply: str) -> None:
+    """Fire-and-forget — memory writes never slow down or break a reply."""
+    if not _rag_ready or len(user_text.split()) < 4:
+        return
+
+    def _w():
+        try:
+            vec = _embed(user_text, is_query=False)
+            enc = pii_vault.encrypt(
+                f"User said: {user_text[:500]} | Assistant replied: {reply[:300]}")
+            _qdrant_client.upsert(
+                collection_name=cfg.QDRANT_COLLECTION,
+                points=[qmodels.PointStruct(
+                    id=str(uuid.uuid4()), vector=vec,
+                    payload={"customer_id": customer_id, "uid": uid,
+                             "enc": enc, "ts": _now()})])
+            analytics.inc("rag.stored")
+        except Exception as exc:
+            log.warning(f"⚠️  RAG store failed: {exc}")
+
+    submit_bg(_w)   # v11 #11: bounded pool instead of a raw daemon thread
+
+
+def rag_retrieve(customer_id: str, uid: str, query: str) -> str:
+    """Returns a memory block ('' if none). Failures degrade silently."""
+    if not _rag_ready or len(query.split()) < 3:
+        return ""
+    try:
+        vec = _embed(query, is_query=True)
+        flt = qmodels.Filter(must=[
+            qmodels.FieldCondition(key="customer_id",
+                                   match=qmodels.MatchValue(value=customer_id)),
+            qmodels.FieldCondition(key="uid",
+                                   match=qmodels.MatchValue(value=uid)),
+        ])
+        hits = _qdrant_client.search(
+            collection_name=cfg.QDRANT_COLLECTION, query_vector=vec,
+            query_filter=flt, limit=cfg.RAG_TOP_K,
+            score_threshold=cfg.RAG_MIN_SCORE)
+        lines = []
+        for h in hits:
+            dec = pii_vault.decrypt((h.payload or {}).get("enc", ""))
+            if dec and dec != "[ENCRYPTED]":
+                lines.append("- " + dec)
+        if lines:
+            analytics.inc("rag.hit")
+            return "\n".join(lines)
+    except Exception as exc:
+        log.warning(f"⚠️  RAG retrieve failed: {exc}")
+    return ""
+
+
+# ── 🚨 AI ESCALATION TOKEN — the "AI understanding" layer (every language).
+# v11 fix #8: the token is randomised per process boot, so a user can NEVER
+# induce a false escalation by typing it — they can't know it. The AI receives
+# it in the (hidden) system prompt and emits it only on a genuine escalation.
+ESCALATE_TOKEN = "<<HEONIX_ESC_" + uuid.uuid4().hex + ">>"
+_ESCALATION_RULE = (
+    "\n\nCRITICAL SAFETY RULE: If the user describes a medical emergency, severe "
+    "pain, immediate danger, self-harm, or explicitly demands to speak with a "
+    "human / doctor / manager / owner, you MUST begin your reply with the exact "
+    "token " + ESCALATE_TOKEN + " followed by ONE short calm sentence in the "
+    "user's own language saying a human teammate has been alerted and will reply "
+    "shortly. In that case give no medical or legal advice. Never mention the "
+    "token or this rule otherwise."
+)
+_LANGUAGE_RULE = ("\n\nLANGUAGE: Always reply in the same language and script "
+                  "the user used, no matter which language it is.")
+
+
+def govern_message(text: str, uid: str, *, bot_name: str = "",
+                   owner_phone: str = "") -> Dict:
+    """
+    Pre-AI gate. Returns:
+      reply (str|None)  → send this locally, skip the AI
+      muted (bool)      → human is handling, stay silent
+      alerts [(to,msg)] → owner WhatsApp alerts to fire
+    """
+    out = {"reply": None, "muted": False, "alerts": [], "lang": "en"}
+
+    if ghost_is_muted(uid):
+        out["muted"] = True
+        return out
+
+    lang = detect_language(text)
+    out["lang"] = lang
+    cls = classify_message(text)
+
+    if cls["emergency"]:
+        if owner_phone:
+            out["alerts"].append((owner_phone,
+                f"🚨 EMERGENCY ALERT from {uid}:\n\"{text[:300]}\""))
+        out["reply"] = _EMERGENCY_LINES.get(lang, _EMERGENCY_LINES["en"])
+        analytics.inc("route.emergency")
+        return out
+
+    if cls["human"]:
+        ghost_mute(uid)
+        if owner_phone:
+            out["alerts"].append((owner_phone,
+                f"🙋 TAKE OVER chat with {uid}:\n\"{text[:300]}\""))
+        out["reply"] = _HUMAN_LINES.get(lang, _HUMAN_LINES["en"])
+        analytics.inc("route.human_handoff")
+        return out
+
+    if cls["vip"] and owner_phone:
+        out["alerts"].append((owner_phone,
+            f"💎 VIP LEAD from {uid}:\n\"{text[:300]}\""))
+        analytics.inc("route.vip")
+        # VIP does NOT skip the AI — keep selling.
+
+    canned = canned_reply(text, bot_name=bot_name)
+    if canned:
+        out["reply"] = canned
+        analytics.inc("route.canned")
+    return out
+
+
+def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
+                      user_uid: str, channel: str) -> Tuple[str, str, bool]:
+    """
+    The single AI path for ALL channels (WhatsApp / Instagram / API):
+      response-cache → RAG memory → multi-AI fallback → escalation handling.
+    Returns (reply, provider, escalated).
+    Raises RuntimeError only if every AI provider fails (caller handles).
+    """
+    base   = brain.get("system_prompt") or ""
+    memory = rag_retrieve(brain.get("customer_id", ""), user_uid, user_text)
+
+    # Cache only memory-free answers — personalised replies must never be
+    # served to a different person who happens to ask the same question.
+    cacheable = (memory == "")
+    if cacheable:
+        cached = resp_cache_get(base, user_text)
+        if cached:
+            analytics.inc("cache.response.hit")
+            return cached, "cache", False
+
+    sys_prompt = base
+    if memory:
+        sys_prompt += ("\n\nRELEVANT MEMORY from earlier chats with this same "
+                       "person (use naturally, don't recite):\n" + memory)
+    sys_prompt += _LANGUAGE_RULE + _ESCALATION_RULE
+
+    reply, provider = multi_ai_reply(sys_prompt, history, user_text)
+
+    escalated = ESCALATE_TOKEN in reply
+    if escalated:
+        reply = reply.replace(ESCALATE_TOKEN, "").strip() or \
+                _HUMAN_LINES.get(detect_language(user_text), _HUMAN_LINES["en"])
+        owner = brain.get("owner_phone") or ""
+        if owner:
+            send_owner_alert_async(owner,
+                f"🚨 AI ESCALATION ({channel}) from {user_uid}:\n\"{user_text[:300]}\"")
+        analytics.inc("escalation.ai")
+    else:
+        if cacheable and provider != "cache":
+            resp_cache_put(base, user_text, reply)
+        rag_store(brain.get("customer_id", ""), user_uid, user_text, reply)
+
+    return reply, provider, escalated
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 📐  PYDANTIC VALIDATION MODELS
 # ─────────────────────────────────────────────────────────────────────────────
 class WebhookPayloadValidator(BaseModel):
@@ -1229,6 +2104,8 @@ class WebhookPayloadValidator(BaseModel):
     business_type:  str = Field(default="General Business", max_length=300)
     extra_notes:    str = Field(default="", max_length=1000)
     whatsapp_phone: str = Field(default="", max_length=20)
+    owner_phone:    str = Field(default="", max_length=20)   # v10: alerts target
+    instagram_id:   str = Field(default="", max_length=60)   # v10: IG business id
 
     @field_validator("customer_name", "business_type", mode="before")
     @classmethod
@@ -1307,7 +2184,7 @@ def audit(actor_id: str, action: str, resource: str,
         except Exception as exc:
             log.warning(f"⚠️  Audit write failed: {exc}")
 
-    threading.Thread(target=_write, name="audit", daemon=True).start()
+    submit_bg(_write)   # v11 #11: bounded pool
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1365,40 +2242,50 @@ def _process_outbox() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 def save_customer_brain(customer_id: str, customer_name: str,
                          business_type: str, system_prompt: str,
-                         whatsapp_phone: str = "") -> None:
+                         whatsapp_phone: str = "", owner_phone: str = "",
+                         instagram_id: str = "", bot_name: str = "") -> None:
     now   = _now()
     is_pg = isinstance(_db_pool, PostgreSQLPool)
     if is_pg:
         sql = """
             INSERT INTO customer_brains
                 (customer_id, customer_name, business_type, system_prompt,
-                 created_at, updated_at, whatsapp_phone, region)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                 created_at, updated_at, whatsapp_phone, region,
+                 owner_phone, instagram_id, bot_name)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
             ON CONFLICT (customer_id) DO UPDATE SET
                 customer_name  = EXCLUDED.customer_name,
                 business_type  = EXCLUDED.business_type,
                 system_prompt  = EXCLUDED.system_prompt,
                 updated_at     = EXCLUDED.updated_at,
                 is_active      = TRUE,
-                whatsapp_phone = EXCLUDED.whatsapp_phone
+                whatsapp_phone = EXCLUDED.whatsapp_phone,
+                owner_phone    = EXCLUDED.owner_phone,
+                instagram_id   = EXCLUDED.instagram_id,
+                bot_name       = EXCLUDED.bot_name
         """
     else:
         sql = """
             INSERT INTO customer_brains
                 (customer_id, customer_name, business_type, system_prompt,
-                 created_at, updated_at, whatsapp_phone, region)
-            VALUES (?,?,?,?,?,?,?,?)
+                 created_at, updated_at, whatsapp_phone, region,
+                 owner_phone, instagram_id, bot_name)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(customer_id) DO UPDATE SET
                 customer_name  = excluded.customer_name,
                 business_type  = excluded.business_type,
                 system_prompt  = excluded.system_prompt,
                 updated_at     = excluded.updated_at,
                 is_active      = 1,
-                whatsapp_phone = excluded.whatsapp_phone
+                whatsapp_phone = excluded.whatsapp_phone,
+                owner_phone    = excluded.owner_phone,
+                instagram_id   = excluded.instagram_id,
+                bot_name       = excluded.bot_name
         """
     with _db_pool.get() as conn:
         _execute(conn, sql, (customer_id, customer_name, business_type,
-                             system_prompt, now, now, whatsapp_phone, cfg.REGION))
+                             system_prompt, now, now, whatsapp_phone, cfg.REGION,
+                             owner_phone, instagram_id, bot_name))
     brain_cache.delete(customer_id)
     analytics.inc("customer.saved")
     log.info(f"💾 Brain saved → {customer_id}")
@@ -1522,24 +2409,46 @@ def store_idempotency(key: str, response: Dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # 📋  ENCRYPTED CRM
 # ─────────────────────────────────────────────────────────────────────────────
+def _crm_phone_hash(customer_id: str, phone: str) -> str:
+    """v11 #3: deterministic dedupe handle. AES-GCM ciphertext changes every
+    encryption (random nonce), so enc_phone can't be compared — this hash can.
+    Scoped per customer so the same lead at two businesses stays two rows."""
+    norm = re.sub(r"\D", "", phone or "")[-12:]   # digits only, country-code tolerant
+    return hashlib.sha256(f"{customer_id}|{norm}".encode()).hexdigest()[:40]
+
+
 def crm_add_contact(customer_id: str, name: str, phone: str,
                      email: str = "", notes: str = "",
                      stage: str = "lead", is_consented: bool = False) -> int:
     now         = _now()
-    enc_name    = pii_vault.encrypt(name)
-    enc_phone   = pii_vault.encrypt(phone)
-    enc_email   = pii_vault.encrypt(email) if email else ""
-    enc_notes   = pii_vault.encrypt(notes) if notes else ""
+    phash       = _crm_phone_hash(customer_id, phone)
     is_pg       = isinstance(_db_pool, PostgreSQLPool)
-    consent_val = is_consented if is_pg else int(is_consented)
 
+    # v11 #3: was a blind INSERT on EVERY message → 10 messages = 10 duplicate
+    # rows. Now: same lead → just bump updated_at and return the existing id.
     with _db_pool.get() as conn:
         cur = _execute(conn,
+            "SELECT id FROM crm_contacts WHERE customer_id=? AND phone_hash=?",
+            (customer_id, phash))
+        row = cur.fetchone()
+        if row:
+            _execute(conn,
+                "UPDATE crm_contacts SET updated_at=? WHERE id=?",
+                (now, row["id"]))
+            analytics.inc("crm.contact.touched")
+            return row["id"]
+
+        enc_name    = pii_vault.encrypt(name)
+        enc_phone   = pii_vault.encrypt(phone)
+        enc_email   = pii_vault.encrypt(email) if email else ""
+        enc_notes   = pii_vault.encrypt(notes) if notes else ""
+        consent_val = is_consented if is_pg else int(is_consented)
+        cur = _execute(conn,
             "INSERT INTO crm_contacts "
-            "(customer_id, enc_name, enc_phone, enc_email, enc_notes, "
+            "(customer_id, phone_hash, enc_name, enc_phone, enc_email, enc_notes, "
             "contact_stage, created_at, updated_at, is_consented) "
-            "VALUES (?,?,?,?,?,?,?,?,?)",
-            (customer_id, enc_name, enc_phone, enc_email, enc_notes,
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (customer_id, phash, enc_name, enc_phone, enc_email, enc_notes,
              stage, now, now, consent_val))
         new_id = cur.lastrowid if hasattr(cur, "lastrowid") else None
 
@@ -1693,6 +2602,18 @@ def verify_tally_signature(raw_body: bytes, headers: dict) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Health Check (Kubernetes liveness probe) ──────────────────────────────────
+@app.route("/", methods=["GET"])
+def root():
+    """Friendly landing — visiting the bare Render URL previously 404'd."""
+    return jsonify({
+        "engine":  "HEONIX ULTRA ENGINE v11.0 — PRODUCTION-HARDENED",
+        "status":  "online",
+        "health":  "/health",
+        "ready":   "/ready",
+        "metrics": "/metrics",
+    }), 200
+
+
 @app.route("/health", methods=["GET"])
 def health():
     db_ok = True
@@ -1705,7 +2626,7 @@ def health():
     ai_active = [k for k, v in AI_PROVIDERS_ACTIVE.items() if v]
     return jsonify({
         "status":           "UP" if db_ok else "DEGRADED",
-        "engine":           "HEONIX Ultra v8.0",
+        "engine":           "HEONIX Ultra v11.0",
         "region":           cfg.REGION,
         "timestamp":        _now(),
         "db_mode":          cfg.DATABASE_MODE,
@@ -1717,6 +2638,10 @@ def health():
         "active_ai_chain":  ai_active,
         "pii_encryption":   pii_vault.enabled,
         "whatsapp_ready":   bool(cfg.WHATSAPP_TOKEN and cfg.WHATSAPP_PHONE_ID),
+        "instagram_ready":  bool(cfg.INSTAGRAM_TOKEN),
+        "graph_api":        cfg.GRAPH_API_VERSION,
+        "rag_memory":       _rag_ready,
+        "voice_decoder":    bool(AI_PROVIDERS_ACTIVE.get("gemini") or AI_PROVIDERS_ACTIVE.get("openai")),
         "gemini_circuit":   _gemini_breaker.state,
         "openai_circuit":   _openai_breaker.state,
         "claude_circuit":   _claude_breaker.state,
@@ -1813,7 +2738,7 @@ def tally_webhook():
     if request.method == "GET":
         return jsonify({
             "status":  "live",
-            "engine":  "HEONIX Ultra v8.0",
+            "engine":  "HEONIX Ultra v11.0",
             "region":  cfg.REGION,
             "message": "POST Tally form payload here to deploy a customer brain.",
         }), 200
@@ -1844,6 +2769,8 @@ def tally_webhook():
             business_type  = extract_field(fields, 1, "General Business"),
             extra_notes    = extract_field(fields, 2, ""),
             whatsapp_phone = extract_field(fields, 3, ""),
+            owner_phone    = extract_field(fields, 4, ""),
+            instagram_id   = extract_field(fields, 5, ""),
         )
         customer_id         = make_customer_id(raw.customer_name)
         bot_name, sys_prompt = build_system_prompt(raw.customer_name, raw.business_type)
@@ -1851,7 +2778,10 @@ def tally_webhook():
             sys_prompt += f"\n\nAdditional context: {raw.extra_notes}"
 
         save_customer_brain(customer_id, raw.customer_name,
-                            raw.business_type, sys_prompt, raw.whatsapp_phone)
+                            raw.business_type, sys_prompt, raw.whatsapp_phone,
+                            owner_phone=(raw.owner_phone or raw.whatsapp_phone),
+                            instagram_id=raw.instagram_id,
+                            bot_name=bot_name)
 
         # Publish welcome message via transactional outbox (FIX #3)
         if raw.whatsapp_phone:
@@ -1892,6 +2822,108 @@ def tally_webhook():
 
 
 # ── WhatsApp Cloud API Webhook ─────────────────────────────────────────────────
+# v11 fix #1: the route now ONLY validates + dedups + queues, then 200s Meta
+# instantly. All heavy work (DB, AI, voice, sends) runs in the bounded worker
+# pool. Previously everything was synchronous → a slow AI/voice call (20-40s)
+# blocked the worker, Meta timed out at ~10s and re-sent, and 8 gunicorn slots
+# could starve under light load.
+# v11 fix #7: loops over EVERY entry / change / message (Meta can batch them);
+# v10 processed only entry[0]/changes[0]/messages[0] and silently dropped rest.
+def _process_wa_message(from_phone: str, msg: dict) -> None:
+    """Heavy per-message handler — runs in the background pool, fully outside
+    any Flask request context."""
+    try:
+        msg_type = msg.get("type", "text")
+
+        with _db_pool.get(read_only=True) as conn:
+            cur = _execute(conn,
+                "SELECT customer_id FROM customer_brains WHERE whatsapp_phone=? AND is_active=?",
+                (from_phone, True if isinstance(_db_pool, PostgreSQLPool) else 1))
+            row = cur.fetchone()
+        if not row:
+            log.info(f"📲 Unknown WA contact: {pii_vault.mask(from_phone)}")
+            return
+        customer_id = row["customer_id"]
+
+        if not customer_limiter.check(customer_id):
+            analytics.inc("ratelimit.customer.hit")
+            return
+
+        brain = get_customer_brain(customer_id)
+        if not brain:
+            return
+
+        if ghost_is_muted(from_phone):          # human owner has taken over
+            analytics.inc("ghost.skipped")
+            return
+
+        if msg_type == "text":
+            user_text = msg.get("text", {}).get("body", "").strip()
+            if not user_text:
+                return
+        elif msg_type == "audio":
+            user_text = transcribe_voice_note(msg.get("audio", {}).get("id", ""))
+            if not user_text:
+                send_whatsapp_async(from_phone,
+                    "🎤 Sorry, I couldn't hear that clearly — could you please type your message?")
+                return
+            analytics.inc("voice.transcribed")
+        else:
+            return
+
+        session_id = brain_cache.get(f"wa_session:{from_phone}")
+        if not session_id:
+            session_id = create_session(customer_id, channel="whatsapp")
+            brain_cache.set(f"wa_session:{from_phone}", session_id, ttl=3600)
+
+        gov = govern_message(user_text, from_phone,
+                             bot_name=(brain.get("bot_name") or ""),
+                             owner_phone=(brain.get("owner_phone") or ""))
+        for to, alert in gov["alerts"]:
+            send_owner_alert_async(to, alert)   # v11 #4: template-capable
+        if gov["muted"]:
+            return
+        if gov["reply"]:
+            send_whatsapp_async(from_phone, gov["reply"])
+            save_messages_batch(session_id, [
+                ("user",  user_text,    "whatsapp", 0),
+                ("model", gov["reply"], "local",    0),
+            ])
+            increment_chat_count(customer_id)
+            analytics.inc("whatsapp.local_reply")
+            return
+
+        history = get_session_history(session_id)
+        t0 = time.monotonic()
+        try:
+            reply, provider, escalated = ai_reply_pipeline(
+                brain, history, user_text,
+                user_uid=from_phone, channel="whatsapp")
+        except RuntimeError:
+            reply     = "Sorry, our AI is temporarily unavailable. We'll get back to you shortly!"
+            provider  = "fallback"
+            escalated = False
+        latency_ms = int((time.monotonic() - t0) * 1000)
+
+        if escalated:
+            ghost_mute(from_phone)
+
+        save_messages_batch(session_id, [
+            ("user",  user_text, "whatsapp", 0),
+            ("model", reply,     provider,   latency_ms),
+        ])
+        increment_chat_count(customer_id)
+        crm_add_contact(customer_id, f"WA {pii_vault.mask(from_phone)}",
+                         from_phone, notes=f"First msg: {user_text[:200]}")
+        send_whatsapp_async(from_phone, reply)
+
+        analytics.inc("whatsapp.chat.handled")
+        log.info(f"📱 WA chat → {customer_id} | {pii_vault.mask(from_phone)} | {provider}")
+    except Exception as exc:
+        log.error(f"❌ WA worker error: {exc}", exc_info=True)
+        analytics.inc("whatsapp.error")
+
+
 @app.route("/whatsapp-webhook", methods=["GET", "POST"])
 @limiter.limit(cfg.WEBHOOK_RATE_LIMIT)
 def whatsapp_webhook():
@@ -1906,94 +2938,164 @@ def whatsapp_webhook():
 
     raw_body  = request.get_data()
     signature = request.headers.get("X-Hub-Signature-256", "")
-    if not verify_whatsapp_signature(raw_body, signature):
+    if not verify_meta_signature(raw_body, signature, cfg.WHATSAPP_APP_SECRET):
         analytics.inc("whatsapp.sig_fail")
         log.warning(f"🚫 Invalid WA signature from {request.remote_addr}")
         return jsonify({"error": "Invalid signature"}), 401
 
-    data = request.get_json(silent=True) or {}
+    data    = request.get_json(silent=True) or {}
+    queued  = 0
+    for entry in data.get("entry", []):                 # #7: all entries
+        for change in entry.get("changes", []):          # #7: all changes
+            for msg in change.get("value", {}).get("messages", []):  # #7: all msgs
+                from_phone = msg.get("from", "")
+                wamid      = msg.get("id", "")
+                if wamid:                                # #_ dedupe Meta retries
+                    if brain_cache.get(f"wamid:{wamid}"):
+                        continue
+                    brain_cache.set(f"wamid:{wamid}", 1, ttl=600)
+                if not from_phone:
+                    continue
+                submit_bg(_process_wa_message, from_phone, msg)   # #1: async
+                queued += 1
+
+    # #1: ALWAYS 200 immediately — Meta must never time out or retry-storm.
+    return jsonify({"status": "queued", "accepted": queued}), 200
+
+
+# ── Instagram Messaging Webhook (v11 — async, same brain / CRM / memory) ─────
+# Same #1 + #7 fixes as WhatsApp: validate + dedupe + queue, then 200 instantly;
+# process every messaging event (not just events[0]) in the worker pool.
+def _process_ig_message(sender: str, recipient: str, message: dict) -> None:
+    """Heavy per-DM handler — runs in the background pool. Owner alerts still go
+    out over WhatsApp; the customer reply goes back over Instagram."""
     try:
-        entry   = data.get("entry", [{}])[0]
-        changes = entry.get("changes", [{}])[0]
-        value   = changes.get("value", {})
-        msgs    = value.get("messages", [])
-        if not msgs:
-            return jsonify({"status": "no_messages"}), 200
-
-        msg        = msgs[0]
-        from_phone = msg.get("from", "")
-        msg_type   = msg.get("type", "text")
-
-        if msg_type != "text":
-            return jsonify({"status": "non_text_ignored"}), 200
-
-        user_text = msg.get("text", {}).get("body", "").strip()
+        user_text = (message.get("text") or "").strip()
         if not user_text:
-            return jsonify({"status": "empty_message"}), 200
+            atts = message.get("attachments") or []
+            aud  = next((a for a in atts if a.get("type") == "audio"), None)
+            if aud:
+                user_text = transcribe_audio_url((aud.get("payload") or {}).get("url", ""))
+                if user_text:
+                    analytics.inc("voice.transcribed")
+            if not user_text:
+                return
 
         with _db_pool.get(read_only=True) as conn:
             cur = _execute(conn,
-                "SELECT customer_id FROM customer_brains WHERE whatsapp_phone=? AND is_active=?",
-                (from_phone, True if isinstance(_db_pool, PostgreSQLPool) else 1))
+                "SELECT customer_id FROM customer_brains WHERE instagram_id=? AND is_active=?",
+                (recipient, True if isinstance(_db_pool, PostgreSQLPool) else 1))
             row = cur.fetchone()
-
         if not row:
-            log.info(f"👑 CEO Bypass Activated for: {from_phone}")
-            customer_id = make_customer_id("CEO Haroon")
-            ceo_prompt = (
-                "You are HEONIX, an elite AI assistant created by CEO Haroon. "
-                "Your goal is to assist Haroon with extreme loyalty, high energy, and precision. "
-                "Always refer to him as 'Master' or 'CEO'. "
-                "Keep your answers short, powerful, and WhatsApp-friendly."
-            )
-            save_customer_brain(customer_id, "CEO Haroon", "Tech Empire", ceo_prompt, from_phone)
-            log.info(f"✅ Brain deployed instantly for CEO Haroon!")
-        else:
-            customer_id = row["customer_id"]
-        # Per-customer rate limit check (FIX #8)
+            log.info(f"📸 Unknown IG account: {pii_vault.mask(recipient)}")
+            return
+        customer_id = row["customer_id"]
+
         if not customer_limiter.check(customer_id):
             analytics.inc("ratelimit.customer.hit")
-            return jsonify({"status": "rate_limited"}), 429
+            return
 
         brain = get_customer_brain(customer_id)
         if not brain:
-            return jsonify({"status": "brain_not_found"}), 200
+            return
 
-        session_id = brain_cache.get(f"wa_session:{from_phone}")
+        uid = f"ig:{sender}"
+        if ghost_is_muted(uid):
+            analytics.inc("ghost.skipped")
+            return
+
+        session_id = brain_cache.get(f"ig_session:{sender}")
         if not session_id:
-            session_id = create_session(customer_id, channel="whatsapp")
-            brain_cache.set(f"wa_session:{from_phone}", session_id, ttl=3600)
+            session_id = create_session(customer_id, channel="instagram")
+            brain_cache.set(f"ig_session:{sender}", session_id, ttl=3600)
+
+        gov = govern_message(user_text, uid,
+                             bot_name=(brain.get("bot_name") or ""),
+                             owner_phone=(brain.get("owner_phone") or ""))
+        for to, alert in gov["alerts"]:
+            send_owner_alert_async(to, alert)   # owner alerts via WhatsApp (template-capable, v11 #4)
+        if gov["muted"]:
+            return
+        if gov["reply"]:
+            send_instagram_async(sender, gov["reply"])
+            save_messages_batch(session_id, [
+                ("user",  user_text,    "instagram", 0),
+                ("model", gov["reply"], "local",     0),
+            ])
+            increment_chat_count(customer_id)
+            analytics.inc("instagram.local_reply")
+            return
 
         history = get_session_history(session_id)
-
         t0 = time.monotonic()
         try:
-            reply, provider = multi_ai_reply(brain["system_prompt"], history, user_text)
-        except RuntimeError as exc:
-            reply    = "Sorry, our AI is temporarily unavailable. We'll get back to you shortly!"
-            provider = "fallback"
+            reply, provider, escalated = ai_reply_pipeline(
+                brain, history, user_text, user_uid=uid, channel="instagram")
+        except RuntimeError:
+            reply     = "Sorry, our AI is temporarily unavailable. We'll get back to you shortly!"
+            provider  = "fallback"
+            escalated = False
         latency_ms = int((time.monotonic() - t0) * 1000)
 
+        if escalated:
+            ghost_mute(uid)
+
         save_messages_batch(session_id, [
-            ("user",  user_text, "whatsapp", 0),
-            ("model", reply,     provider,   latency_ms),
+            ("user",  user_text, "instagram", 0),
+            ("model", reply,     provider,    latency_ms),
         ])
         increment_chat_count(customer_id)
+        crm_add_contact(customer_id, f"IG {pii_vault.mask(sender)}",
+                         f"ig_{sender}", notes=f"First msg: {user_text[:200]}")
+        send_instagram_async(sender, reply)
 
-        # Auto-CRM lead capture
-        crm_add_contact(customer_id, f"WA {pii_vault.mask(from_phone)}",
-                         from_phone, notes=f"First msg: {user_text[:200]}")
-
-        send_whatsapp_async(from_phone, reply)
-
-        analytics.inc("whatsapp.chat.handled")
-        log.info(f"📱 WA chat → {customer_id} | {pii_vault.mask(from_phone)} | {provider}")
-        return jsonify({"status": "replied", "provider": provider}), 200
-
+        analytics.inc("instagram.chat.handled")
+        log.info(f"📸 IG chat → {customer_id} | {pii_vault.mask(sender)} | {provider}")
     except Exception as exc:
-        log.error(f"❌ WA webhook error: {exc}", exc_info=True)
-        analytics.inc("whatsapp.error")
-        return jsonify({"error": "Processing failed"}), 500
+        log.error(f"❌ IG worker error: {exc}", exc_info=True)
+        analytics.inc("instagram.error")
+
+
+@app.route("/instagram-webhook", methods=["GET", "POST"])
+@limiter.limit(cfg.WEBHOOK_RATE_LIMIT)
+def instagram_webhook():
+    if request.method == "GET":
+        mode      = request.args.get("hub.mode")
+        token     = request.args.get("hub.verify_token")
+        challenge = request.args.get("hub.challenge")
+        if mode == "subscribe" and token == cfg.WHATSAPP_VERIFY_TOKEN:
+            log.info("✅ Instagram webhook verified by Meta.")
+            return challenge, 200
+        return "Forbidden", 403
+
+    raw_body  = request.get_data()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    secret    = cfg.INSTAGRAM_APP_SECRET or cfg.WHATSAPP_APP_SECRET
+    if not verify_meta_signature(raw_body, signature, secret):
+        analytics.inc("instagram.sig_fail")
+        return jsonify({"error": "Invalid signature"}), 401
+
+    data = request.get_json(silent=True) or {}
+    if data.get("object") != "instagram":
+        return jsonify({"status": "ignored_object"}), 200
+
+    queued = 0
+    for entry in data.get("entry", []):                 # #7: all entries
+        for ev in entry.get("messaging") or []:          # #7: all events
+            sender    = str(ev.get("sender", {}).get("id", ""))
+            recipient = str(ev.get("recipient", {}).get("id", ""))
+            message   = ev.get("message") or {}
+            if not sender or not message or message.get("is_echo"):
+                continue
+            mid = message.get("mid", "")
+            if mid:
+                if brain_cache.get(f"igmid:{mid}"):
+                    continue
+                brain_cache.set(f"igmid:{mid}", 1, ttl=600)
+            submit_bg(_process_ig_message, sender, recipient, message)   # #1: async
+            queued += 1
+
+    return jsonify({"status": "queued", "accepted": queued}), 200
 
 
 # ── Chat API ──────────────────────────────────────────────────────────────────
@@ -2025,7 +3127,9 @@ def chat():
 
     t0 = time.monotonic()
     try:
-        reply, provider = multi_ai_reply(brain["system_prompt"], history, req.message)
+        reply, provider, _escalated = ai_reply_pipeline(
+            brain, history, req.message,
+            user_uid=f"api:{req.customer_id}", channel="api")
     except RuntimeError as exc:
         analytics.inc("chat.ai_all_failed")
         return jsonify({
@@ -2262,7 +3366,7 @@ def analytics_snapshot():
     snap = analytics.snapshot()
     return jsonify({
         "region":      cfg.REGION,
-        "engine":      "HEONIX Ultra v8.0",
+        "engine":      "HEONIX Ultra v11.0",
         "counters":    snap["counters"],
         "latency_p99": snap["latency_p99"],
         "uptime_secs": snap["uptime_secs"],
@@ -2295,16 +3399,28 @@ def method_not_allowed(e):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 🚦  GRACEFUL SHUTDOWN  (FIX #12 — K8s SIGTERM drain)
+# 🚦  GRACEFUL SHUTDOWN  (v11 #14 — no blocking sleep inside the handler)
 # ─────────────────────────────────────────────────────────────────────────────
 def _shutdown_handler(signum, frame):
     log.info(f"📴 Signal {signum} — graceful shutdown starting...")
     _shutdown_event.set()
-    # Give in-flight requests 10 s to finish
-    time.sleep(10)
-    if _db_pool:
-        _db_pool.close_all()
-    log.info("✅ HEONIX Ultra v8.0 shut down cleanly.")
+    # v11 #14: was time.sleep(10) INSIDE the handler (blocks all signal
+    # delivery). Now: stop accepting new bg work, let queued sends finish
+    # with a hard ceiling enforced by a watchdog, then close the DB pool.
+    def _drain():
+        try:
+            _WORKER_POOL.shutdown(wait=True)   # waits for queued sends/alerts
+        except Exception:
+            pass
+        if _db_pool:
+            try:
+                _db_pool.close_all()
+            except Exception:
+                pass
+        log.info("✅ HEONIX Ultra v11.0 shut down cleanly.")
+    t = threading.Thread(target=_drain, name="drain", daemon=True)
+    t.start()
+    t.join(timeout=10)        # bounded — gunicorn's graceful-timeout is the boss
 
 
 signal.signal(signal.SIGTERM, _shutdown_handler)
@@ -2314,11 +3430,19 @@ signal.signal(signal.SIGINT,  _shutdown_handler)
 # ─────────────────────────────────────────────────────────────────────────────
 # 🚀  STARTUP SEQUENCE
 # ─────────────────────────────────────────────────────────────────────────────
+_startup_done = False
+_startup_lock = threading.Lock()
+
+
 def startup() -> None:
-    global _db_pool
+    global _db_pool, _startup_done
+    with _startup_lock:
+        if _startup_done:          # idempotent — safe under gunicorn + __main__
+            return
+        _startup_done = True
 
     log.info("=" * 76)
-    log.info("  👑  HEONIX ULTRA ENGINE  v8.0 — SILICON VALLEY ENTERPRISE EDITION")
+    log.info("  👑  HEONIX ULTRA ENGINE  v11.0 — PRODUCTION-HARDENED EDITION")
     log.info(f"  🌍  Region: {cfg.REGION}")
     log.info("=" * 76)
 
@@ -2333,10 +3457,33 @@ def startup() -> None:
     else:
         _db_pool = SQLitePool(cfg.DATABASE_FILE, pool_size=cfg.MAX_POOL_SIZE)
 
+    # ── v11 #2: never *silently* run a multi-worker deployment on fallbacks ──
+    on_paas    = bool(os.getenv("RENDER") or os.getenv("DYNO") or os.getenv("FLY_APP_NAME"))
+    sqlite_db  = isinstance(_db_pool, SQLitePool)
+    no_redis   = not (cfg.REDIS_URL and REDIS_AVAILABLE)
+    if sqlite_db and on_paas:
+        log.critical("🛑 SQLite on a PaaS dyno: disk is EPHEMERAL (all customer "
+                     "data lost on every deploy) and 'database locked' errors "
+                     "appear under 2+ workers. Set DATABASE_URL + DATABASE_MODE=postgres.")
+    if no_redis and on_paas:
+        log.critical("🛑 No REDIS_URL: dedupe / ghost-mute / response-cache are "
+                     "per-process → with 2 gunicorn workers users can get DOUBLE "
+                     "replies and human-takeover mute won't stick. Set REDIS_URL "
+                     "(Upstash free tier works).")
+    if cfg.STRICT_PROD and (sqlite_db or no_redis):
+        raise SystemExit("STRICT_PROD=1: refusing to boot without Postgres + Redis. "
+                         "Set DATABASE_URL, DATABASE_MODE=postgres, REDIS_URL "
+                         "— or unset STRICT_PROD for dev.")
+
     init_db()
+    _migrate_v10()   # v10: new columns, safe every boot
+    _migrate_v11()   # v11: CRM dedupe column + index, safe every boot
 
     # ── AI Providers ──
     _init_ai_providers()
+
+    # ── v10: RAG long-term memory ──
+    init_rag()
 
     # ── Background Janitor ──
     threading.Thread(target=_janitor_loop, name="Janitor", daemon=True).start()
@@ -2356,23 +3503,41 @@ def startup() -> None:
              f"{'ACTIVE ✅' if BCRYPT_AVAILABLE else 'SHA-256 fallback ⚠️'}")
     log.info(f"  📱  WhatsApp API:   "
              f"{'CONFIGURED ✅' if cfg.WHATSAPP_TOKEN else 'NOT SET ⚠️'}")
+    if not cfg.WHATSAPP_APP_SECRET:
+        log.warning("  🚨  WHATSAPP_APP_SECRET not set → webhook signature "
+                    "verification is OFF. Anyone who finds the URL can POST "
+                    "fake messages. Set it before going live!")
+    log.info(f"  📸  Instagram API:  "
+             f"{'CONFIGURED ✅' if cfg.INSTAGRAM_TOKEN else 'NOT SET (optional)'}")
+    log.info(f"  🧬  RAG Memory:     "
+             f"{'Qdrant ONLINE ✅' if _rag_ready else 'OFF (set QDRANT_URL + QDRANT_API_KEY)'}")
+    log.info(f"  🎙️   Voice Decoder:  "
+             f"{'Gemini→Whisper ✅' if (AI_PROVIDERS_ACTIVE.get('gemini') or AI_PROVIDERS_ACTIVE.get('openai')) else 'OFF'}")
     log.info(f"  🤖  AI Chain:       {[k for k, v in AI_PROVIDERS_ACTIVE.items() if v]}")
     log.info(f"  🔒  JWT Auth:       {'ACTIVE ✅' if JWT_AVAILABLE else 'pyjwt not installed ⚠️'}")
     log.info(f"  📊  Analytics:      {'ENABLED ✅' if cfg.ENABLE_ANALYTICS else 'DISABLED'}")
     log.info(f"  📬  Outbox/Saga:    ACTIVE ✅")
     log.info(f"  🪙  Customer RL:    60 req/min per customer_id ✅")
+    log.info(f"  🧵  BG Workers:     {_WORKER_POOL._max_workers} bounded threads ✅")
+    log.info(f"  📨  Owner Alerts:   "
+             f"{'template (24h-proof) ✅' if cfg.OWNER_ALERT_TEMPLATE else 'free-form (set OWNER_ALERT_TEMPLATE!) ⚠️'}")
     log.info(f"  📝  Log Format:     {cfg.LOG_FORMAT}")
     log.info("=" * 76)
-    log.info("  🦅  v8.0 — ALL DRAWBACKS RESOLVED — Zero Known Issues")
+    log.info("  🦅  v11.0 — PRODUCTION-HARDENED — async webhooks, fails safe, logs loud")
     log.info("=" * 76)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ▶️   ENTRY POINT
 # ─────────────────────────────────────────────────────────────────────────────
+# v10 FIX: run startup at import time too. The documented production command is
+#   gunicorn heonix_ultra_engine_v11:app
+# which imports this module but never executes __main__ — in v8 that left
+# _db_pool = None and every request crashed with "pool not initialised".
+# startup() is idempotent, so both paths are safe.
 startup()
+
 if __name__ == "__main__":
-    
     app.run(
         host         = "0.0.0.0",
         port         = cfg.PORT,
