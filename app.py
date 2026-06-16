@@ -2692,6 +2692,30 @@ def govern_message(text: str, uid: str, *, bot_name: str = "",
     return out
 
 
+# ── 🕐 v14-GEN2: real-time awareness (IST). The language model has no clock of
+#    its own, so without an explicit "now" it INVENTS a plausible time and gives
+#    wrong "are you open?" answers. We inject the real India/IST time at chat
+#    time and bucket the response cache by the hour so the open/closed answer is
+#    never served stale. Server runs in UTC, hence the explicit +05:30 offset.
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+def _now_ist() -> datetime:
+    return datetime.now(_IST)
+
+def _time_context() -> str:
+    n = _now_ist()
+    return ("\n\n[REAL-TIME — India / IST] It is currently "
+            + n.strftime("%A, %d %B %Y, %I:%M %p")
+            + ". Use THIS actual current time to decide whether the business is "
+              "open or closed right now (compare it against the working hours "
+              "stated above). Never guess, assume, or invent the time.")
+
+def _cache_hour_seed(base: str) -> str:
+    # Bucket the response cache by IST hour so time-sensitive answers
+    # (e.g. "are you open now?") cannot be served stale within the cache TTL.
+    return base + "\n#h=" + _now_ist().strftime("%Y%m%d%H")
+
+
 def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
                       user_uid: str, channel: str) -> Tuple[str, str, bool]:
     """
@@ -2707,7 +2731,7 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
     # served to a different person who happens to ask the same question.
     cacheable = (memory == "")
     if cacheable:
-        cached = resp_cache_get(base, user_text)
+        cached = resp_cache_get(_cache_hour_seed(base), user_text)
         if cached:
             analytics.inc("cache.response.hit")
             return cached, "cache", False
@@ -2717,6 +2741,7 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
         sys_prompt += ("\n\nRELEVANT MEMORY from earlier chats with this same "
                        "person (use naturally, don't recite):\n" + memory)
     sys_prompt += _LANGUAGE_RULE + _ESCALATION_RULE
+    sys_prompt += _time_context()
 
     reply, provider = multi_ai_reply(sys_prompt, history, user_text)
 
@@ -2734,7 +2759,7 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
         analytics.inc("escalation.ai")
     else:
         if cacheable and provider != "cache":
-            resp_cache_put(base, user_text, reply)
+            resp_cache_put(_cache_hour_seed(base), user_text, reply)
         rag_store(brain.get("customer_id", ""), user_uid, user_text, reply)
 
     return reply, provider, escalated
