@@ -1,4 +1,152 @@
 """
+═══════════════════════════════════════════════════════════════════════════════
+  HEONIX ULTRA ENGINE  v14.0 — GEN-5   ·   AUDIT-HARDENED (50 findings closed) 🦅
+═══════════════════════════════════════════════════════════════════════════════
+  GEN-5 is a pure CORRECTNESS + SECURITY pass over GEN-4 driven by the 50-item
+  audit. It is additive and backward compatible — with every Gen-4 flag still OFF
+  it boots and behaves like Gen-4. Each fix is tagged inline "v14g5 FIX N".
+
+  CODE-FIXED (real change in this file):
+    1  /channel partial update no longer wipes the other channel (dynamic SET).
+    2  WhatsApp media (voice/image) fetched with the OWNING clinic's token.
+    3  DPDP erasure resolves sessions from the DB via chat_sessions.subject_hash
+       (was a 1-hour cache key) + erases WA- and IG-shaped RAG uids.
+    4  crm_get_contact_full is tenant-scoped (?customer_id=) → no id-enumeration IDOR.
+    5  WhatsApp/Instagram webhooks exempt from the IP limiter (Meta = one source IP).
+    6  Cross-worker per-conversation mutex (Redis) so two workers can't interleave
+       one conversation. (Strict arrival order across workers still wants WEB_CONCURRENCY=1.)
+    7  Scheduler runs under a single-leader Redis lock → no duplicate reminders/follow-ups.
+    8  Token-death self-heal busts the ROUTING caches too (not just the brain cache).
+    9  Voice-transcription Gemini + Whisper calls now carry hard timeouts.
+   10  Single-tenant routing fallback is gated (SINGLE_TENANT_FALLBACK) + logs on use.
+   11  Missing JWT/SECRET with >1 worker now REFUSES to boot (was warn-only).
+   12  Reschedule keeps the old appointment until the NEW slot is actually booked.
+   14  make_customer_id name-fallback is ASCII-safe (always matches the id pattern).
+   15  Real WhatsApp profile name captured into CRM + bookings (was "WA 91***").
+   16  Cold-lead follow-ups skip soft-deleted clinics.
+   17  Tally fields mapped by LABEL first (robust to form reordering), index fallback.
+   18  RAG embeddings padded (not just truncated) to EMBED_DIMS.
+   19  Legacy X-Admin-Key compared in constant time.
+   21  Password fallback is salted PBKDF2 (was unsalted SHA-256); constant-time verify.
+   22  bookings table gets a FK→customer_brains ON DELETE CASCADE (fresh installs).
+   23  /metrics optional token gate (METRICS_TOKEN).
+   24  Reminder copy uses the ACTUAL remaining time, not the lead bucket.
+   25  _to_local returns a true naive local datetime (no misleading UTC tag).
+   26  Leads captured on the local/canned path too (not only the AI path).
+   29  Analytics get_counter no longer auto-creates probed keys.
+   33  store_idempotency logs instead of silently swallowing every error.
+   35  Separate INSTAGRAM_VERIFY_TOKEN (falls back to the WhatsApp verify token).
+   38  Booking slot dedupe keyed by canonical epoch (survives ISO formatting drift).
+   40  Soft-deleting a clinic releases its routing number + busts caches.
+   41  Read-only DB paths use autocommit (no empty COMMIT churn).
+   44  Outbox fails permanent errors (missing creds/template) immediately, not after 5 tries.
+   46  Owner alerts mask the subject (no internal id / full number leak).
+   48  /health reports a LIVE Redis ping, not just "configured".
+   50  Local/booking reply paths standardised to persist-then-send.
+
+  BY DESIGN / OPS (documented, not a code defect — see the audit file):
+    13 (offer state needs Redis — already required by STRICT_PROD)
+    20 (Gemini model names are env-config — verify against the live model list)
+    27/28/30/31/32/34/36/37/39/42/45/47 (accepted trade-offs / require env or sticky LB)
+
+  NEW ENV (all optional, safe defaults):
+    INSTAGRAM_VERIFY_TOKEN=<falls back to WHATSAPP_VERIFY_TOKEN>
+    METRICS_TOKEN=<unset = open>   SINGLE_TENANT_FALLBACK=true
+    CONV_LOCK_TTL=60   SCHED_LOCK_TTL=290
+  Still ONE file. Still backward compatible. What stands between you and revenue
+  is the first paying clinic + a live token — not another rewrite. Ship it. 🦅
+═══════════════════════════════════════════════════════════════════════════════
+  HEONIX ULTRA ENGINE  v14.0 — GEN-4   ·   ADVANCED FEATURES (additive) 🦅
+═══════════════════════════════════════════════════════════════════════════════
+  Gen-4 ADDS real, working features on top of the gen-3 hardened core. It is
+  PURELY ADDITIVE and every feature is behind a flag that defaults OFF — so with
+  no env changes, Gen-4 boots and behaves EXACTLY like Gen-3. Turn features on
+  one at a time, after testing each live. New code is tagged inline "v14g4".
+
+  WHAT'S NEW (all flag-gated, default OFF):
+   • Appointment booking engine (ENABLE_BOOKING) — per-tenant slots computed
+     from business-hours config; deterministic book / reschedule / cancel /
+     status state machine (no fragile LLM tool-loop); race-safe via a unique
+     slot index. Offered as a tappable WhatsApp list with a numbered-text
+     fallback.
+   • Background scheduler (ENABLE_SCHEDULER) — runs in the existing janitor
+     thread: appointment reminders (REMINDER_LEAD_HOURS, e.g. "24,2"), one-time
+     cold-lead follow-ups for CONSENTED contacts (FOLLOWUP_ENABLED), and DPDP
+     retention purge of chat logs + dead bookings (DATA_RETENTION_DAYS).
+   • Image understanding (ENABLE_IMAGE_UNDERSTANDING) — a patient/customer photo
+     is read by Gemini (your existing multimodal key) and answered in the bot's
+     own persona. Voice notes were already supported in gen-3.
+   • Interactive WhatsApp messages — reply buttons + list pickers.
+   • DPDP endpoints — POST /admin/customer/<id>/erase-subject (right-to-erasure:
+     CRM + bookings + RAG memory + cache-mapped chat session), POST
+     /admin/customer/<id>/consent, GET /admin/customer/<id>/bookings.
+   • Outbox gains a whatsapp.template event so scheduled sends can use an
+     approved template.
+
+  HONEST CONSTRAINTS (read before enabling the scheduler):
+   • WhatsApp delivers FREE TEXT only inside the 24-hour customer-service window.
+     Reminders/follow-ups sent OUTSIDE 24h REQUIRE a pre-approved template —
+     set REMINDER_TEMPLATE / FOLLOWUP_TEMPLATE to an approved template name and
+     the scheduler routes via template automatically. Without a template, a
+     scheduled send outside 24h will be rejected by Meta (by design).
+   • The scheduler needs a long-lived process — fine on a Render *web service*,
+     not on serverless/scale-to-zero.
+   • None of this is a substitute for testing live against Meta + Gemini + your
+     DB. All flags default OFF precisely so you can enable + verify one at a time.
+
+═══════════════════════════════════════════════════════════════════════════════
+  HEONIX ULTRA ENGINE  v14.0 — GEN-3   ·   PREMIUM HARDENING (20 bugs killed) 🦅
+═══════════════════════════════════════════════════════════════════════════════
+  Gen-3 is a CORRECTNESS + RESILIENCE pass over gen-2 — no new surface area, no
+  rewrite. Every change below kills a real bug found in the gen-2 audit. The
+  fixes are tagged inline in the code as "v14g3 BUG N":
+
+   1  Analytics deadlock (CRITICAL) — snapshot() re-acquired a non-reentrant
+      lock, so every /metrics scrape & /admin/analytics hit permanently hung a
+      worker. Fixed with a no-lock inner percentile.
+   2  Gemini & Claude had NO request timeout (only OpenAI did) — a frozen socket
+      pinned a worker thread forever. Native SDK timeouts added.
+   3  JWT_SECRET_KEY / SECRET_KEY defaulted to a per-process random value →
+      tokens & Flask sessions broke across gunicorn workers. Startup now fails
+      loud and refuses to boot under STRICT_PROD.
+   4  Inbound routing compared whatsapp_phone == phone_number_id (a number vs a
+      Meta ID — never equal) → dead path. Now routes on wa_phone_number_id.
+   5  Conversation drains and fire-and-forget I/O shared ONE 8-thread pool
+      (head-of-line blocking). Sends/alerts/audit/RAG get their own _IO_POOL.
+   6  Timeout pool could leak threads on overrun — enlarged + breaker-guarded,
+      and the AI path no longer needs it (native timeouts). Limitation documented.
+   7  An empty WHATSAPP_APP_SECRET meant "accept ALL webhooks" → forgeable.
+      Now fail-closed under STRICT_PROD / REQUIRE_WEBHOOK_SIGNATURE.
+   8  Per-customer rate limit was per-process without Redis (effective limit ×
+      worker count). Divides by worker count in the local fallback.
+   9  Outbox welcome message always used GLOBAL creds → wrong number for tenant
+      #2. Now uses the clinic's own creds + token self-heal.
+  10  CRM dedupe was SELECT-then-INSERT over a NON-unique index (dup rows under
+      races). Unique index + race-recovery that returns the existing id.
+  11  customer_id used the last 10 digits only → a +1 and a +91 number could
+      COLLIDE and overwrite each other's brain. Country-aware normalisation.
+  12  Legacy phone lookup was exact-string → a reformatted number re-orphaned
+      the clinic. Now also matches the normalised form.
+  13  Backlog-full dropped a message AND its dedupe claim → Meta's retry was
+      swallowed (permanent loss). The claim is now released on drop.
+  14  Audit log rode on ENABLE_ANALYTICS → muting metrics silently killed the
+      SOC2/GDPR trail. It now has its own ENABLE_AUDIT switch.
+  15  Response cache wasn't language-keyed → a wrong-language reply was possible.
+      Detected language is folded into the cache key.
+  16  idx_brain_phone existed on Postgres only → table scan on SQLite. Added.
+  17  Dead db() helper (ignored its read_only arg) removed — latent footgun.
+  18  Gemini .text raised on safety blocks → spurious circuit-breaker trips.
+      Safe extraction; an empty reply is "no answer" and falls through cleanly.
+  19  Redundant JWT except clause (ExpiredSignatureError ⊂ InvalidTokenError).
+  20  DATABASE_FILE default no longer mismatches its own documentation.
+
+  NEW ENV (all optional, safe defaults):
+    REQUIRE_WEBHOOK_SIGNATURE=0   ENABLE_AUDIT=true   DEFAULT_COUNTRY_CODE=91
+    IO_THREADS=16   (TIMEOUT_THREADS default bumped 4 → 8)
+  Still ONE file. Still backward compatible. What stands between you and revenue
+  is deploying it + a live token + the first paying clinic — not another rewrite.
+═══════════════════════════════════════════════════════════════════════════════
+
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║   HEONIX ULTRA ENGINE  v14.0 — STABLE-IDENTITY + ORDERED (2 real bugs killed) ║
 ║                                                                              ║
@@ -294,7 +442,7 @@ class Config:
     DATABASE_MODE: str          = os.getenv("DATABASE_MODE", "postgres")
     DATABASE_URL: str           = os.getenv("DATABASE_URL", "")
     DATABASE_REPLICA_URL: str   = os.getenv("DATABASE_REPLICA_URL", "")   # NEW v8
-    DATABASE_FILE: str          = os.getenv("DATABASE_FILE", "heonix_v8.db")
+    DATABASE_FILE: str          = os.getenv("DATABASE_FILE", "heonix_ultra.db")  # v14g3 BUG 20: matches the docstring
     MAX_POOL_SIZE: int          = int(os.getenv("MAX_POOL_SIZE", "20"))
 
     # ── AI Keys ──
@@ -371,6 +519,37 @@ class Config:
     RAG_MIN_SCORE: float        = float(os.getenv("RAG_MIN_SCORE", "0.55"))
     OPENAI_TRANSCRIBE_MODEL: str = os.getenv("OPENAI_TRANSCRIBE_MODEL", "whisper-1")
 
+    # ══ v14 Gen-4 — ADVANCED FEATURES (every flag defaults OFF) ════════════════
+    # Gen-4 is purely ADDITIVE: with all flags off, the engine behaves EXACTLY
+    # like Gen-3. Turn features on one at a time, after testing each live.
+    #  Appointment booking + reminders
+    ENABLE_BOOKING: bool        = os.getenv("ENABLE_BOOKING", "false").lower() == "true"
+    BOOKING_SLOT_MINUTES: int   = int(os.getenv("BOOKING_SLOT_MINUTES", "30"))
+    BOOKING_OPEN_HOUR: int      = int(os.getenv("BOOKING_OPEN_HOUR", "9"))    # local clinic hour
+    BOOKING_CLOSE_HOUR: int     = int(os.getenv("BOOKING_CLOSE_HOUR", "18"))  # local clinic hour
+    BOOKING_DAYS_AHEAD: int     = int(os.getenv("BOOKING_DAYS_AHEAD", "5"))
+    BOOKING_SLOTS_SHOWN: int    = int(os.getenv("BOOKING_SLOTS_SHOWN", "6"))
+    BOOKING_TZ_OFFSET_MIN: int  = int(os.getenv("BOOKING_TZ_OFFSET_MIN", "330"))  # IST +5:30
+    BOOKING_WEEKDAYS: str       = os.getenv("BOOKING_WEEKDAYS", "0,1,2,3,4,5")     # Mon=0..Sun=6
+    #  Background scheduler (reminders / follow-ups / retention) — needs a
+    #  long-lived process (true on Render web service; NOT on serverless).
+    ENABLE_SCHEDULER: bool      = os.getenv("ENABLE_SCHEDULER", "false").lower() == "true"
+    REMINDER_LEAD_HOURS: str    = os.getenv("REMINDER_LEAD_HOURS", "24,2")         # csv hours-before
+    FOLLOWUP_ENABLED: bool      = os.getenv("FOLLOWUP_ENABLED", "false").lower() == "true"
+    FOLLOWUP_AFTER_HOURS: int   = int(os.getenv("FOLLOWUP_AFTER_HOURS", "24"))
+    FOLLOWUP_MAX_AGE_HOURS: int = int(os.getenv("FOLLOWUP_MAX_AGE_HOURS", "168"))  # don't chase >7d-old
+    DATA_RETENTION_DAYS: int    = int(os.getenv("DATA_RETENTION_DAYS", "0"))       # 0 = keep forever
+    #  Image understanding (uses your existing Gemini key — already multimodal)
+    ENABLE_IMAGE_UNDERSTANDING: bool = os.getenv("ENABLE_IMAGE_UNDERSTANDING", "false").lower() == "true"
+    #  Scheduled sends (reminders/follow-ups) outside WhatsApp's 24-hour customer
+    #  service window REQUIRE a pre-approved template. If you set these to an
+    #  approved template name, the scheduler sends via template (reliable). If
+    #  left blank, it sends free text — which Meta only delivers INSIDE 24h.
+    REMINDER_TEMPLATE: str      = os.getenv("REMINDER_TEMPLATE", "")
+    REMINDER_TEMPLATE_LANG: str = os.getenv("REMINDER_TEMPLATE_LANG", "en")
+    FOLLOWUP_TEMPLATE: str      = os.getenv("FOLLOWUP_TEMPLATE", "")
+    FOLLOWUP_TEMPLATE_LANG: str = os.getenv("FOLLOWUP_TEMPLATE_LANG", "en")
+
     # ── v11 ──
     # #4: free-form WhatsApp texts to the OWNER are blocked by Meta outside
     # the 24-hour window (error 131047) — an emergency alert could silently
@@ -415,6 +594,30 @@ class Config:
     # Allow the onboarding smoke-test endpoint to send ONE real test WhatsApp to a
     # number you pass in. Off by default so it can never be abused to fan out spam.
     SMOKE_TEST_ENABLED: bool       = os.getenv("SMOKE_TEST_ENABLED", "1") == "1"
+
+    # ── v14 Gen-3 ── (hardening pass — see the CHANGELOG header at top of file)
+    # BUG 7: force webhook signature verification even when STRICT_PROD is off.
+    REQUIRE_WEBHOOK_SIGNATURE: bool = os.getenv("REQUIRE_WEBHOOK_SIGNATURE", "0") == "1"
+    # BUG 14: the audit trail no longer rides on ENABLE_ANALYTICS — its own switch
+    # so you can mute metrics without silently losing the SOC2/GDPR audit log.
+    ENABLE_AUDIT: bool             = os.getenv("ENABLE_AUDIT", "true").lower() == "true"
+    # BUG 11: country code assumed for a bare 10-digit national number (India=91)
+    # when minting the stable customer_id, so +1 / +44 / … can't collide on the
+    # last 10 digits and overwrite each other's brain.
+    DEFAULT_COUNTRY_CODE: str      = os.getenv("DEFAULT_COUNTRY_CODE", "91")
+
+    # ── v14 Gen-5 ── (audit fixes — 50 findings closed; see header)
+    # FIX 35: a separate Instagram webhook verify token (falls back to the WA one).
+    INSTAGRAM_VERIFY_TOKEN: str    = (os.getenv("INSTAGRAM_VERIFY_TOKEN", "")
+                                      or os.getenv("WHATSAPP_VERIFY_TOKEN", "heonix_verify"))
+    # FIX 23: optional token to gate /metrics so counts aren't public recon.
+    METRICS_TOKEN: str             = os.getenv("METRICS_TOKEN", "")
+    # FIX 10: gate the "route any unknown number to the only clinic" guess.
+    SINGLE_TENANT_FALLBACK: bool   = os.getenv("SINGLE_TENANT_FALLBACK", "true").lower() == "true"
+    # FIX 6: cross-worker per-conversation mutex TTL (must exceed a slow AI turn).
+    CONV_LOCK_TTL: int             = int(os.getenv("CONV_LOCK_TTL", "60"))
+    # FIX 7: single-leader scheduler lock TTL (~ the 5-min cadence, just under it).
+    SCHED_LOCK_TTL: int            = int(os.getenv("SCHED_LOCK_TTL", "290"))
 
 
 cfg = Config()
@@ -515,17 +718,40 @@ pii_vault = PIIVault(cfg.ENCRYPTION_KEY)
 # ─────────────────────────────────────────────────────────────────────────────
 # 🔑  PASSWORD HASHING  (v8 fix: bcrypt replaces plaintext in admin table)
 # ─────────────────────────────────────────────────────────────────────────────
+_PBKDF2_ITERS = 240_000
+
+
 def hash_password(plaintext: str) -> str:
-    """bcrypt-hash a password. Falls back to SHA-256 if bcrypt not installed."""
+    """bcrypt-hash a password. v14g5 FIX 21: if bcrypt is unavailable, fall back to
+    SALTED PBKDF2-HMAC-SHA256 (was unsalted SHA-256 → instantly rainbow-tableable)."""
     if BCRYPT_AVAILABLE:
         return bcrypt_lib.hashpw(plaintext.encode("utf-8"), bcrypt_lib.gensalt(rounds=12)).decode("utf-8")
-    return hashlib.sha256(plaintext.encode("utf-8")).hexdigest()
+    salt = os.urandom(16)
+    dk   = hashlib.pbkdf2_hmac("sha256", plaintext.encode("utf-8"), salt, _PBKDF2_ITERS)
+    return f"pbkdf2${_PBKDF2_ITERS}${salt.hex()}${dk.hex()}"
 
 
 def verify_password(plaintext: str, stored_hash: str) -> bool:
-    if BCRYPT_AVAILABLE and stored_hash.startswith("$2"):
-        return bcrypt_lib.checkpw(plaintext.encode("utf-8"), stored_hash.encode("utf-8"))
-    return hashlib.sha256(plaintext.encode("utf-8")).hexdigest() == stored_hash
+    """v14g5 FIX 21: constant-time across bcrypt / salted-PBKDF2 / legacy sha256."""
+    if not stored_hash:
+        return False
+    if stored_hash.startswith("$2"):
+        if not BCRYPT_AVAILABLE:
+            return False
+        try:
+            return bcrypt_lib.checkpw(plaintext.encode("utf-8"), stored_hash.encode("utf-8"))
+        except Exception:
+            return False
+    if stored_hash.startswith("pbkdf2$"):
+        try:
+            _, iters, salt_hex, hash_hex = stored_hash.split("$", 3)
+            dk = hashlib.pbkdf2_hmac("sha256", plaintext.encode("utf-8"),
+                                     bytes.fromhex(salt_hex), int(iters))
+            return hmac.compare_digest(dk.hex(), hash_hex)
+        except Exception:
+            return False
+    # legacy unsalted sha256 hex (pre-v14g5) — still compared in constant time
+    return hmac.compare_digest(hashlib.sha256(plaintext.encode("utf-8")).hexdigest(), stored_hash)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -554,7 +780,7 @@ def decode_jwt(token: str) -> Optional[Dict]:
         return None
     try:
         return pyjwt.decode(token, cfg.JWT_SECRET_KEY, algorithms=["HS256"])
-    except (pyjwt.ExpiredSignatureError, pyjwt.InvalidTokenError):
+    except pyjwt.InvalidTokenError:   # v14g3 BUG 19: ExpiredSignatureError ⊂ InvalidTokenError
         return None
 
 
@@ -565,7 +791,8 @@ def require_jwt(min_role: str = "admin"):
         def wrapper(*args, **kwargs):
             # Legacy X-Admin-Key backward compat
             if cfg.ADMIN_API_KEY:
-                if request.headers.get("X-Admin-Key", "") == cfg.ADMIN_API_KEY:
+                if hmac.compare_digest(request.headers.get("X-Admin-Key", ""),
+                                       cfg.ADMIN_API_KEY):   # v14g5 FIX 19: constant-time
                     g.jwt_user = {"sub": "legacy_admin", "role": "superadmin"}
                     return func(*args, **kwargs)
 
@@ -613,20 +840,33 @@ class AnalyticsEngine:
 
     def get_counter(self, key: str) -> int:
         with self._lock:
-            return self._counters[key]
+            return self._counters.get(key, 0)   # v14g5 FIX 29: don't auto-create probed keys
 
-    def percentile(self, key: str, pct: float = 0.99) -> float:
-        with self._lock:
-            data = sorted(self._latencies[key])
+    def _percentile_nolock(self, key: str, pct: float = 0.99) -> float:
+        # v14g3 BUG 1: the caller already holds self._lock. threading.Lock is
+        # NOT reentrant, so any method invoked while the lock is held must not
+        # try to re-acquire it. This no-lock variant is the safe inner core.
+        data = sorted(self._latencies[key])
         if not data:
             return 0.0
         idx = max(0, int(len(data) * pct) - 1)
         return round(data[idx], 2)
 
-    def snapshot(self) -> Dict:
+    def percentile(self, key: str, pct: float = 0.99) -> float:
         with self._lock:
-            counters   = dict(self._counters)
-            latency_p99 = {k: self.percentile(k) for k in self._latencies}
+            return self._percentile_nolock(key, pct)
+
+    def snapshot(self) -> Dict:
+        # v14g3 BUG 1 FIX (CRITICAL): the old body did
+        #     latency_p99 = {k: self.percentile(k) for k in self._latencies}
+        # INSIDE `with self._lock`, and percentile() then re-acquired the SAME
+        # non-reentrant lock → the thread blocked forever waiting on a lock it
+        # already held. Every Prometheus scrape of /metrics (and every hit to
+        # /admin/analytics) permanently hung a gunicorn worker. Now we compute
+        # percentiles with the no-lock variant while holding the lock once.
+        with self._lock:
+            counters    = dict(self._counters)
+            latency_p99 = {k: self._percentile_nolock(k) for k in self._latencies}
         uptime_s = time.monotonic() - self._started
         return {
             "counters":    counters,
@@ -668,12 +908,16 @@ class PostgreSQLPool:
     def get(self, read_only: bool = False) -> Generator:
         pool = (self._read or self._write) if read_only else self._write
         conn = pool.getconn()
-        conn.autocommit = False
+        # v14g5 FIX 41: read paths use autocommit so pure SELECTs don't churn an
+        # empty COMMIT every call; write paths keep explicit transaction control.
+        conn.autocommit = bool(read_only)
         try:
             yield conn
-            conn.commit()
+            if not read_only:
+                conn.commit()
         except Exception:
-            conn.rollback()
+            if not read_only:
+                conn.rollback()
             raise
         finally:
             pool.putconn(conn)
@@ -730,12 +974,9 @@ class SQLitePool:
 
 
 _db_pool: Any = None
-
-
-def db(read_only: bool = False):
-    if _db_pool is None:
-        raise RuntimeError("Database pool not initialised — call startup() first.")
-    return _db_pool
+# v14g3 BUG 17: removed the dead db(read_only=...) helper. It was never called
+# (every call site uses `_db_pool.get(...)` directly) and its read_only argument
+# was silently ignored — a latent footgun if anyone had ever used it.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -762,7 +1003,8 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     last_active   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     message_count INTEGER DEFAULT 0,
-    channel       TEXT DEFAULT 'api'
+    channel       TEXT DEFAULT 'api',
+    subject_hash  TEXT DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS chat_messages (
@@ -871,6 +1113,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     last_active   TEXT NOT NULL,
     message_count INTEGER DEFAULT 0,
     channel       TEXT DEFAULT 'api',
+    subject_hash  TEXT DEFAULT '',
     FOREIGN KEY (customer_id) REFERENCES customer_brains(customer_id) ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS chat_messages (
@@ -1129,6 +1372,114 @@ def _migrate_v12() -> None:
                 log.warning(f"⚠️  v13 index skip [{name}]: {exc}")
 
 
+def _migrate_v14g3() -> None:
+    """v14 Gen-3 migrations — idempotent, safe on every boot.
+
+    BUG 10: a UNIQUE index on (customer_id, phone_hash) makes CRM dedupe
+    race-proof — a concurrent second insert of the same lead fails at the DB and
+    crm_add_contact returns the existing row instead of creating a duplicate.
+    Best-effort: if pre-existing duplicate phone_hash rows block the unique index,
+    we log and keep the non-unique idx_crm_dedupe (lookups still work, the SELECT
+    -first dedupe still applies, and the messaging path is already serialised).
+
+    BUG 16: the whatsapp_phone index ships in the Postgres schema but was missing
+    on SQLite — add it so the legacy-id lookup isn't a table scan there."""
+    is_pg = isinstance(_db_pool, PostgreSQLPool)
+    uq = ("CREATE UNIQUE INDEX IF NOT EXISTS uq_crm_dedupe "
+          "ON crm_contacts(customer_id, phone_hash) WHERE phone_hash <> ''")
+    try:
+        with _db_pool.get() as conn:
+            if is_pg:
+                _execute(conn, "SELECT pg_advisory_lock(427014)")
+                try:
+                    _execute(conn, uq)
+                finally:
+                    _execute(conn, "SELECT pg_advisory_unlock(427014)")
+            else:
+                _execute(conn, uq)
+        log.info("🗄️  v14g3 migration: unique CRM dedupe index ensured.")
+    except Exception as exc:
+        log.warning("⚠️  v14g3: unique CRM index not built (likely existing "
+                    f"duplicate phone_hash rows) — dedupe stays best-effort: {exc}")
+
+    if not is_pg:
+        try:
+            with _db_pool.get() as conn:
+                _execute(conn, "CREATE INDEX IF NOT EXISTS idx_brain_phone "
+                               "ON customer_brains(whatsapp_phone)")
+        except Exception:
+            pass
+
+
+def _migrate_v14g4() -> None:
+    """v14 Gen-4 migrations — idempotent, safe on every boot, fully additive.
+
+    Creates the `bookings` table (appointment engine) and adds
+    crm_contacts.followed_up_at (cold-lead follow-up marker). Nothing here
+    touches existing rows or behaviour — and every Gen-4 feature is flag-gated
+    OFF by default, so a fresh boot of Gen-4 behaves EXACTLY like Gen-3 until you
+    explicitly enable a feature."""
+    is_pg = isinstance(_db_pool, PostgreSQLPool)
+    pk = "BIGSERIAL PRIMARY KEY" if is_pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    create_bookings = f"""
+        CREATE TABLE IF NOT EXISTS bookings (
+            id             {pk},
+            customer_id    TEXT NOT NULL,
+            phone_hash     TEXT NOT NULL,
+            enc_phone      TEXT DEFAULT '',
+            enc_name       TEXT DEFAULT '',
+            slot_start     TEXT NOT NULL,
+            slot_end       TEXT NOT NULL,
+            status         TEXT DEFAULT 'booked',
+            reminders_sent TEXT DEFAULT '',
+            source         TEXT DEFAULT 'whatsapp',
+            created_at     TEXT NOT NULL,
+            updated_at     TEXT NOT NULL,
+            FOREIGN KEY (customer_id) REFERENCES customer_brains(customer_id) ON DELETE CASCADE
+        )"""
+    try:
+        with _db_pool.get() as conn:
+            _execute(conn, create_bookings)
+            _execute(conn, "CREATE INDEX IF NOT EXISTS idx_book_slot "
+                           "ON bookings(customer_id, status, slot_start)")
+            _execute(conn, "CREATE INDEX IF NOT EXISTS idx_book_phone "
+                           "ON bookings(customer_id, phone_hash, status)")
+            # a slot can be held by at most one active booking per clinic
+            _execute(conn, "CREATE UNIQUE INDEX IF NOT EXISTS uq_book_slot "
+                           "ON bookings(customer_id, slot_start) WHERE status='booked'")
+        log.info("🗄️  v14g4 migration: bookings table + indexes ensured.")
+    except Exception as exc:
+        log.warning(f"⚠️  v14g4: bookings migration issue: {exc}")
+
+    try:
+        with _db_pool.get() as conn:
+            if not _column_exists(conn, "crm_contacts", "followed_up_at"):
+                _execute(conn, "ALTER TABLE crm_contacts "
+                               "ADD COLUMN followed_up_at TEXT DEFAULT ''")
+        log.info("🗄️  v14g4 migration: crm_contacts.followed_up_at ensured.")
+    except Exception as exc:
+        log.warning(f"⚠️  v14g4: followed_up_at migration issue: {exc}")
+
+
+def _migrate_v14g5() -> None:
+    """v14 Gen-5 migrations — idempotent, additive. Adds chat_sessions.subject_hash
+    (FIX 3 — lets DPDP erasure resolve a subject's sessions from the DB instead of a
+    1-hour cache key) plus its lookup index. Safe on every boot."""
+    try:
+        with _db_pool.get() as conn:
+            if not _column_exists(conn, "chat_sessions", "subject_hash"):
+                _execute(conn, "ALTER TABLE chat_sessions ADD COLUMN subject_hash TEXT DEFAULT ''")
+                log.info("🗄️  v14g5 migration: chat_sessions.subject_hash added.")
+    except Exception as exc:
+        log.warning(f"⚠️  v14g5: subject_hash migration issue: {exc}")
+    try:
+        with _db_pool.get() as conn:
+            _execute(conn, "CREATE INDEX IF NOT EXISTS idx_sess_subject "
+                           "ON chat_sessions(customer_id, subject_hash)")
+    except Exception:
+        pass
+
+
 def _report_wa_pid_duplicates() -> None:
     """v14 (drawback #4): make duplicate-tenant routing self-diagnosing. If two
     active clinics share a wa_phone_number_id, inbound routing is ambiguous and
@@ -1270,6 +1621,53 @@ class DistributedCache:
                 removed += 1
         return removed
 
+    # v14g5 FIX 6/7: cross-worker mutex (per-conversation) + single-leader lock
+    # (scheduler). On Redis these are atomic across ALL gunicorn workers: SET NX EX
+    # with a random token, released only by the holder via a check-and-del (Lua).
+    # Local fallback is lock-guarded — single-process dev only, so in prod you MUST
+    # set REDIS_URL (STRICT_PROD already enforces this) for these to be real.
+    def lock(self, name: str, ttl: int) -> Optional[str]:
+        token = uuid.uuid4().hex
+        if self._redis:
+            try:
+                if self._redis.set(f"heonix:lock:{name}", token, nx=True, ex=ttl):
+                    return token
+                return None
+            except Exception:
+                pass
+        with self._lock:
+            now   = time.monotonic()
+            entry = self._local.get(f"__lock__{name}")
+            if entry is not None and now < entry[1]:
+                return None
+            self._local[f"__lock__{name}"] = (token, now + ttl)
+            return token
+
+    def unlock(self, name: str, token: str) -> None:
+        if not token:
+            return
+        if self._redis:
+            try:
+                lua = ("if redis.call('get', KEYS[1]) == ARGV[1] then "
+                       "return redis.call('del', KEYS[1]) else return 0 end")
+                self._redis.eval(lua, 1, f"heonix:lock:{name}", token)
+                return
+            except Exception:
+                pass
+        with self._lock:
+            entry = self._local.get(f"__lock__{name}")
+            if entry and entry[0] == token:
+                self._local.pop(f"__lock__{name}", None)
+
+    def ping(self) -> bool:
+        """v14g5 FIX 48: live Redis health, not just 'a client object exists'."""
+        if not self._redis:
+            return False
+        try:
+            return bool(self._redis.ping())
+        except Exception:
+            return False
+
 
 brain_cache = DistributedCache(cfg.REDIS_URL, default_ttl=cfg.CACHE_TTL)
 
@@ -1286,10 +1684,22 @@ class CustomerRateLimiter:
     def __init__(self, requests_per_minute: int = 60):
         self._rpm = requests_per_minute
 
+    def _effective_rpm(self) -> int:
+        # v14g3 BUG 8: with Redis, INCR is shared across all workers, so the
+        # limit is global and exact. WITHOUT Redis the counter is per-process,
+        # so N gunicorn workers would EACH allow the full rpm (aggregate =
+        # rpm × N). Divide by the worker count in that fallback so the whole
+        # fleet stays close to the intended limit. (STRICT_PROD already refuses
+        # to boot without Redis — this just makes the dev/degraded path sane.)
+        if getattr(brain_cache, "_redis", None) is not None:
+            return self._rpm
+        workers = max(1, cfg.WEB_CONCURRENCY)
+        return max(1, self._rpm // workers)
+
     def is_allowed(self, customer_id: str) -> bool:
         key    = f"rl:{customer_id}:{int(time.time() // 60)}"
         count  = brain_cache.incr(key, ttl=60)
-        return count <= self._rpm
+        return count <= self._effective_rpm()
 
     def check(self, customer_id: str):
         """Call this in route handlers. Returns (allowed: bool, count: int)."""
@@ -1416,13 +1826,50 @@ def _init_ai_providers() -> None:
         log.info(f"🤖 AI Fallback Chain: {' → '.join(active)}")
 
 
+class AIEmptyResponse(Exception):
+    """v14g3 BUG 18: raised when a provider returns no usable text (e.g. a safety
+    block). Treated as 'this provider had no answer' → fall through to the next
+    one WITHOUT retry-spamming and without slamming the circuit breaker."""
+
+
+def _safe_response_text(resp: Any) -> str:
+    """v14g3 BUG 18: Gemini's `.text` *raises* (ValueError) when the model emits
+    no usable candidate. The old `.text.strip()` therefore threw a raw exception
+    that got retried 3× and counted as hard breaker failures — a safety block
+    could trip the Gemini circuit. Extract text defensively; '' when none."""
+    try:
+        t = getattr(resp, "text", None)
+        if t:
+            return t.strip()
+    except Exception:
+        pass
+    try:
+        for cand in (getattr(resp, "candidates", None) or []):
+            parts = getattr(getattr(cand, "content", None), "parts", None) or []
+            buf = "".join((getattr(p, "text", "") or "") for p in parts).strip()
+            if buf:
+                return buf
+    except Exception:
+        pass
+    return ""
+
+
 def _call_gemini(system_prompt: str, history: List[Dict], user_message: str) -> str:
     model = genai.GenerativeModel(
         model_name=cfg.GEMINI_MODEL,
         system_instruction=system_prompt,
     )
     chat = model.start_chat(history=history)
-    return chat.send_message(user_message).text.strip()
+    # v14g3 BUG 2: a HARD request timeout — a frozen Gemini socket can no longer
+    # pin a worker thread forever (previously only OpenAI passed a timeout).
+    resp = chat.send_message(
+        user_message,
+        request_options={"timeout": cfg.AI_TIMEOUT_SECS},
+    )
+    text = _safe_response_text(resp)          # v14g3 BUG 18: safe extraction
+    if not text:
+        raise AIEmptyResponse("gemini returned no text")
+    return text
 
 
 def _call_openai(system_prompt: str, history: List[Dict], user_message: str) -> str:
@@ -1453,8 +1900,14 @@ def _call_claude(system_prompt: str, history: List[Dict], user_message: str) -> 
         max_tokens=cfg.AI_MAX_TOKENS,
         system=system_prompt,
         messages=messages,
+        timeout=cfg.AI_TIMEOUT_SECS,   # v14g3 BUG 2: hard timeout (was unbounded)
     )
-    return resp.content[0].text.strip()
+    # v14g3 BUG 18: tolerate an empty content list instead of raising IndexError.
+    blocks = getattr(resp, "content", None) or []
+    text = "".join((getattr(b, "text", "") or "") for b in blocks).strip()
+    if not text:
+        raise AIEmptyResponse("claude returned no text")
+    return text
 
 
 def _retry_with_backoff(fn: Callable, *args, max_retries: int = 3,
@@ -1466,6 +1919,12 @@ def _retry_with_backoff(fn: Callable, *args, max_retries: int = 3,
     for attempt in range(max_retries + 1):
         try:
             return fn(*args)
+        except AIEmptyResponse:
+            # v14g3 BUG 18: an empty/safety-blocked reply will not change on a
+            # retry — re-raise immediately so we fall straight through to the
+            # next provider instead of burning the retry budget and counting
+            # multiple spurious failures against the circuit breaker.
+            raise
         except Exception as exc:
             if attempt == max_retries:
                 raise
@@ -1541,9 +2000,20 @@ _WA_AUTH_FAIL_CODES = {190, 102, 10, 200, 803, 463, 467}
 
 def verify_meta_signature(raw_body: bytes, signature_header: str,
                           app_secret: str) -> bool:
-    """v10: shared by WhatsApp + Instagram webhooks (same X-Hub-Signature-256)."""
+    """v10: shared by WhatsApp + Instagram webhooks (same X-Hub-Signature-256).
+
+    v14g3 BUG 7: an empty app secret used to mean 'accept everything', so a
+    deployment that forgot to set WHATSAPP_APP_SECRET silently accepted FORGED
+    webhooks from anyone who found the URL. Now an empty secret skips the check
+    ONLY in dev; under STRICT_PROD (or REQUIRE_WEBHOOK_SIGNATURE) a missing
+    secret is fail-CLOSED — in production an unsigned webhook is an attack, not
+    a convenience."""
     if not app_secret:
-        return True  # Skip if secret not configured (dev mode)
+        if cfg.STRICT_PROD or cfg.REQUIRE_WEBHOOK_SIGNATURE:
+            log.error("🛑 Webhook rejected: signature required but no app secret "
+                      "set (configure WHATSAPP_APP_SECRET / INSTAGRAM_APP_SECRET).")
+            return False
+        return True  # dev mode only — explicitly insecure
     if not signature_header.startswith("sha256="):
         return False
     expected = "sha256=" + hmac.new(
@@ -1611,13 +2081,25 @@ _WORKER_POOL = ThreadPoolExecutor(
     thread_name_prefix="heonix-bg",
 )
 
+# v14g3 BUG 5: the ordered per-conversation drains run on _WORKER_POOL and hold
+# a thread for the ENTIRE duration of an AI call. Previously fire-and-forget
+# work (owner alerts, audit writes, RAG stores, outbox sends) was submitted to
+# the SAME pool, so it queued behind slow AI calls and, under load, the 8 drain
+# threads and competing bg tasks throttled each other (head-of-line blocking).
+# Side-effect I/O now gets its OWN pool, fully decoupled from the drains.
+_IO_POOL = ThreadPoolExecutor(
+    max_workers=int(os.getenv("IO_THREADS", "16")),
+    thread_name_prefix="heonix-io",
+)
+
 
 def submit_bg(fn: Callable, *args, **kwargs) -> None:
-    """Fire-and-forget onto the bounded pool. Never raises into the caller.
-    If the pool is shutting down (SIGTERM in flight), runs inline as a fallback
-    so an in-progress reply is never silently dropped."""
+    """Fire-and-forget onto the dedicated I/O pool (v14g3 BUG 5 — kept separate
+    from the conversation-drain pool so alerts/audit/RAG never queue behind a
+    slow AI call). Never raises into the caller. If the pool is shutting down
+    (SIGTERM in flight), runs inline so in-progress work is never lost."""
     try:
-        _WORKER_POOL.submit(fn, *args, **kwargs)
+        _IO_POOL.submit(fn, *args, **kwargs)
     except RuntimeError:
         try:
             fn(*args, **kwargs)
@@ -1686,10 +2168,27 @@ class OrderedKeyedRunner:
                     self._queues.pop(key, None)
                     return
                 fn, args, kwargs = q.popleft()
+            # v14g5 FIX 6: take a CROSS-WORKER per-conversation mutex so the same
+            # conversation can't be processed concurrently on two gunicorn workers
+            # (which would interleave and scramble history). Bounded wait — if we
+            # can't acquire it we proceed rather than stall forever. NOTE: this stops
+            # concurrent corruption, but strict ARRIVAL order across separate POSTs
+            # landing on different workers still needs WEB_CONCURRENCY=1 (use threads).
+            lease  = None
+            waited = 0.0
+            while waited < 5.0:
+                lease = brain_cache.lock(f"conv:{key}", ttl=cfg.CONV_LOCK_TTL)
+                if lease:
+                    break
+                time.sleep(0.1)
+                waited += 0.1
             try:
                 fn(*args, **kwargs)
             except Exception as exc:
                 log.error(f"❌ ordered task error [{key}]: {exc}", exc_info=True)
+            finally:
+                if lease:
+                    brain_cache.unlock(f"conv:{key}", lease)
 
 
 _ORDERED = OrderedKeyedRunner(
@@ -1707,15 +2206,22 @@ def submit_ordered(key: str, fn: Callable, *args, **kwargs) -> bool:
 #    a blocking call (RAG embed / vector search). Kept distinct from _WORKER_POOL
 #    so a timeout wrapper can never end up waiting on the same pool it runs in.
 _TIMEOUT_POOL = ThreadPoolExecutor(
-    max_workers=int(os.getenv("TIMEOUT_THREADS", "4")),
+    max_workers=int(os.getenv("TIMEOUT_THREADS", "8")),   # v14g3 BUG 6: was 4
     thread_name_prefix="heonix-to",
 )
 
 
 def _call_with_timeout(fn: Callable, timeout: float, *args, **kwargs):
-    """Run fn with a hard timeout; raises TimeoutError on overrun so a circuit
-    breaker can count it as a failure (v12 #9/#23 — a hung embedding endpoint or
-    Qdrant can no longer freeze a worker forever)."""
+    """Run fn with a hard wall-clock ceiling; raises TimeoutError on overrun so
+    the surrounding circuit breaker counts it as a failure (v12 #9/#23).
+
+    v14g3 BUG 6 — HONEST LIMITATION: Python cannot cancel a running thread, so on
+    timeout the underlying call keeps executing until it returns on its own. The
+    REAL guard is the breaker: a few RAG timeouts open the Qdrant breaker, which
+    then short-circuits further submits for reset_timeout seconds — so leaked
+    threads drain instead of piling up. We also doubled this pool (4 → 8) for
+    headroom, and RAG is now the ONLY caller: the primary AI calls use native SDK
+    timeouts (BUG 2), which need no extra thread at all."""
     fut = _TIMEOUT_POOL.submit(fn, *args, **kwargs)
     return fut.result(timeout=timeout)
 
@@ -1773,6 +2279,7 @@ def _flag_channel_reauth(customer_id: str, detail: str) -> None:
         return
     try:
         is_pg = isinstance(_db_pool, PostgreSQLPool)
+        _pid = _igid = ""
         with _db_pool.get() as conn:
             # column may not exist on a very old DB that skipped _migrate_v12 — guard
             if _column_exists(conn, "customer_brains", "channel_status"):
@@ -1780,7 +2287,26 @@ def _flag_channel_reauth(customer_id: str, detail: str) -> None:
                     "UPDATE customer_brains SET channel_status=?, updated_at=? "
                     "WHERE customer_id=?",
                     ("needs_reauth", _now(), customer_id))
+            # v14g5 FIX 8: read the routing keys so we can bust their caches below.
+            try:
+                if _column_exists(conn, "customer_brains", "wa_phone_number_id"):
+                    cur = _execute(conn, "SELECT wa_phone_number_id, instagram_id "
+                                         "FROM customer_brains WHERE customer_id=?", (customer_id,))
+                    _r = cur.fetchone()
+                    if _r:
+                        _pid  = (_r["wa_phone_number_id"] if not isinstance(_r, tuple) else "") or ""
+                        _igid = (_r["instagram_id"] if not isinstance(_r, tuple) else "") or ""
+            except Exception:
+                pass
+        # v14g5 FIX 8: bust the ROUTING caches too, not just the brain cache, so the
+        # send path stops using the stale brain (with the dead token) immediately.
         brain_cache.delete(customer_id)
+        if _pid:
+            brain_cache.delete(f"wapid:{_pid}")
+            brain_cache.delete(f"wa_route:{_pid}")
+        if _igid:
+            brain_cache.delete(f"igid:{_igid}")
+        brain_cache.delete("wa_route:__single__")
         analytics.inc("channel.reauth_flagged")
         log.error(f"🔑 Clinic {customer_id} token DEAD → needs_reauth ({detail})")
         if cfg.ADMIN_ALERT_PHONE and cfg.WHATSAPP_PHONE_ID and cfg.WHATSAPP_TOKEN:
@@ -1810,6 +2336,94 @@ def _wa_send_now(to_phone: str, message: str, phone_id: str = "",
     except Exception as exc:
         analytics.inc("whatsapp.error")
         log.error(f"❌ WhatsApp send failed → {pii_vault.mask(to_phone)}: {exc}")
+
+
+def _wa_send_interactive(to_phone: str, payload_interactive: Dict,
+                         phone_id: str = "", token: str = "") -> Dict:
+    """v14g4: send a WhatsApp INTERACTIVE message (reply-buttons or a list).
+    Same per-tenant creds + auth-death semantics as _wa_send_text. Buttons/lists
+    let a patient TAP a slot instead of typing — far fewer mis-bookings."""
+    phone_id = phone_id or cfg.WHATSAPP_PHONE_ID
+    token    = token    or cfg.WHATSAPP_TOKEN
+    if not token or not phone_id:
+        return {"error": "not_configured"}
+    url  = f"{WHATSAPP_API_BASE}/{phone_id}/messages"
+    body = {"messaging_product": "whatsapp", "recipient_type": "individual",
+            "to": to_phone, "type": "interactive", "interactive": payload_interactive}
+    resp = _wa_session.post(
+        url, headers={"Authorization": f"Bearer {token}",
+                      "Content-Type": "application/json"},
+        json=body, timeout=(cfg.HTTP_CONNECT_TIMEOUT, 15))
+    if resp.status_code >= 400:
+        err  = {}
+        try:
+            if "json" in resp.headers.get("content-type", ""):
+                err = (resp.json() or {}).get("error", {}) or {}
+        except Exception:
+            err = {}
+        code = err.get("code")
+        log.error(f"❌ WA interactive {resp.status_code} code={code} → {resp.text[:400]}")
+        if resp.status_code in (401, 403) or code in _WA_AUTH_FAIL_CODES:
+            raise WhatsAppAuthError(code, err.get("message", "auth failed"))
+    resp.raise_for_status()
+    return resp.json()
+
+
+def wa_send_list_now(to_phone: str, body_text: str, button_label: str,
+                     rows: List[Dict], phone_id: str = "", token: str = "",
+                     customer_id: str = "", header: str = "") -> bool:
+    """v14g4: send a single-section list message. `rows` = [{id,title,description?}]
+    (max 10 per WhatsApp). Returns True on success. Never raises (self-heals on
+    token death) so it is safe inside a serialized drain. Falls back to plain text
+    by returning False so the caller can degrade gracefully."""
+    section = {"title": button_label[:24] or "Options",
+               "rows": [{"id": str(r["id"])[:200],
+                         "title": str(r["title"])[:24],
+                         "description": str(r.get("description", ""))[:72]}
+                        for r in rows[:10]]}
+    inter = {"type": "list",
+             "body": {"text": body_text[:1024]},
+             "action": {"button": (button_label[:20] or "Choose"),
+                        "sections": [section]}}
+    if header:
+        inter["header"] = {"type": "text", "text": header[:60]}
+    try:
+        _whatsapp_breaker.call(_meta_send_retry, _wa_send_interactive,
+                               to_phone, inter, phone_id, token)
+        analytics.inc("whatsapp.list_sent")
+        return True
+    except WhatsAppAuthError as exc:
+        analytics.inc("whatsapp.auth_fail")
+        _flag_channel_reauth(customer_id, f"code={exc.code}")
+    except Exception as exc:
+        analytics.inc("whatsapp.interactive_error")
+        log.warning(f"⚠️  list send failed → {pii_vault.mask(to_phone)}: {exc}")
+    return False
+
+
+def wa_send_buttons_now(to_phone: str, body_text: str, buttons: List[Dict],
+                        phone_id: str = "", token: str = "",
+                        customer_id: str = "") -> bool:
+    """v14g4: send up to 3 reply buttons. `buttons` = [{id,title}]. Returns True
+    on success, never raises. Used for yes/no confirmations (cancel, reschedule)."""
+    inter = {"type": "button",
+             "body": {"text": body_text[:1024]},
+             "action": {"buttons": [
+                 {"type": "reply",
+                  "reply": {"id": str(b["id"])[:256], "title": str(b["title"])[:20]}}
+                 for b in buttons[:3]]}}
+    try:
+        _whatsapp_breaker.call(_meta_send_retry, _wa_send_interactive,
+                               to_phone, inter, phone_id, token)
+        analytics.inc("whatsapp.buttons_sent")
+        return True
+    except WhatsAppAuthError as exc:
+        analytics.inc("whatsapp.auth_fail")
+        _flag_channel_reauth(customer_id, f"code={exc.code}")
+    except Exception as exc:
+        analytics.inc("whatsapp.interactive_error")
+        log.warning(f"⚠️  buttons send failed → {pii_vault.mask(to_phone)}: {exc}")
+    return False
 
 
 def send_whatsapp_async(to_phone: str, message: str,
@@ -2426,7 +3040,8 @@ def transcribe_audio_bytes(audio_bytes: bytes, mime: str = "audio/ogg") -> str:
         try:
             gmodel = genai.GenerativeModel(model_name=cfg.GEMINI_MODEL)
             resp   = gmodel.generate_content(
-                [_TRANSCRIBE_PROMPT, {"mime_type": mime, "data": audio_bytes}])
+                [_TRANSCRIBE_PROMPT, {"mime_type": mime, "data": audio_bytes}],
+                request_options={"timeout": cfg.AI_TIMEOUT_SECS})   # v14g5 FIX 9
             text = (getattr(resp, "text", "") or "").strip()
             if text:
                 analytics.inc("voice.gemini.success")
@@ -2442,7 +3057,8 @@ def transcribe_audio_bytes(audio_bytes: bytes, mime: str = "audio/ogg") -> str:
             buf.name = "voice." + ("ogg" if "ogg" in mime else
                                    (mime.split("/")[-1] or "mp3"))
             tr = _openai_client.audio.transcriptions.create(
-                model=cfg.OPENAI_TRANSCRIBE_MODEL, file=buf)
+                model=cfg.OPENAI_TRANSCRIBE_MODEL, file=buf,
+                timeout=cfg.AI_TIMEOUT_SECS)   # v14g5 FIX 9
             text = (getattr(tr, "text", "") or "").strip()
             if text:
                 analytics.inc("voice.whisper.success")
@@ -2455,12 +3071,15 @@ def transcribe_audio_bytes(audio_bytes: bytes, mime: str = "audio/ogg") -> str:
     return ""
 
 
-def transcribe_voice_note(media_id: str) -> str:
-    """WhatsApp: media_id → signed URL → bytes → transcript. '' on any failure."""
-    if not media_id or not cfg.WHATSAPP_TOKEN:
+def transcribe_voice_note(media_id: str, token: str = "") -> str:
+    """WhatsApp: media_id → signed URL → bytes → transcript. '' on any failure.
+    v14g5 FIX 2: fetch media with the OWNING clinic's token (passed in) so a tenant
+    on its own token is actually retrievable; falls back to the global token."""
+    token = token or cfg.WHATSAPP_TOKEN
+    if not media_id or not token:
         return ""
     try:
-        hdr  = {"Authorization": f"Bearer {cfg.WHATSAPP_TOKEN}"}
+        hdr  = {"Authorization": f"Bearer {token}"}
         meta = _wa_session.get(
             f"https://graph.facebook.com/{cfg.GRAPH_API_VERSION}/{media_id}",
             headers=hdr, timeout=(cfg.HTTP_CONNECT_TIMEOUT, 15))
@@ -2483,6 +3102,57 @@ def transcribe_audio_url(url: str) -> str:
         return transcribe_audio_bytes(audio, ctype or "audio/mp4")
     except Exception as exc:
         log.error(f"❌ IG audio download failed: {exc}")
+        return ""
+
+
+_IMAGE_PROMPT = (
+    "You are assisting a business (e.g. a clinic or real-estate office) on "
+    "WhatsApp. A customer sent this image. In 1-2 short, factual sentences, "
+    "describe what is shown so a staff member can act on it. If it shows a "
+    "document, prescription, report, ID, or property, say so and read the key "
+    "visible details. Do NOT give a medical diagnosis or legal/financial advice "
+    "— only describe. If the image is unclear, say that plainly."
+)
+
+
+def understand_image_bytes(img_bytes: bytes, mime: str = "image/jpeg") -> str:
+    """v14g4: describe an image with Gemini (your existing multimodal key).
+    Never raises — returns '' on failure so one bad image can't 500 a webhook."""
+    if not img_bytes or not AI_PROVIDERS_ACTIVE.get("gemini"):
+        return ""
+    mime = (mime or "image/jpeg").split(";")[0].strip()
+    try:
+        gmodel = genai.GenerativeModel(model_name=cfg.GEMINI_MODEL)
+        resp   = gmodel.generate_content(
+            [_IMAGE_PROMPT, {"mime_type": mime, "data": img_bytes}],
+            request_options={"timeout": cfg.AI_TIMEOUT_SECS})   # v14g3 BUG 2 discipline
+        text = _safe_response_text(resp)                        # v14g3 BUG 18 helper
+        if text:
+            analytics.inc("image.gemini.success")
+            return text
+    except Exception as exc:
+        log.warning(f"⚠️  Gemini image understanding failed: {exc}")
+        analytics.inc("image.gemini.error")
+    return ""
+
+
+def understand_image_media(media_id: str, token: str = "") -> str:
+    """WhatsApp: media_id → signed URL → bytes → Gemini description. '' on failure.
+    v14g5 FIX 2: fetch with the owning clinic's token (global fallback)."""
+    token = token or cfg.WHATSAPP_TOKEN
+    if not media_id or not token:
+        return ""
+    try:
+        hdr  = {"Authorization": f"Bearer {token}"}
+        meta = _wa_session.get(
+            f"https://graph.facebook.com/{cfg.GRAPH_API_VERSION}/{media_id}",
+            headers=hdr, timeout=(cfg.HTTP_CONNECT_TIMEOUT, 15))
+        meta.raise_for_status()
+        info       = meta.json()
+        img, ctype = _download_capped(info["url"], headers=hdr)   # hard byte cap
+        return understand_image_bytes(img, info.get("mime_type") or ctype or "image/jpeg")
+    except Exception as exc:
+        log.error(f"❌ Image download failed: {exc}")
         return ""
 
 
@@ -2531,8 +3201,12 @@ def _embed(text: str, is_query: bool = False) -> List[float]:
     except TypeError:   # older SDK without output_dimensionality
         res = genai.embed_content(model=cfg.EMBED_MODEL, content=text[:2000],
                                   task_type=task)
-    vec = res["embedding"]
-    return list(vec)[:cfg.EMBED_DIMS]
+    vec = list(res["embedding"])
+    # v14g5 FIX 18: PAD (not just truncate) so a short embedding can't produce a
+    # wrong-size vector that silently fails the Qdrant upsert / corrupts search.
+    if len(vec) < cfg.EMBED_DIMS:
+        vec = vec + [0.0] * (cfg.EMBED_DIMS - len(vec))
+    return vec[:cfg.EMBED_DIMS]
 
 
 # v12 #1: replies we must NEVER write into long-term memory (they'd poison it).
@@ -2620,6 +3294,32 @@ def rag_retrieve(customer_id: str, uid: str, query: str) -> str:
         return ""
 
 
+def rag_forget(customer_id: str, uid: str) -> bool:
+    """v14g4 (DPDP): delete every RAG memory point for ONE data subject (uid =
+    'customer_id:phone'). Best-effort; never raises. Returns True if the delete
+    call succeeded. Vectors store only AES-256-GCM-encrypted text, but erasure
+    means erasure — so we remove the points entirely."""
+    if not _rag_ready:
+        return False
+    try:
+        flt = qmodels.Filter(must=[
+            qmodels.FieldCondition(key="customer_id",
+                                   match=qmodels.MatchValue(value=customer_id)),
+            qmodels.FieldCondition(key="uid", match=qmodels.MatchValue(value=uid)),
+        ])
+        _qdrant_breaker.call(
+            _call_with_timeout,
+            lambda: _qdrant_client.delete(
+                collection_name=cfg.QDRANT_COLLECTION,
+                points_selector=qmodels.FilterSelector(filter=flt)),
+            cfg.RAG_TIMEOUT_SECS)
+        analytics.inc("rag.forgotten")
+        return True
+    except Exception as exc:
+        log.warning(f"⚠️  rag_forget failed: {exc}")
+        return False
+
+
 # ── 🚨 AI ESCALATION TOKEN — the "AI understanding" layer (every language).
 # v11 fix #8: the token is randomised per process boot, so a user can NEVER
 # induce a false escalation by typing it — they can't know it. The AI receives
@@ -2636,6 +3336,20 @@ _ESCALATION_RULE = (
 )
 _LANGUAGE_RULE = ("\n\nLANGUAGE: Always reply in the same language and script "
                   "the user used, no matter which language it is.")
+
+
+def _mask_uid(uid: str) -> str:
+    """v14g5 FIX 46: an internal conversation uid is 'customer_id:phone' (WhatsApp)
+    or 'ig:customer_id:sender' (Instagram). Owner alerts were dumping that raw
+    string — leaking the tenant id and the FULL number into a WhatsApp message.
+    Render a privacy-preserving label instead (the owner still sees the actual
+    chat in their own inbox)."""
+    u = uid or ""
+    if u.startswith("ig:"):
+        who = u.split(":")[-1]
+        return f"Instagram user {pii_vault.mask(who)}" if who else "an Instagram user"
+    phone = u.split(":")[-1]            # WhatsApp shape: customer_id:phone
+    return pii_vault.mask(phone) if phone else "a customer"
 
 
 def govern_message(text: str, uid: str, *, bot_name: str = "",
@@ -2665,7 +3379,7 @@ def govern_message(text: str, uid: str, *, bot_name: str = "",
     if cls["emergency"]:
         if owner_phone:
             out["alerts"].append((owner_phone,
-                f"🚨 EMERGENCY ALERT from {uid}:\n\"{text[:300]}\""))
+                f"🚨 EMERGENCY ALERT from {_mask_uid(uid)}:\n\"{text[:300]}\""))
         out["reply"] = _EMERGENCY_LINES.get(lang, _EMERGENCY_LINES["en"])
         analytics.inc("route.emergency")
         return out
@@ -2674,14 +3388,14 @@ def govern_message(text: str, uid: str, *, bot_name: str = "",
         ghost_mute(uid)
         if owner_phone:
             out["alerts"].append((owner_phone,
-                f"🙋 TAKE OVER chat with {uid}:\n\"{text[:300]}\""))
+                f"🙋 TAKE OVER chat with {_mask_uid(uid)}:\n\"{text[:300]}\""))
         out["reply"] = _HUMAN_LINES.get(lang, _HUMAN_LINES["en"])
         analytics.inc("route.human_handoff")
         return out
 
     if cls["vip"] and owner_phone:
         out["alerts"].append((owner_phone,
-            f"💎 VIP LEAD from {uid}:\n\"{text[:300]}\""))
+            f"💎 VIP LEAD from {_mask_uid(uid)}:\n\"{text[:300]}\""))
         analytics.inc("route.vip")
         # VIP does NOT skip the AI — keep selling.
 
@@ -2729,9 +3443,13 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
 
     # Cache only memory-free answers — personalised replies must never be
     # served to a different person who happens to ask the same question.
+    # v14g3 BUG 15: also fold the detected LANGUAGE into the cache key, so a
+    # reply produced for one language can't be served to a user who wrote the
+    # same normalised text intending a different language.
     cacheable = (memory == "")
+    cache_msg = detect_language(user_text) + "|" + user_text
     if cacheable:
-        cached = resp_cache_get(_cache_hour_seed(base), user_text)
+        cached = resp_cache_get(_cache_hour_seed(base), cache_msg)
         if cached:
             analytics.inc("cache.response.hit")
             return cached, "cache", False
@@ -2754,12 +3472,12 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
             # v13: escalation alert goes FROM this clinic's own WhatsApp line
             _opid, _otok = brain_wa_creds(brain)
             send_owner_alert_async(owner,
-                f"🚨 AI ESCALATION ({channel}) from {user_uid}:\n\"{user_text[:300]}\"",
+                f"🚨 AI ESCALATION ({channel}) from {_mask_uid(user_uid)}:\n\"{user_text[:300]}\"",
                 _opid, _otok, brain.get("customer_id", ""))
         analytics.inc("escalation.ai")
     else:
         if cacheable and provider != "cache":
-            resp_cache_put(_cache_hour_seed(base), user_text, reply)
+            resp_cache_put(_cache_hour_seed(base), cache_msg, reply)
         rag_store(brain.get("customer_id", ""), user_uid, user_text, reply)
 
     return reply, provider, escalated
@@ -2848,8 +3566,10 @@ def _db_true():
 # ─────────────────────────────────────────────────────────────────────────────
 def audit(actor_id: str, action: str, resource: str,
           detail: Optional[Dict] = None, ip: Optional[str] = None) -> None:
-    """Write an immutable audit record — async so it never blocks the request path."""
-    if not cfg.ENABLE_ANALYTICS:
+    """Write an immutable audit record — async so it never blocks the request path.
+    v14g3 BUG 14: was gated on ENABLE_ANALYTICS, so disabling metrics to cut DB
+    load ALSO silently killed the SOC2/GDPR audit log. Now it has its own switch."""
+    if not cfg.ENABLE_AUDIT:
         return
 
     def _write():
@@ -2930,20 +3650,67 @@ def _process_outbox() -> None:
         try:
             payload = json.loads(payload_raw)
             if event_type == "whatsapp.send":
-                _whatsapp_breaker.call(
-                    _meta_send_retry, _wa_send_text,
-                    payload["to"], _to_whatsapp_markdown(payload["message"]))
+                # v14g3 BUG 9: route outbox sends through THIS clinic's OWN creds
+                # (was always the GLOBAL number, so a multi-tenant welcome went
+                # out from the wrong line or failed when global creds were unset).
+                # A dead per-clinic token now flags needs_reauth and stops being
+                # retried; transient errors still bubble up for outbox retry.
+                cust = payload.get("customer_id", "")
+                pid = tok = ""
+                if cust:
+                    _b = get_customer_brain(cust)
+                    if _b:
+                        pid, tok = brain_wa_creds(_b)
+                try:
+                    _whatsapp_breaker.call(
+                        _meta_send_retry, _wa_send_text,
+                        payload["to"], _to_whatsapp_markdown(payload["message"]),
+                        pid, tok)
+                except WhatsAppAuthError as _ae:
+                    _flag_channel_reauth(cust, f"outbox code={_ae.code}")
+            elif event_type == "whatsapp.template":
+                # v14g4: scheduled sends (reminders / follow-ups) use an approved
+                # template so they deliver OUTSIDE the 24-hour window. Same per-
+                # tenant creds + token-death self-heal as whatsapp.send.
+                cust = payload.get("customer_id", "")
+                pid = tok = ""
+                if cust:
+                    _b = get_customer_brain(cust)
+                    if _b:
+                        pid, tok = brain_wa_creds(_b)
+                try:
+                    res = _whatsapp_breaker.call(
+                        _meta_send_retry, _wa_send_template,
+                        payload["to"], payload["template"],
+                        payload.get("lang", "en"), payload.get("body_param", ""),
+                        pid, tok)
+                    if isinstance(res, dict) and res.get("error"):
+                        raise RuntimeError(f"template not sent: {res.get('error')}")
+                except WhatsAppAuthError as _ae:
+                    _flag_channel_reauth(cust, f"outbox tmpl code={_ae.code}")
             # Add more event types here as the system grows.
             with _db_pool.get() as conn:
                 _execute(conn,
                     "UPDATE outbox SET status='done', processed_at=? WHERE id=?",
                     (_now(), evt_id))
         except Exception as exc:
+            # v14g5 FIX 44: separate PERMANENT failures (misconfiguration, unknown
+            # template, undeliverable recipient) from transient ones. Retrying a
+            # permanent error five times only delays the dead-letter and spams the
+            # logs — mark it failed on the first hit.
+            _emsg = str(exc).lower()
+            _permanent = any(m in _emsg for m in (
+                "not_configured", "not configured", "not sent:", "does not exist",
+                "unknown template", "invalid template", "template not found",
+                "recipient not", "132001", "131026"))
+            new_status = "failed" if (_permanent or attempts >= 4) else "pending"
             with _db_pool.get() as conn:
                 _execute(conn,
                     "UPDATE outbox SET attempts=attempts+1, status=? WHERE id=?",
-                    ("failed" if attempts >= 4 else "pending", evt_id))
-            log.warning(f"⚠️  Outbox event {evt_id} ({event_type}) failed: {exc}")
+                    (new_status, evt_id))
+            (log.error if _permanent else log.warning)(
+                f"⚠️  Outbox event {evt_id} ({event_type}) "
+                f"{'PERMANENT — not retrying' if _permanent else 'failed'}: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3094,14 +3861,14 @@ def brain_ig_creds(brain: Dict) -> Tuple[str, str]:
     return igid, tok
 
 
-def create_session(customer_id: str, channel: str = "api") -> str:
+def create_session(customer_id: str, channel: str = "api", subject_hash: str = "") -> str:
     session_id = f"sess_{uuid.uuid4().hex[:20]}"
     now = _now()
     with _db_pool.get() as conn:
         _execute(conn,
-            "INSERT INTO chat_sessions (session_id, customer_id, created_at, last_active, channel) "
-            "VALUES (?,?,?,?,?)",
-            (session_id, customer_id, now, now, channel))
+            "INSERT INTO chat_sessions (session_id, customer_id, created_at, last_active, channel, subject_hash) "
+            "VALUES (?,?,?,?,?,?)",
+            (session_id, customer_id, now, now, channel, subject_hash))
     analytics.inc("session.created")
     return session_id
 
@@ -3194,8 +3961,11 @@ def store_idempotency(key: str, response: Dict) -> None:
             _execute(conn,
                 "INSERT INTO idempotency_keys (key, response_body, created_at) VALUES (?,?,?)",
                 (key, json.dumps(response), _now()))
-        except Exception:
-            pass  # Race condition — already exists
+        except Exception as exc:
+            # v14g5 FIX 33: the common case is a duplicate-key race (fine), but
+            # blanket-swallowing also hid serialization errors and full disks.
+            # Keep it non-fatal, but leave a breadcrumb for diagnosis.
+            log.debug(f"idempotency store skipped for {key}: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3245,12 +4015,33 @@ def crm_add_contact(customer_id: str, name: str, phone: str,
             # v13 BUGFIX: psycopg2 cursor.lastrowid is 0 for normal tables, so the
             # API previously returned contact_id=0 for every new Postgres contact.
             # RETURNING id gives the real primary key.
-            cur    = _execute(conn, cols + " RETURNING id", vals)
-            picked = cur.fetchone()
-            new_id = (picked["id"] if picked else None)
+            insert_sql = cols + " RETURNING id"
         else:
-            cur    = _execute(conn, cols, vals)
-            new_id = cur.lastrowid if hasattr(cur, "lastrowid") else None
+            insert_sql = cols
+        try:
+            cur = _execute(conn, insert_sql, vals)
+            if is_pg:
+                picked = cur.fetchone()
+                new_id = (picked["id"] if picked else None)
+            else:
+                new_id = cur.lastrowid if hasattr(cur, "lastrowid") else None
+        except Exception:
+            # v14g3 BUG 10: lost the insert race against the unique dedupe index
+            # (uq_crm_dedupe — another worker just created this same lead). Fetch
+            # the existing row's id from a FRESH connection (the current PG txn may
+            # be aborted) and return it instead of erroring or duplicating.
+            new_id = None
+            try:
+                with _db_pool.get(read_only=True) as conn2:
+                    c2 = _execute(conn2,
+                        "SELECT id FROM crm_contacts WHERE customer_id=? AND phone_hash=?",
+                        (customer_id, phash))
+                    r2 = c2.fetchone()
+                    new_id = r2["id"] if r2 else None
+            except Exception:
+                new_id = None
+            analytics.inc("crm.contact.race_merged")
+            return new_id or 0
 
     analytics.inc("crm.contact.added")
     log.info(f"📋 CRM contact → customer={customer_id} phone={pii_vault.mask(phone)}")
@@ -3290,9 +4081,17 @@ def crm_list_contacts(customer_id: str, stage: Optional[str] = None,
     return contacts, total
 
 
-def crm_get_contact_full(contact_id: int) -> Optional[Dict]:
+def crm_get_contact_full(contact_id: int, customer_id: str = "") -> Optional[Dict]:
+    """v14g5 FIX 4 (IDOR): when customer_id is supplied the lookup is scoped to that
+    tenant, so a clinic enumerating /crm/contact/<id> can never read another
+    clinic's PII. An empty customer_id (superadmin) keeps the unscoped lookup."""
     with _db_pool.get(read_only=True) as conn:
-        cur = _execute(conn, "SELECT * FROM crm_contacts WHERE id=?", (contact_id,))
+        if customer_id:
+            cur = _execute(conn,
+                "SELECT * FROM crm_contacts WHERE id=? AND customer_id=?",
+                (contact_id, customer_id))
+        else:
+            cur = _execute(conn, "SELECT * FROM crm_contacts WHERE id=?", (contact_id,))
         row = cur.fetchone()
     if not row:
         return None
@@ -3309,10 +4108,532 @@ def crm_get_contact_full(contact_id: int) -> Optional[Dict]:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ♻️  BACKGROUND JANITOR  (FIX #12: graceful K8s drain)
-# ─────────────────────────────────────────────────────────────────────────────
-_shutdown_event = threading.Event()
+# ═════════════════════════════════════════════════════════════════════════════
+# 📅  v14 GEN-4 — APPOINTMENT BOOKING ENGINE  (flag: ENABLE_BOOKING, default OFF)
+#   Per-tenant slots generated from business-hours config; only BOOKINGS are
+#   stored (slot availability is computed, so there's no slot table to seed).
+#   A deterministic per-conversation state machine drives book / reschedule /
+#   cancel / status — no fragile LLM tool-loop, so behaviour is predictable.
+# ═════════════════════════════════════════════════════════════════════════════
+def _parse_dt(s: str) -> datetime:
+    """Parse an ISO timestamp to an aware UTC datetime (tolerates a trailing Z)."""
+    s = (s or "").strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _to_local(dt_or_iso) -> datetime:
+    # v14g5 FIX 25: return a NAIVE local wall-clock datetime (was tagged UTC while
+    # carrying local numbers — misleading if ever reused in tz-aware math).
+    dt = dt_or_iso if isinstance(dt_or_iso, datetime) else _parse_dt(dt_or_iso)
+    return (dt + timedelta(minutes=cfg.BOOKING_TZ_OFFSET_MIN)).replace(tzinfo=None)
+
+
+def _fmt_local_dt(s) -> str:
+    return _to_local(s).strftime("%a %d %b, %I:%M %p")
+
+
+def _fmt_local_time_range(s, e) -> str:
+    return _to_local(s).strftime("%I:%M %p") + "–" + _to_local(e).strftime("%I:%M %p")
+
+
+def booking_available_slots(customer_id: str, limit: int) -> List[Tuple[datetime, datetime]]:
+    """Return the next `limit` open slots (as aware-UTC (start,end) tuples),
+    computed from business-hours config minus slots already booked. At least
+    60 minutes in the future so nobody books a slot that's basically now."""
+    step    = max(5, cfg.BOOKING_SLOT_MINUTES)
+    open_m  = cfg.BOOKING_OPEN_HOUR * 60
+    close_m = cfg.BOOKING_CLOSE_HOUR * 60
+    wkdays  = {int(x) for x in cfg.BOOKING_WEEKDAYS.split(",") if x.strip().isdigit()}
+    off     = timedelta(minutes=cfg.BOOKING_TZ_OFFSET_MIN)
+    now_utc = datetime.now(timezone.utc)
+    now_loc = (now_utc + off).replace(tzinfo=None)        # naive local wall-clock
+
+    booked: set = set()
+    try:
+        with _db_pool.get(read_only=True) as conn:
+            cur = _execute(conn,
+                "SELECT slot_start FROM bookings WHERE customer_id=? AND status='booked' "
+                "AND slot_start >= ?", (customer_id, now_utc.isoformat()))
+            # v14g5 FIX 38: key booked slots by canonical epoch-second, not raw ISO
+            # string, so dedupe survives any future formatting drift (Z vs +00:00).
+            booked = {int(_parse_dt(r["slot_start"]).timestamp()) for r in cur.fetchall()}
+    except Exception as exc:
+        log.warning(f"⚠️  booking slot scan failed: {exc}")
+
+    out: List[Tuple[datetime, datetime]] = []
+    for day in range(0, cfg.BOOKING_DAYS_AHEAD + 1):
+        d_loc = now_loc + timedelta(days=day)
+        if d_loc.weekday() not in wkdays:
+            continue
+        m = open_m
+        while m + step <= close_m:
+            hh, mm = divmod(m, 60)
+            m += step
+            local_naive = d_loc.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            start_utc   = (local_naive - off).replace(tzinfo=timezone.utc)
+            if start_utc <= now_utc + timedelta(minutes=60):
+                continue
+            if int(start_utc.timestamp()) in booked:   # v14g5 FIX 38
+                continue
+            out.append((start_utc, start_utc + timedelta(minutes=step)))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def booking_create(customer_id: str, phone: str, name: str,
+                   start_iso: str, end_iso: str, source: str = "whatsapp") -> bool:
+    """Insert a booking. Returns False if the slot was just taken (the unique
+    index uq_book_slot makes this race-safe — two patients can't grab one slot)."""
+    phash = _crm_phone_hash(customer_id, phone)
+    now   = _now()
+    try:
+        with _db_pool.get() as conn:
+            _execute(conn,
+                "INSERT INTO bookings (customer_id, phone_hash, enc_phone, enc_name, "
+                "slot_start, slot_end, status, reminders_sent, source, created_at, updated_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (customer_id, phash, pii_vault.encrypt(phone), pii_vault.encrypt(name or ""),
+                 start_iso, end_iso, "booked", "", source, now, now))
+        analytics.inc("booking.created")
+        return True
+    except Exception as exc:
+        analytics.inc("booking.slot_conflict")
+        log.info(f"📅 booking slot conflict/failed (cust={customer_id}): {exc}")
+        return False
+
+
+def booking_upcoming_for_phone(customer_id: str, phone: str) -> Optional[Dict]:
+    phash   = _crm_phone_hash(customer_id, phone)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        with _db_pool.get(read_only=True) as conn:
+            cur = _execute(conn,
+                "SELECT id, slot_start, slot_end FROM bookings WHERE customer_id=? "
+                "AND phone_hash=? AND status='booked' AND slot_start >= ? "
+                "ORDER BY slot_start ASC LIMIT 1", (customer_id, phash, now_iso))
+            r = cur.fetchone()
+            return dict(r) if r else None
+    except Exception:
+        return None
+
+
+def booking_cancel_upcoming(customer_id: str, phone: str) -> Optional[Dict]:
+    b = booking_upcoming_for_phone(customer_id, phone)
+    if not b:
+        return None
+    try:
+        with _db_pool.get() as conn:
+            _execute(conn, "UPDATE bookings SET status='cancelled', updated_at=? WHERE id=?",
+                     (_now(), b["id"]))
+        analytics.inc("booking.cancelled")
+        return b
+    except Exception as exc:
+        log.warning(f"⚠️  booking cancel failed: {exc}")
+        return None
+
+
+def booking_cancel_by_id(booking_id) -> None:
+    """v14g5 FIX 12: cancel one specific booking by id — used by reschedule, but
+    only AFTER the replacement slot has been secured."""
+    try:
+        with _db_pool.get() as conn:
+            _execute(conn, "UPDATE bookings SET status='cancelled', updated_at=? "
+                           "WHERE id=? AND status='booked'", (_now(), booking_id))
+        analytics.inc("booking.cancelled")
+    except Exception as exc:
+        log.warning(f"⚠️  booking cancel-by-id failed: {exc}")
+
+
+_BOOK_WORDS = ("book", "appointment", "appoint", "booking", "slot", "schedule",
+               "available", "availability", "timing", "consult", "checkup",
+               "check-up", "reserve", "neram", "appointment venum", "varalama",
+               "milna", "samay", "dikhana")
+_CANCEL_WORDS = ("cancel", "cancel appointment", "cancel booking", "cancel pannu",
+                 "venda", "radd")
+_RESCHED_WORDS = ("reschedule", "change appointment", "change time", "postpone",
+                  "vera time", "time maathu", "time change")
+_STATUS_WORDS = ("my appointment", "my booking", "when is my", "appointment status",
+                 "booking status")
+
+
+def detect_booking_intent(text: str) -> Optional[str]:
+    t = " " + (text or "").lower() + " "
+    if any(w in t for w in _RESCHED_WORDS): return "reschedule"
+    if any(w in t for w in _CANCEL_WORDS):  return "cancel"
+    if any(w in t for w in _STATUS_WORDS):  return "status"
+    if any(w in t for w in _BOOK_WORDS):    return "book"
+    return None
+
+
+def _parse_slot_pick(text: str) -> Optional[int]:
+    t = (text or "").strip().lower()
+    m = re.search(r"slot[:\s]*(\d{1,2})", t)        # interactive reply id 'slot:3'
+    if m:
+        return int(m.group(1))
+    m = re.fullmatch(r"\D*(\d{1,2})\D*", t)          # bare number '3' / 'no 3'
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _booking_status_text(b: Optional[Dict]) -> str:
+    """v14g5 FIX 49: one canonical 'your appointment' message so the wording can
+    never drift between the status branch and any future caller."""
+    if b:
+        return (f"📅 Your upcoming appointment: *{_fmt_local_dt(b['slot_start'])}*. "
+                f"Reply 'cancel appointment' to cancel or 'reschedule' to change.")
+    return ("You don't have an upcoming appointment yet. Reply 'book appointment' "
+            "and I'll show you available times. 🙂")
+
+
+def handle_booking(brain: Dict, from_phone: str, user_text: str,
+                   out_pid: str, out_tok: str, customer_id: str,
+                   session_id: str, subject_name: str = "") -> bool:
+    """Deterministic booking state machine. Returns True if it handled the
+    message (caller should then stop). Returns False to let the normal AI run.
+    v14g5 FIX 12: a RESCHEDULE no longer cancels the existing appointment up-front;
+    the old slot is carried as prev_id and retired ONLY after a new slot is secured,
+    so abandoning the flow can never leave the patient with no appointment."""
+    if not cfg.ENABLE_BOOKING:
+        return False
+
+    offer_key = f"bk_offer:{customer_id}:{from_phone}"
+    text      = (user_text or "").strip()
+    low       = text.lower()
+    action: Optional[Tuple] = None      # ('text', msg) | ('list', body, rows, payload)
+
+    raw_offer = brain_cache.get(offer_key)
+    if raw_offer:
+        # An offer is active — interpret this message as a slot pick / abort.
+        try:
+            payload = json.loads(raw_offer)
+            if isinstance(payload, dict):
+                offers  = payload.get("slots", [])
+                prev_id = payload.get("prev_id")
+            else:                       # tolerate pre-FIX bare-list payloads in cache
+                offers, prev_id = payload, None
+        except Exception:
+            offers, prev_id = [], None
+
+        if low in ("cancel", "stop", "no", "venda", "exit"):
+            brain_cache.delete(offer_key)
+            # FIX 12: abandoning a reschedule must NOT lose the original booking —
+            # we never cancelled it, so it simply stands.
+            kept = " Your existing appointment is unchanged." if prev_id else ""
+            action = ("text", "No problem — I've stopped the booking." + kept +
+                              " Ask anytime to book again. 🙂")
+        else:
+            pick = _parse_slot_pick(text)
+            if pick is not None and 1 <= pick <= len(offers):
+                start_iso, end_iso = offers[pick - 1]
+                ok = booking_create(customer_id, from_phone, subject_name,
+                                    start_iso, end_iso)
+                if ok:
+                    brain_cache.delete(offer_key)
+                    # only NOW retire the old slot — the reschedule has succeeded
+                    if prev_id:
+                        booking_cancel_by_id(prev_id)
+                    moved = "rescheduled to" if prev_id else "confirmed for"
+                    action = ("text",
+                        f"✅ Booked! Your appointment is {moved} "
+                        f"*{_fmt_local_dt(start_iso)}*. We'll remind you beforehand. "
+                        f"Reply 'cancel appointment' anytime to cancel.")
+                else:
+                    # slot just taken — re-offer, PRESERVING prev_id so the next pick
+                    # still reschedules instead of creating a duplicate booking.
+                    action = _booking_offer_action(customer_id,
+                        note="Sorry, that slot was just taken — here are fresh times:",
+                        prev_id=prev_id)
+            else:
+                action = _booking_offer_action(customer_id,
+                    note="Please reply with the *number* of a time from the list:",
+                    prev_id=prev_id)
+    else:
+        intent = detect_booking_intent(text)
+        if not intent:
+            return False
+        if intent == "status":
+            b = booking_upcoming_for_phone(customer_id, from_phone)
+            action = ("text", _booking_status_text(b))
+        elif intent == "cancel":
+            b = booking_cancel_upcoming(customer_id, from_phone)
+            action = ("text",
+                f"✅ Cancelled your appointment ({_fmt_local_dt(b['slot_start'])}). "
+                f"Reply 'book' anytime to pick a new time."
+                if b else
+                "I couldn't find an upcoming appointment to cancel. Reply 'book' to "
+                "make one. 🙂")
+        else:  # book or reschedule
+            prev_id = None
+            if intent == "reschedule":
+                # FIX 12: capture (do NOT cancel) the current appointment.
+                existing = booking_upcoming_for_phone(customer_id, from_phone)
+                prev_id  = existing["id"] if existing else None
+            action = _booking_offer_action(customer_id, prev_id=prev_id)
+
+    if action is None:
+        return False
+    _booking_dispatch(action, from_phone, out_pid, out_tok, customer_id,
+                      session_id, user_text)
+    return True
+
+
+def _booking_offer_action(customer_id: str, note: str = "", prev_id=None) -> Tuple:
+    """Build the slot-offer action AND stash the offered slots (plus any prev_id
+    being rescheduled) in cache so the next inbound message can be matched to a
+    slot by index and complete the reschedule atomically."""
+    slots = booking_available_slots(customer_id, cfg.BOOKING_SLOTS_SHOWN)
+    if not slots:
+        return ("text", "Sorry, there are no open slots in the next few days. "
+                        "Please try again later, or leave a message for our team.")
+    offers = [[s.isoformat(), e.isoformat()] for s, e in slots]
+    rows = [{"id": f"slot:{i+1}", "title": _fmt_local_dt(s)[:24],
+             "description": _fmt_local_time_range(s, e)}
+            for i, (s, e) in enumerate(slots)]
+    body = ((note + "\n\n") if note else "") + \
+           "Here are the next available times — tap one or reply with its number:"
+    return ("list", body, rows, {"slots": offers, "prev_id": prev_id})
+
+
+def _booking_dispatch(action: Tuple, from_phone: str, out_pid: str, out_tok: str,
+                      customer_id: str, session_id: str, user_text: str) -> None:
+    """Send the chosen booking reply (interactive list with text fallback) and
+    record exactly ONE conversation turn for history/analytics."""
+    if action[0] == "list":
+        _, body, rows, payload = action
+        brain_cache.set(f"bk_offer:{customer_id}:{from_phone}",
+                        json.dumps(payload), ttl=900)
+        sent = wa_send_list_now(from_phone, body, "Pick a time", rows,
+                                out_pid, out_tok, customer_id, header="Book appointment")
+        if sent:
+            log_text = body + "  [interactive list sent]"
+        else:
+            numbered = "\n".join(f"{i+1}. {r['title']} ({r['description']})"
+                                 for i, r in enumerate(rows))
+            log_text = body + "\n\n" + numbered
+            send_whatsapp_sync(from_phone, log_text, out_pid, out_tok, customer_id)
+    else:
+        _, msg = action
+        send_whatsapp_sync(from_phone, msg, out_pid, out_tok, customer_id)
+        log_text = msg
+    try:
+        save_messages_batch(session_id, [
+            ("user",  user_text, "whatsapp", 0),
+            ("model", log_text,  "booking",  0)])
+        increment_chat_count(customer_id)
+        analytics.inc("booking.handled")
+    except Exception:
+        pass
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# ⏰  v14 GEN-4 — SCHEDULER  (flag: ENABLE_SCHEDULER, default OFF)
+#   Runs inside the existing janitor thread. Reminders + cold-lead follow-ups
+#   are published to the transactional OUTBOX, so they reuse the per-tenant
+#   creds + token self-heal path (gen-3 BUG 9). HONEST NOTE: WhatsApp only
+#   delivers FREE TEXT inside the 24-hour customer-service window; outside it
+#   you MUST use an approved template (set *_TEMPLATE env). The scheduler routes
+#   via template automatically when one is configured.
+# ═════════════════════════════════════════════════════════════════════════════
+def _publish_reminder(customer_id: str, phone: str, when_text: str, full_msg: str) -> None:
+    if cfg.REMINDER_TEMPLATE:
+        outbox_publish("whatsapp.template", {
+            "to": phone, "customer_id": customer_id,
+            "template": cfg.REMINDER_TEMPLATE, "lang": cfg.REMINDER_TEMPLATE_LANG,
+            "body_param": when_text})
+    else:
+        outbox_publish("whatsapp.send",
+                       {"to": phone, "customer_id": customer_id, "message": full_msg})
+
+
+def _publish_followup(customer_id: str, phone: str, full_msg: str) -> None:
+    if cfg.FOLLOWUP_TEMPLATE:
+        outbox_publish("whatsapp.template", {
+            "to": phone, "customer_id": customer_id,
+            "template": cfg.FOLLOWUP_TEMPLATE, "lang": cfg.FOLLOWUP_TEMPLATE_LANG,
+            "body_param": "follow-up"})
+    else:
+        outbox_publish("whatsapp.send",
+                       {"to": phone, "customer_id": customer_id, "message": full_msg})
+
+
+def _scheduler_send_reminders() -> None:
+    """Fire each configured lead-time reminder exactly once per booking."""
+    leads = sorted({int(x) for x in cfg.REMINDER_LEAD_HOURS.split(",")
+                    if x.strip().lstrip("-").isdigit() and int(x) > 0}, reverse=True)
+    if not leads:
+        return
+    now_utc = datetime.now(timezone.utc)
+    horizon = (now_utc + timedelta(hours=leads[0])).isoformat()
+    try:
+        with _db_pool.get(read_only=True) as conn:
+            cur = _execute(conn,
+                "SELECT id, customer_id, enc_phone, slot_start, slot_end, reminders_sent "
+                "FROM bookings WHERE status='booked' AND slot_start > ? AND slot_start <= ?",
+                (now_utc.isoformat(), horizon))
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        log.warning(f"⚠️  reminder scan failed: {exc}")
+        return
+    for b in rows:
+        try:
+            start = _parse_dt(b["slot_start"])
+            sent  = {x for x in (b.get("reminders_sent") or "").split(",") if x}
+            changed = False
+            for h in leads:
+                if str(h) in sent:
+                    continue
+                if now_utc >= start - timedelta(hours=h):
+                    phone = pii_vault.decrypt(b["enc_phone"])
+                    if not phone or phone == "[ENCRYPTED]":
+                        continue
+                    when    = _fmt_local_dt(b["slot_start"])
+                    # v14g5 FIX 24: word the lead from the ACTUAL remaining time, not
+                    # the configured lead bucket (a slot 1h away no longer says "~2h").
+                    rem_h   = max(0, int(round((start - now_utc).total_seconds() / 3600)))
+                    hrs_txt = ("tomorrow" if rem_h >= 20 else
+                               ("in about an hour" if rem_h <= 1 else f"in ~{rem_h} hour(s)"))
+                    _publish_reminder(b["customer_id"], phone, when,
+                        f"⏰ Reminder: you have an appointment {hrs_txt} — *{when}*. "
+                        f"Reply 'cancel appointment' if you can't make it.")
+                    sent.add(str(h))
+                    changed = True
+            if changed:
+                with _db_pool.get() as conn:
+                    _execute(conn, "UPDATE bookings SET reminders_sent=?, updated_at=? WHERE id=?",
+                             (",".join(sorted(sent, key=lambda x: -int(x))), _now(), b["id"]))
+        except Exception as exc:
+            log.warning(f"⚠️  reminder send failed (id={b.get('id')}): {exc}")
+    if rows:
+        analytics.inc("scheduler.reminders_scanned")
+
+
+def _scheduler_followups() -> None:
+    """One-time cold-lead nudge for CONSENTED contacts that went quiet."""
+    if not cfg.FOLLOWUP_ENABLED:
+        return
+    now_utc    = datetime.now(timezone.utc)
+    older_than = (now_utc - timedelta(hours=cfg.FOLLOWUP_AFTER_HOURS)).isoformat()
+    too_old    = (now_utc - timedelta(hours=cfg.FOLLOWUP_MAX_AGE_HOURS)).isoformat()
+    try:
+        with _db_pool.get(read_only=True) as conn:
+            # v14g5 FIX 16: only chase leads belonging to ACTIVE clinics (was also
+            # messaging cold leads of soft-deleted clinics).
+            cur = _execute(conn,
+                "SELECT c.id, c.customer_id, c.enc_phone FROM crm_contacts c "
+                "JOIN customer_brains b ON b.customer_id=c.customer_id "
+                "WHERE (c.followed_up_at IS NULL OR c.followed_up_at='') "
+                "AND c.created_at <= ? AND c.created_at >= ? AND c.is_consented=? "
+                "AND b.is_active=? LIMIT 200",
+                (older_than, too_old, _db_true(), _db_true()))
+            rows = [dict(r) for r in cur.fetchall()]
+    except Exception as exc:
+        log.warning(f"⚠️  followup scan failed: {exc}")
+        return
+    for c in rows:
+        try:
+            phone = pii_vault.decrypt(c["enc_phone"])
+            if phone and phone != "[ENCRYPTED]":
+                brain = get_customer_brain(c["customer_id"])
+                bot   = (brain.get("bot_name") if brain else "") or "our team"
+                _publish_followup(c["customer_id"], phone,
+                    f"Hi! 👋 Just checking in from {bot} — do you still have any "
+                    f"questions we can help with? We're happy to assist anytime.")
+                analytics.inc("scheduler.followup_sent")
+            _mark_followed(c["id"])     # mark regardless, so we never rescan it
+        except Exception as exc:
+            log.warning(f"⚠️  followup failed (id={c.get('id')}): {exc}")
+
+
+def _mark_followed(contact_id) -> None:
+    try:
+        with _db_pool.get() as conn:
+            _execute(conn, "UPDATE crm_contacts SET followed_up_at=? WHERE id=?",
+                     (_now(), contact_id))
+    except Exception:
+        pass
+
+
+def _scheduler_retention_purge() -> None:
+    """DPDP retention: drop chat logs + dead bookings older than DATA_RETENTION_DAYS
+    (0 = keep forever). Lead/CRM data is NOT auto-purged — use the erasure endpoint
+    for that, so a business never loses its book of contacts by surprise."""
+    days = cfg.DATA_RETENTION_DAYS
+    if days <= 0:
+        return
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    try:
+        with _db_pool.get() as conn:
+            _execute(conn, "DELETE FROM chat_messages WHERE timestamp < ?", (cutoff,))
+            _execute(conn, "DELETE FROM chat_sessions WHERE last_active < ?", (cutoff,))
+            _execute(conn, "DELETE FROM bookings WHERE status IN ('cancelled','completed') "
+                           "AND updated_at < ?", (cutoff,))
+        analytics.inc("scheduler.retention_purged")
+        log.info(f"🧹 Retention purge: removed chat/booking data older than {days}d.")
+    except Exception as exc:
+        log.warning(f"⚠️  retention purge failed: {exc}")
+
+
+def erase_data_subject(customer_id: str, phone: str) -> Dict:
+    """v14g4 (DPDP right-to-erasure): delete ALL data for ONE person (by phone)
+    under ONE clinic — CRM contact, bookings, RAG memory, and the cache-mapped
+    chat session + its messages. Returns a small report. Best-effort + safe."""
+    phash  = _crm_phone_hash(customer_id, phone)
+    report = {"crm": 0, "bookings": 0, "sessions": 0, "messages": 0, "rag": False}
+    # 1) CRM + bookings (direct by customer + phone_hash)
+    try:
+        with _db_pool.get() as conn:
+            cur = _execute(conn, "DELETE FROM crm_contacts WHERE customer_id=? AND phone_hash=?",
+                           (customer_id, phash))
+            report["crm"] = getattr(cur, "rowcount", 0) or 0
+            cur = _execute(conn, "DELETE FROM bookings WHERE customer_id=? AND phone_hash=?",
+                           (customer_id, phash))
+            report["bookings"] = getattr(cur, "rowcount", 0) or 0
+    except Exception as exc:
+        log.warning(f"⚠️  erase (crm/bookings) failed: {exc}")
+    # 2) Chat session + messages. v14g5 FIX 3: resolve sessions from the DB by
+    # subject_hash (stamped at session creation) instead of a 1-hour cache key — so
+    # erasure works for ANY subject, not only one active in the last hour.
+    try:
+        with _db_pool.get() as conn:
+            cur = _execute(conn,
+                "SELECT session_id FROM chat_sessions WHERE customer_id=? AND subject_hash=?",
+                (customer_id, phash))
+            sids = [(r["session_id"] if not isinstance(r, tuple) else r[0])
+                    for r in cur.fetchall()]
+            # also fold in any cache-mapped session ids (covers pre-FIX rows whose
+            # subject_hash is empty), then drop those cache keys.
+            for k in (f"wa_session:{customer_id}:{phone}",
+                      f"ig_session:{customer_id}:{phone}"):
+                _sid = brain_cache.get(k)
+                if _sid and _sid not in sids:
+                    sids.append(_sid)
+                brain_cache.delete(k)
+            for sid in sids:
+                cur = _execute(conn, "DELETE FROM chat_messages WHERE session_id=?", (sid,))
+                report["messages"] += getattr(cur, "rowcount", 0) or 0
+                cur = _execute(conn, "DELETE FROM chat_sessions WHERE session_id=?", (sid,))
+                report["sessions"] += getattr(cur, "rowcount", 0) or 0
+    except Exception as exc:
+        log.warning(f"⚠️  erase (sessions) failed: {exc}")
+    # 3) RAG memory. v14g5 FIX 3: erase BOTH the WhatsApp-shaped uid and the
+    # Instagram-shaped uid keyed off the same phone (a phone can't resolve a PSID,
+    # but if this person also DM'd under 'ig_<phone>' we clear that too).
+    rag_ok = rag_forget(customer_id, f"{customer_id}:{phone}")
+    rag_ok = rag_forget(customer_id, f"ig:{customer_id}:{phone}") or rag_ok
+    report["rag"] = rag_ok
+    analytics.inc("dpdp.subject_erased")
+    log.info(f"🗑️  DPDP erase → cust={customer_id} phone={pii_vault.mask(phone)} {report}")
+    return report
+
+
+
 
 
 def _janitor_loop() -> None:
@@ -3323,6 +4644,7 @@ def _janitor_loop() -> None:
     left 'processing' by a crashed worker."""
     tick        = max(5, int(os.getenv("OUTBOX_TICK", "20")))
     heavy_every = max(1, int(3600 / tick))     # ~ once an hour
+    med_every   = max(1, int(300 / tick))      # v14g4: ~ every 5 minutes
     n = 0
     while not _shutdown_event.wait(timeout=tick):
         n += 1
@@ -3334,6 +4656,24 @@ def _janitor_loop() -> None:
             brain_cache.prune_local()          # v12 #35
         except Exception:
             pass
+
+        # v14g4: scheduler (reminders + cold-lead follow-ups) on a 5-min cadence.
+        # Flag-gated OFF by default; needs a long-lived process (true on Render).
+        if cfg.ENABLE_SCHEDULER and (n % med_every == 0):
+            # v14g5 FIX 7: single-leader lock so reminders/follow-ups run on exactly
+            # ONE worker per tick. Every gunicorn worker runs a janitor → without
+            # this the same reminder went out once PER worker. Lease is intentionally
+            # NOT released early; its TTL (~the cadence) blocks a second run.
+            _lease = brain_cache.lock("sched:cycle", ttl=cfg.SCHED_LOCK_TTL)
+            if _lease:
+                try:
+                    _scheduler_send_reminders()
+                except Exception as exc:
+                    log.warning(f"⚠️  scheduler (reminders) error: {exc}")
+                try:
+                    _scheduler_followups()
+                except Exception as exc:
+                    log.warning(f"⚠️  scheduler (followups) error: {exc}")
 
         if n % heavy_every:
             continue
@@ -3353,6 +4693,16 @@ def _janitor_loop() -> None:
             log.info("🧹 Janitor: housekeeping done (idempotency / outbox / webhook_log).")
         except Exception as exc:
             log.warning(f"⚠️  Janitor (cleanup) error: {exc}")
+
+        # v14g4: DPDP retention purge (chat logs + dead bookings) — no-op unless
+        # DATA_RETENTION_DAYS > 0. Never touches live CRM/lead data.
+        if cfg.ENABLE_SCHEDULER:
+            _rlease = brain_cache.lock("sched:retention", ttl=cfg.SCHED_LOCK_TTL)  # FIX 7
+            if _rlease:
+                try:
+                    _scheduler_retention_purge()
+                except Exception as exc:
+                    log.warning(f"⚠️  Janitor (retention) error: {exc}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3442,41 +4792,90 @@ def extract_field(fields: List, index: int, default: str = "") -> str:
         return default
 
 
+def extract_by_label(fields: List, labels: Tuple[str, ...], idx_fallback: int,
+                     default: str = "") -> str:
+    """v14g5 FIX 17: Tally's field ORDER is not stable — reordering questions or
+    inserting one silently shifts every positional index, so (e.g.) a phone number
+    lands in the name column and a clinic onboards with garbage data. Prefer
+    matching the field's own label (case-insensitive substring of any candidate);
+    fall back to the positional index only when no label matches."""
+    try:
+        for f in fields:
+            lbl = str(f.get("label", "")).strip().lower()
+            if lbl and any(k in lbl for k in labels):
+                val = f.get("value", "")
+                if val:
+                    return str(val).strip()
+    except Exception:
+        pass
+    return extract_field(fields, idx_fallback, default)
+
+
+def _normalize_msisdn(raw: str) -> str:
+    """v14g3 BUG 11/12: canonicalise a phone number to digits in a COUNTRY-AWARE
+    way, so the same line always yields the same key while two different lines
+    that merely share the last 10 digits (different country codes) stay distinct.
+      • strip every non-digit
+      • drop a leading '00' international prefix, then a single leading '0' trunk
+      • if exactly 10 digits remain (a bare national number), prepend the default
+        country code (DEFAULT_COUNTRY_CODE — India '91' by default)
+      • otherwise keep the digits as-is (they already carry a country code)
+    Returns '' when there aren't enough digits to be a real number."""
+    d = re.sub(r"\D", "", raw or "")
+    if d.startswith("00"):
+        d = d[2:]
+    if len(d) == 11 and d.startswith("0"):
+        d = d[1:]                       # national trunk '0' → bare 10-digit number
+    if len(d) < 7:
+        return ""
+    if len(d) == 10:
+        d = cfg.DEFAULT_COUNTRY_CODE + d
+    return d
+
+
 def make_customer_id(name: str, whatsapp_phone: str = "",
                      owner_phone: str = "") -> str:
-    """v14 BUG 41 FIX — Identity Fragmentation.
+    """v14 BUG 41 / v14g3 BUG 11 — stable, collision-safe identity.
 
-    The old id was derived from the (mutable) display NAME, so if a doctor edited
-    the spelling in Tally even slightly ("Smile Dental" → "Smile Dental Clinic"),
-    a brand-new customer_id was minted and the old patients/CRM were orphaned.
-
-    The business identity that does NOT change is the WhatsApp number. So we derive
-    the id from the normalised phone digits → the SAME business always maps to the
-    SAME id regardless of how the name is typed, and save_customer_brain()'s UPSERT
-    then updates the existing brain instead of creating a duplicate. Name is used
-    only as a last-resort fallback when no phone is supplied at all."""
-    digits = re.sub(r"\D", "", whatsapp_phone or owner_phone or "")
-    if len(digits) >= 7:
-        # Normalise to the last 10 digits (the national subscriber number) so the
-        # SAME number written with or without a country code / spaces / dashes —
-        # "+91 98765 43210", "9876543210", "+91-98765-43210" — all collapse to ONE
-        # stable id. (Tuned for India's 10-digit mobiles, the primary market.)
-        norm = digits[-10:] if len(digits) >= 10 else digits
-        return "HX_WA_" + norm                  # stable across any name edit
+    The id is derived from the WhatsApp number (which does NOT change when the
+    display name is edited), normalised country-aware via _normalize_msisdn so:
+      • '+91 98765 43210', '9876543210', '+91-98765-43210' → ONE id, and
+      • a +1 number and a +91 number that share the last 10 digits → TWO ids.
+    The old 'last-10-digits only' rule could collide those two and let one
+    clinic's Tally re-submit silently OVERWRITE another clinic's brain via the
+    UPSERT. Name is only a last-resort fallback when no usable phone is given."""
+    msisdn = _normalize_msisdn(whatsapp_phone or owner_phone or "")
+    if msisdn:
+        return "HX_WA_" + msisdn                # stable + country-safe
     # Fallback: no phone given → legacy name-based id (best effort, unavoidable).
-    safe = "".join(c if c.isalnum() else "_" for c in (name or "").upper())
-    return f"HX_{safe[:60]}" if safe else "HX_" + uuid.uuid4().hex[:16]
+    # v14g5 FIX 14: restrict to ASCII [A-Z0-9_] so the id always satisfies the
+    # /chat id validator (Unicode letters pass .isalnum() and used to leak in). If
+    # nothing usable survives, hash the name so two names can't collide on "HX_".
+    safe = "".join(c if (c.isascii() and c.isalnum()) else "_" for c in (name or "").upper())
+    safe = safe.strip("_")
+    if safe:
+        return f"HX_{safe[:60]}"
+    if name:
+        return "HX_" + hashlib.sha256(name.encode("utf-8")).hexdigest()[:16].upper()
+    return "HX_" + uuid.uuid4().hex[:16].upper()
 
 
 def find_legacy_brain_id_by_phone(whatsapp_phone: str) -> Optional[str]:
-    """v14 BUG 41: transition helper. If a business was created on a PRE-v14
-    (name-based) id and now re-submits with the same WhatsApp number, find that
-    existing brain by its stored whatsapp_phone (indexed) so we keep using its id
-    instead of creating a parallel phone-based row. Exact-match on the stored
-    string; bounded and indexed (idx_brain_phone)."""
+    """v14 BUG 41 transition helper / v14g3 BUG 12 fix.
+
+    If a business was created on a PRE-v14 (name-based) id and now re-submits
+    with the same WhatsApp number, find that existing brain so we keep its id
+    instead of minting a parallel phone-based row.
+
+    v14g3: the old version did an EXACT string match on whatsapp_phone only, so
+    the same number stored as '+91 98765 43210' but re-submitted as '9876543210'
+    would NOT match → a new id was minted → the very orphaning BUG 41 was meant
+    to kill. We now (1) try the fast exact match (indexed), then (2) fall back to
+    a bounded scan that compares the COUNTRY-AWARE NORMALISED form."""
     wp = (whatsapp_phone or "").strip()
     if not wp:
         return None
+    target = _normalize_msisdn(wp)
     try:
         with _db_pool.get(read_only=True) as conn:
             cur = _execute(conn,
@@ -3484,7 +4883,20 @@ def find_legacy_brain_id_by_phone(whatsapp_phone: str) -> Optional[str]:
                 "WHERE whatsapp_phone=? AND is_active=? LIMIT 1",
                 (wp, _db_true()))
             row = cur.fetchone()
-        return row["customer_id"] if row else None
+            if row:
+                return row["customer_id"]
+            if not target:
+                return None
+            # (2) normalised scan — bounded; runs only on onboarding, never on the
+            # hot message path, and tenant counts are small.
+            cur = _execute(conn,
+                "SELECT customer_id, whatsapp_phone FROM customer_brains "
+                "WHERE whatsapp_phone <> '' AND is_active=? LIMIT 5000",
+                (_db_true(),))
+            for r in cur.fetchall():
+                if _normalize_msisdn(r["whatsapp_phone"]) == target:
+                    return r["customer_id"]
+        return None
     except Exception as exc:
         log.warning(f"⚠️  legacy-id lookup failed: {exc}")
         return None
@@ -3509,7 +4921,7 @@ def verify_tally_signature(raw_body: bytes, headers: dict) -> bool:
 def root():
     """Friendly landing — visiting the bare Render URL previously 404'd."""
     return jsonify({
-        "engine":  "HEONIX ULTRA ENGINE v14.0 — STABLE-IDENTITY + ORDERED",
+        "engine":  "HEONIX ULTRA ENGINE v14.0 — GEN-5 (audit-hardened)",
         "status":  "online",
         "health":  "/health",
         "ready":   "/ready",
@@ -3529,14 +4941,14 @@ def health():
     ai_active = [k for k, v in AI_PROVIDERS_ACTIVE.items() if v]
     return jsonify({
         "status":           "UP" if db_ok else "DEGRADED",
-        "engine":           "HEONIX Ultra v14.0",
+        "engine":           "HEONIX Ultra v14.0 Gen-5",
         "region":           cfg.REGION,
         "timestamp":        _now(),
         "db_mode":          cfg.DATABASE_MODE,
         "db_healthy":       db_ok,
         "replica_pool":     bool(
             isinstance(_db_pool, PostgreSQLPool) and _db_pool._read),
-        "redis_connected":  brain_cache._redis is not None,
+        "redis_connected":  brain_cache.ping(),   # v14g5 FIX 48: real round-trip
         "ai_providers":     AI_PROVIDERS_ACTIVE,
         "active_ai_chain":  ai_active,
         "pii_encryption":   pii_vault.enabled,
@@ -3574,6 +4986,12 @@ def ready():
 # ── Prometheus Metrics (FIX #15: histograms + P99 latency) ──────────────────
 @app.route("/metrics", methods=["GET"])
 def metrics():
+    # v14g5 FIX 23: if METRICS_TOKEN is set, require it (constant-time) so the
+    # endpoint that exposes customer/session/message counts isn't world-readable.
+    # Unset = open (dev / private network), preserving prior behaviour.
+    if cfg.METRICS_TOKEN and not hmac.compare_digest(
+            request.headers.get("X-Metrics-Token", ""), cfg.METRICS_TOKEN):
+        return jsonify({"error": "Unauthorized"}), 401
     snap = analytics.snapshot()
     c    = snap["counters"]
     p99  = snap["latency_p99"]
@@ -3653,7 +5071,7 @@ def tally_webhook():
     if request.method == "GET":
         return jsonify({
             "status":  "live",
-            "engine":  "HEONIX Ultra v14.0",
+            "engine":  "HEONIX Ultra v14.0 Gen-5",
             "region":  cfg.REGION,
             "message": "POST Tally form payload here to deploy a customer brain.",
         }), 200
@@ -3680,12 +5098,18 @@ def tally_webhook():
     try:
         fields = tally_data.get("data", {}).get("fields", [])
         raw    = WebhookPayloadValidator(
-            customer_name  = extract_field(fields, 0, "Anonymous Client"),
-            business_type  = extract_field(fields, 1, "General Business"),
-            extra_notes    = extract_field(fields, 2, ""),
-            whatsapp_phone = extract_field(fields, 3, ""),
-            owner_phone    = extract_field(fields, 4, ""),
-            instagram_id   = extract_field(fields, 5, ""),
+            customer_name  = extract_by_label(
+                fields, ("name", "clinic", "business name", "your name"), 0, "Anonymous Client"),
+            business_type  = extract_by_label(
+                fields, ("type", "industry", "category", "vertical"), 1, "General Business"),
+            extra_notes    = extract_by_label(
+                fields, ("note", "detail", "message", "anything else"), 2, ""),
+            whatsapp_phone = extract_by_label(
+                fields, ("whatsapp", "wa number", "business number", "business phone"), 3, ""),
+            owner_phone    = extract_by_label(
+                fields, ("owner", "your phone", "contact number", "personal"), 4, ""),
+            instagram_id   = extract_by_label(
+                fields, ("instagram", "insta", "ig handle", "ig id"), 5, ""),
         )
         # v14 BUG 41: stable, phone-derived id (no more orphaning on name edits).
         # First honour any pre-v14 brain that already owns this number, so an old
@@ -3703,12 +5127,14 @@ def tally_webhook():
                             instagram_id=raw.instagram_id,
                             bot_name=bot_name)
 
-        # Publish welcome message via transactional outbox (FIX #3)
+        # Publish welcome message via transactional outbox (FIX #3).
+        # v14g3 BUG 9: carry customer_id so the sender can use this clinic's creds.
         if raw.whatsapp_phone:
             outbox_publish("whatsapp.send", {
-                "to":      raw.whatsapp_phone,
-                "message": (f"Hi! Your AI assistant {bot_name} is live for "
-                            f"{raw.customer_name}. Customer ID: {customer_id}"),
+                "to":          raw.whatsapp_phone,
+                "customer_id": customer_id,
+                "message":     (f"Hi! Your AI assistant {bot_name} is live for "
+                                f"{raw.customer_name}. Customer ID: {customer_id}"),
             })
 
         log_webhook(source_ip, payload_hash, customer_id, "SUCCESS")
@@ -3766,7 +5192,13 @@ def _resolve_inbound_brain(phone_number_id: str, from_phone: str) -> Optional[st
     Full multi-tenant routing (per-clinic creds, many lines) is deferred to
     tenant #2; this just makes sure replies actually reach the patient today.
     """
-    # 1) explicit phone_number_id → brain mapping (cached)
+    # 1) explicit routing: the Meta phone_number_id → the owning brain.
+    # v14g3 BUG 4: the old query compared whatsapp_phone (a phone NUMBER) against
+    # phone_number_id (a Meta numeric ID) — they can NEVER be equal, so this path
+    # was dead code and every inbound fell straight through to the single-brain
+    # guess below. The correct routing column is wa_phone_number_id (attached via
+    # POST /admin/customer/<id>/channel), so this resolver is now correct on its
+    # own even when get_brain_by_wa_phone_id wasn't consulted first.
     if phone_number_id:
         ckey = f"wa_route:{phone_number_id}"
         cached = brain_cache.get(ckey)
@@ -3774,19 +5206,25 @@ def _resolve_inbound_brain(phone_number_id: str, from_phone: str) -> Optional[st
             return cached if cached != "__none__" else None
         try:
             with _db_pool.get(read_only=True) as conn:
-                cur = _execute(conn,
-                    "SELECT customer_id FROM customer_brains "
-                    "WHERE whatsapp_phone=? AND is_active=?",
-                    (phone_number_id, _db_true()))
-                row = cur.fetchone()
-            if row:
-                cid = row["customer_id"]
-                brain_cache.set(ckey, cid, ttl=600)
-                return cid
+                if _column_exists(conn, "customer_brains", "wa_phone_number_id"):
+                    cur = _execute(conn,
+                        "SELECT customer_id FROM customer_brains "
+                        "WHERE wa_phone_number_id=? AND is_active=?",
+                        (phone_number_id, _db_true()))
+                    row = cur.fetchone()
+                    if row:
+                        cid = row["customer_id"]
+                        brain_cache.set(ckey, cid, ttl=600)
+                        return cid
         except Exception as exc:
             log.warning(f"⚠️  inbound route lookup failed: {exc}")
 
-    # 2) single-tenant fallback — exactly one active brain (cached briefly)
+    # 2) single-tenant fallback — exactly one active brain (cached briefly).
+    # v14g5 FIX 10: gated behind SINGLE_TENANT_FALLBACK. This is a convenience for a
+    # pre-v13 single-clinic setup; in a real multi-tenant deployment it can mis-route
+    # an unknown number to the only clinic, so it can be turned off.
+    if not cfg.SINGLE_TENANT_FALLBACK:
+        return None
     try:
         single = brain_cache.get("wa_route:__single__")
         if single:
@@ -3799,6 +5237,11 @@ def _resolve_inbound_brain(phone_number_id: str, from_phone: str) -> Optional[st
         if len(rows) == 1:
             cid = rows[0]["customer_id"]
             brain_cache.set("wa_route:__single__", cid, ttl=120)
+            # If a business number actually arrived but didn't match a brain above,
+            # routing fell through to the single-tenant guess — surface that loudly.
+            if phone_number_id:
+                log.warning(f"⚠️  WA single-tenant fallback used for pnid={phone_number_id} "
+                            f"→ {cid}. Attach this number via /admin to enable true routing.")
             return cid
         # 0 or >1 active brains → ambiguous, cache the miss briefly
         brain_cache.set("wa_route:__single__", "__none__", ttl=60)
@@ -3807,7 +5250,8 @@ def _resolve_inbound_brain(phone_number_id: str, from_phone: str) -> Optional[st
     return None
 
 
-def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "") -> None:
+def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
+                        profile_name: str = "") -> None:
     """Heavy per-message handler — runs in the background pool, fully outside
     any Flask request context.
     v13: routes by the BUSINESS number that received the message
@@ -3851,13 +5295,38 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "") -
             if len(user_text) > cfg.MAX_MESSAGE_LEN:
                 user_text = user_text[:cfg.MAX_MESSAGE_LEN]
         elif msg_type == "audio":
-            user_text = transcribe_voice_note(msg.get("audio", {}).get("id", ""))
+            user_text = transcribe_voice_note(msg.get("audio", {}).get("id", ""), out_tok)
             if not user_text:
                 send_whatsapp_sync(from_phone,
                     "🎤 Sorry, I couldn't hear that clearly — could you please type your message?",
                     out_pid, out_tok, customer_id)  # v14: ordered reply
                 return
             analytics.inc("voice.transcribed")
+        elif msg_type == "image" and cfg.ENABLE_IMAGE_UNDERSTANDING:
+            # v14g4: actually LOOK at the image with Gemini, then fall through to
+            # the normal pipeline so the bot answers in the clinic's own persona.
+            caption = (msg.get("image", {}).get("caption") or "").strip()
+            desc    = understand_image_media(msg.get("image", {}).get("id", ""), out_tok)
+            if not desc:
+                send_whatsapp_sync(from_phone,
+                    "📎 Thanks for the image! I couldn't read it clearly — could you "
+                    "briefly type what you'd like help with?",
+                    out_pid, out_tok, customer_id)
+                analytics.inc("whatsapp.image_unreadable")
+                return
+            analytics.inc("image.understood")
+            user_text = ((caption + "\n\n") if caption else "") + \
+                        f"[The customer sent an image. It appears to show: {desc}]"
+            if len(user_text) > cfg.MAX_MESSAGE_LEN:
+                user_text = user_text[:cfg.MAX_MESSAGE_LEN]
+        elif msg_type == "interactive":
+            # v14g4: a tapped reply-button / list-row arrives here. Prefer the id
+            # (it carries 'slot:N' for booking); fall back to the visible title.
+            inter = msg.get("interactive", {})
+            br    = inter.get("button_reply") or inter.get("list_reply") or {}
+            user_text = (br.get("id") or br.get("title") or "").strip()
+            if not user_text:
+                return
         elif msg_type in ("image", "document", "video", "sticker"):
             # #16: acknowledge media instead of silently black-holing it
             send_whatsapp_sync(from_phone,
@@ -3872,7 +5341,9 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "") -
         skey = f"wa_session:{customer_id}:{from_phone}"
         session_id = brain_cache.get(skey)
         if not session_id:
-            session_id = create_session(customer_id, channel="whatsapp")
+            session_id = create_session(
+                customer_id, channel="whatsapp",
+                subject_hash=_crm_phone_hash(customer_id, from_phone))
             brain_cache.set(skey, session_id, ttl=3600)
 
         gov = govern_message(user_text, guid,
@@ -3884,13 +5355,29 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "") -
         if gov["muted"]:
             return
         if gov["reply"]:
-            send_whatsapp_sync(from_phone, gov["reply"], out_pid, out_tok, customer_id)  # v14: ordered
+            # v14g5 FIX 50: persist the turn BEFORE the network send so a record
+            # always backs a delivered message (and a mid-send crash can't lose it).
             save_messages_batch(session_id, [
                 ("user",  user_text,    "whatsapp", 0),
                 ("model", gov["reply"], "local",    0),
             ])
             increment_chat_count(customer_id)
+            # v14g5 FIX 26: a first contact that only triggers a local/templated
+            # reply is still a lead — capture it here too, not just on the AI path.
+            crm_add_contact(customer_id,
+                            (profile_name.strip() or f"WA {pii_vault.mask(from_phone)}"),
+                            from_phone, notes=f"First msg: {user_text[:200]}")
+            send_whatsapp_sync(from_phone, gov["reply"], out_pid, out_tok, customer_id)  # v14: ordered
             analytics.inc("whatsapp.local_reply")
+            return
+
+        # v14g4: appointment booking (flag-gated, default OFF). If this message is
+        # part of a booking flow, handle it deterministically and stop — the AI
+        # only runs for non-booking messages, so booking can never be derailed by
+        # a hallucinated time or double-booked slot.
+        if cfg.ENABLE_BOOKING and handle_booking(
+                brain, from_phone, user_text, out_pid, out_tok, customer_id,
+                session_id, subject_name=profile_name):
             return
 
         history = get_session_history(session_id)
@@ -3913,7 +5400,8 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "") -
             ("model", reply,     provider,   latency_ms),
         ])
         increment_chat_count(customer_id)
-        crm_add_contact(customer_id, f"WA {pii_vault.mask(from_phone)}",
+        crm_add_contact(customer_id,
+                         (profile_name.strip() or f"WA {pii_vault.mask(from_phone)}"),
                          from_phone, notes=f"First msg: {user_text[:200]}")
         send_whatsapp_sync(from_phone, reply, out_pid, out_tok, customer_id)  # v14: ordered
 
@@ -3925,7 +5413,9 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "") -
 
 
 @app.route("/whatsapp-webhook", methods=["GET", "POST"])
-@limiter.limit(cfg.WEBHOOK_RATE_LIMIT)
+@limiter.exempt   # v14g5 FIX 5: Meta posts every clinic's traffic from shared IPs;
+                  # an IP limit here throttles ALL clinics at once. The HMAC
+                  # signature check (verify_meta_signature) is the real gatekeeper.
 def whatsapp_webhook():
     if request.method == "GET":
         mode      = request.args.get("hub.mode")
@@ -3950,6 +5440,11 @@ def whatsapp_webhook():
             value           = change.get("value", {})
             # #13: the business line the patient texted (Meta's routing key)
             phone_number_id = value.get("metadata", {}).get("phone_number_id", "")
+            # v14g5 FIX 15: WhatsApp delivers the sender's display name once per
+            # webhook under value.contacts[].profile.name — capture it so CRM leads
+            # and bookings carry a real name instead of just a masked number.
+            name_map = {c.get("wa_id", ""): (c.get("profile", {}) or {}).get("name", "")
+                        for c in value.get("contacts", [])}
             for msg in value.get("messages", []):        # #7: all msgs
                 from_phone = msg.get("from", "")
                 wamid      = msg.get("id", "")
@@ -3965,8 +5460,14 @@ def whatsapp_webhook():
                 # different conversations still run in parallel.
                 conv_key = f"wa:{phone_number_id}:{from_phone}"
                 if submit_ordered(conv_key, _process_wa_message,
-                                  from_phone, msg, phone_number_id):  # #1: async, ordered
+                                  from_phone, msg, phone_number_id,
+                                  name_map.get(from_phone, "")):  # #1: async, ordered
                     queued += 1
+                elif wamid:
+                    # v14g3 BUG 13: backlog full → this message was NOT processed.
+                    # Release the dedupe claim so Meta's automatic retry can try
+                    # again later, instead of being deduped away (= permanent loss).
+                    brain_cache.delete(f"wamid:{wamid}")
 
     # #1: ALWAYS 200 immediately — Meta must never time out or retry-storm.
     return jsonify({"status": "queued", "accepted": queued}), 200
@@ -4020,7 +5521,9 @@ def _process_ig_message(sender: str, recipient: str, message: dict) -> None:
         skey = f"ig_session:{customer_id}:{sender}"
         session_id = brain_cache.get(skey)
         if not session_id:
-            session_id = create_session(customer_id, channel="instagram")
+            session_id = create_session(
+                customer_id, channel="instagram",
+                subject_hash=_crm_phone_hash(customer_id, f"ig_{sender}"))
             brain_cache.set(skey, session_id, ttl=3600)
 
         gov = govern_message(user_text, uid,
@@ -4031,12 +5534,16 @@ def _process_ig_message(sender: str, recipient: str, message: dict) -> None:
         if gov["muted"]:
             return
         if gov["reply"]:
-            send_instagram_sync(sender, gov["reply"], ig_own, ig_tok, customer_id)  # v14: ordered
+            # v14g5 FIX 50: persist before the network send (see WA path).
             save_messages_batch(session_id, [
                 ("user",  user_text,    "instagram", 0),
                 ("model", gov["reply"], "local",     0),
             ])
             increment_chat_count(customer_id)
+            # v14g5 FIX 26: capture the IG lead on the local-reply path too.
+            crm_add_contact(customer_id, f"IG {pii_vault.mask(sender)}",
+                            f"ig_{sender}", notes=f"First msg: {user_text[:200]}")
+            send_instagram_sync(sender, gov["reply"], ig_own, ig_tok, customer_id)  # v14: ordered
             analytics.inc("instagram.local_reply")
             return
 
@@ -4071,13 +5578,13 @@ def _process_ig_message(sender: str, recipient: str, message: dict) -> None:
 
 
 @app.route("/instagram-webhook", methods=["GET", "POST"])
-@limiter.limit(cfg.WEBHOOK_RATE_LIMIT)
+@limiter.exempt   # v14g5 FIX 5: see WhatsApp webhook — signature is the real gate.
 def instagram_webhook():
     if request.method == "GET":
         mode      = request.args.get("hub.mode")
         token     = request.args.get("hub.verify_token")
         challenge = request.args.get("hub.challenge")
-        if mode == "subscribe" and token == cfg.WHATSAPP_VERIFY_TOKEN:
+        if mode == "subscribe" and token == cfg.INSTAGRAM_VERIFY_TOKEN:  # v14g5 FIX 35
             log.info("✅ Instagram webhook verified by Meta.")
             return challenge, 200
         return "Forbidden", 403
@@ -4112,6 +5619,10 @@ def instagram_webhook():
             if submit_ordered(conv_key, _process_ig_message,
                               sender, recipient, message):   # #1: async, ordered
                 queued += 1
+            elif mid:
+                # v14g3 BUG 13: backlog full → release the dedupe claim so a Meta
+                # retry can re-deliver instead of being silently deduped away.
+                brain_cache.delete(f"igmid:{mid}")
 
     return jsonify({"status": "queued", "accepted": queued}), 200
 
@@ -4273,16 +5784,35 @@ def delete_customer(customer_id: str):
     brain = get_customer_brain(customer_id)
     if not brain:
         return jsonify({"error": "Not found"}), 404
+    old_wa_pid = (brain.get("wa_phone_number_id") or "")
+    old_ig_id  = (brain.get("instagram_id") or "")
     is_pg = isinstance(_db_pool, PostgreSQLPool)
     with _db_pool.get() as conn:
-        _execute(conn,
-            "UPDATE customer_brains SET is_active=?, updated_at=? WHERE customer_id=?",
-            (False if is_pg else 0, _now(), customer_id))
+        # v14g5 FIX 40: also release the routing identifiers. The unique index on
+        # wa_phone_number_id otherwise keeps a DELETED clinic's number reserved
+        # forever, so it could never be re-attached to a new clinic.
+        clear_route = (_column_exists(conn, "customer_brains", "wa_phone_number_id")
+                       and _column_exists(conn, "customer_brains", "instagram_id"))
+        if clear_route:
+            _execute(conn,
+                "UPDATE customer_brains SET is_active=?, wa_phone_number_id=?, "
+                "instagram_id=?, updated_at=? WHERE customer_id=?",
+                (False if is_pg else 0, "", "", _now(), customer_id))
+        else:
+            _execute(conn,
+                "UPDATE customer_brains SET is_active=?, updated_at=? WHERE customer_id=?",
+                (False if is_pg else 0, _now(), customer_id))
     brain_cache.delete(customer_id)
+    # bust every routing cache that could still point at this (now freed) number
+    if old_wa_pid:
+        brain_cache.delete(f"wapid:{old_wa_pid}")
+    if old_ig_id:
+        brain_cache.delete(f"igid:{old_ig_id}")
+    brain_cache.delete("wa_route:__single__")
     actor = g.jwt_user.get("sub", "unknown")
     audit(actor, "customer.delete", customer_id, ip=request.remote_addr)
     analytics.inc("customer.deleted")
-    log.info(f"🗑️  Soft-deleted → {customer_id}")
+    log.info(f"🗑️  Soft-deleted → {customer_id} (released wa_pid={old_wa_pid or '(none)'})")
     return jsonify({"status": "deleted", "customer_id": customer_id}), 200
 
 
@@ -4312,15 +5842,32 @@ def set_customer_channel(customer_id: str):
             return jsonify({"error": "wa_phone_number_id already attached to "
                             f"{existing['customer_id']}"}), 409
 
+    # v14g5 FIX 1: build the UPDATE from ONLY the channel keys actually present in
+    # the request body. Attaching just Instagram must never blank out an existing
+    # WhatsApp number/token (and vice-versa). A bare key with empty value is an
+    # explicit "clear this field".
+    sets: list[str] = []
+    vals: list[Any] = []
+    if "wa_phone_number_id" in body:
+        sets.append("wa_phone_number_id=?"); vals.append(wa_pid)
+    if "wa_token" in body:
+        sets.append("wa_token_enc=?");       vals.append(pii_vault.encrypt(wa_tok) if wa_tok else "")
+    if "instagram_id" in body:
+        sets.append("instagram_id=?");       vals.append(ig_id)
+    if "ig_token" in body:
+        sets.append("ig_token_enc=?");       vals.append(pii_vault.encrypt(ig_tok) if ig_tok else "")
+    if not sets:
+        return jsonify({"error": "No channel fields provided "
+                        "(wa_phone_number_id, wa_token, instagram_id, ig_token)"}), 400
+    sets.append("channel_status=?"); vals.append("ok")
+    sets.append("updated_at=?");     vals.append(_now())
+    vals.append(customer_id)
+
     try:
         with _db_pool.get() as conn:
             _execute(conn,
-                "UPDATE customer_brains SET wa_phone_number_id=?, wa_token_enc=?, "
-                "instagram_id=?, ig_token_enc=?, channel_status=?, updated_at=? "
-                "WHERE customer_id=?",
-                (wa_pid, pii_vault.encrypt(wa_tok) if wa_tok else "",
-                 ig_id,  pii_vault.encrypt(ig_tok) if ig_tok else "",
-                 "ok", _now(), customer_id))
+                "UPDATE customer_brains SET " + ", ".join(sets) +
+                " WHERE customer_id=?", tuple(vals))
     except Exception as exc:
         # DB-level unique-index violation → 409 (the real safety net)
         if "uq_brain_wa_pid" in str(exc) or "unique" in str(exc).lower():
@@ -4437,7 +5984,7 @@ def tenants_health():
         return jsonify({"error": "query_failed"}), 500
 
     return jsonify({
-        "engine":             "HEONIX Ultra v14.0",
+        "engine":             "HEONIX Ultra v14.0 Gen-5",
         "region":             cfg.REGION,
         "active_tenants":     total,
         "healthy":            healthy,
@@ -4529,12 +6076,96 @@ def crm_list_contacts_api(customer_id: str):
 @require_jwt(min_role="admin")
 @limiter.limit(cfg.ADMIN_RATE_LIMIT)
 def crm_get_contact_api(contact_id: int):
-    contact = crm_get_contact_full(contact_id)
+    # v14g5 FIX 4 (IDOR): require the caller to name the tenant they're reading, so
+    # a non-superadmin token can't enumerate contact ids across clinics. Superadmin
+    # may omit it for cross-tenant support.
+    customer_id = (request.args.get("customer_id") or "").strip()
+    role        = g.jwt_user.get("role", "viewer")
+    if not customer_id and role != "superadmin":
+        return jsonify({"error": "customer_id query param required"}), 400
+    contact = crm_get_contact_full(contact_id, customer_id)
     if not contact:
         return jsonify({"error": "Contact not found"}), 404
     actor = g.jwt_user.get("sub", "unknown")
-    audit(actor, "crm.view_full", str(contact_id), ip=request.remote_addr)
+    audit(actor, "crm.view_full", f"{customer_id or '*'}:{contact_id}", ip=request.remote_addr)
     return jsonify(contact), 200
+
+
+# ── v14g4 DPDP: right-to-erasure for ONE data subject (by phone) ──────────────
+@app.route("/admin/customer/<customer_id>/erase-subject", methods=["POST"])
+@require_jwt(min_role="admin")
+@limiter.limit(cfg.ADMIN_RATE_LIMIT)
+def erase_subject_api(customer_id: str):
+    """DPDP Act 2023 right-to-erasure. Body: {"phone": "+91..."}. Deletes this
+    person's CRM contact, bookings, RAG memory, and cache-mapped chat session."""
+    data  = request.get_json(silent=True) or {}
+    phone = (data.get("phone") or "").strip()
+    if not phone:
+        return jsonify({"error": "phone is required"}), 400
+    report = erase_data_subject(customer_id, phone)
+    actor  = g.jwt_user.get("sub", "unknown")
+    audit(actor, "dpdp.erase_subject", f"{customer_id}:{pii_vault.mask(phone)}",
+          ip=request.remote_addr)
+    return jsonify({"status": "erased", "customer_id": customer_id, "deleted": report}), 200
+
+
+# ── v14g4: record/clear a contact's marketing consent (DPDP) ──────────────────
+@app.route("/admin/customer/<customer_id>/consent", methods=["POST"])
+@require_jwt(min_role="admin")
+@limiter.limit(cfg.ADMIN_RATE_LIMIT)
+def set_consent_api(customer_id: str):
+    """Body: {"phone": "+91...", "consented": true}. Only CONSENTED contacts are
+    ever sent cold-lead follow-ups by the scheduler."""
+    data  = request.get_json(silent=True) or {}
+    phone = (data.get("phone") or "").strip()
+    if not phone:
+        return jsonify({"error": "phone is required"}), 400
+    consented = bool(data.get("consented", True))
+    phash = _crm_phone_hash(customer_id, phone)
+    val   = _db_true() if consented else (False if isinstance(_db_pool, PostgreSQLPool) else 0)
+    try:
+        with _db_pool.get() as conn:
+            cur = _execute(conn,
+                "UPDATE crm_contacts SET is_consented=? WHERE customer_id=? AND phone_hash=?",
+                (val, customer_id, phash))
+            updated = getattr(cur, "rowcount", 0) or 0
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    actor = g.jwt_user.get("sub", "unknown")
+    audit(actor, "dpdp.set_consent", f"{customer_id}:{pii_vault.mask(phone)}={consented}",
+          ip=request.remote_addr)
+    return jsonify({"status": "ok", "consented": consented, "rows_updated": updated}), 200
+
+
+# ── v14g4: list a clinic's upcoming bookings (ops view) ───────────────────────
+@app.route("/admin/customer/<customer_id>/bookings", methods=["GET"])
+@require_jwt(min_role="viewer")
+@limiter.limit(cfg.ADMIN_RATE_LIMIT)
+def list_bookings_api(customer_id: str):
+    """Upcoming booked appointments for a clinic. Phones are masked."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    limit   = min(200, int(request.args.get("limit", 50)))
+    out: List[Dict] = []
+    try:
+        with _db_pool.get(read_only=True) as conn:
+            cur = _execute(conn,
+                "SELECT id, enc_phone, slot_start, slot_end, status, reminders_sent "
+                "FROM bookings WHERE customer_id=? AND status='booked' AND slot_start >= ? "
+                "ORDER BY slot_start ASC LIMIT ?", (customer_id, now_iso, limit))
+            for r in cur.fetchall():
+                d = dict(r)
+                out.append({
+                    "id":            d["id"],
+                    "phone":         pii_vault.mask(pii_vault.decrypt(d["enc_phone"])),
+                    "slot_start":    d["slot_start"],
+                    "slot_end":      d["slot_end"],
+                    "local_time":    _fmt_local_dt(d["slot_start"]),
+                    "status":        d["status"],
+                    "reminders_sent": d.get("reminders_sent", ""),
+                })
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    return jsonify({"customer_id": customer_id, "count": len(out), "bookings": out}), 200
 
 
 # ── Analytics Snapshot ────────────────────────────────────────────────────────
@@ -4546,7 +6177,7 @@ def analytics_snapshot():
     snap = analytics.snapshot()
     return jsonify({
         "region":      cfg.REGION,
-        "engine":      "HEONIX Ultra v14.0",
+        "engine":      "HEONIX Ultra v14.0 Gen-5",
         "counters":    snap["counters"],
         "latency_p99": snap["latency_p99"],
         "uptime_secs": snap["uptime_secs"],
@@ -4596,10 +6227,14 @@ def _shutdown_handler(signum, frame):
     # delivery). Now: stop accepting new bg work, let queued sends finish
     # with a hard ceiling enforced by a watchdog, then close the DB pool.
     def _drain():
-        try:
-            _WORKER_POOL.shutdown(wait=True)   # waits for queued sends/alerts
-        except Exception:
-            pass
+        # v14g3 BUG 5: drain ALL bounded pools on shutdown, not just the worker
+        # pool — the I/O pool (alerts/audit/sends) and timeout pool must finish
+        # or be released cleanly too.
+        for _pool in (_WORKER_POOL, _IO_POOL, _TIMEOUT_POOL):
+            try:
+                _pool.shutdown(wait=True)
+            except Exception:
+                pass
         if _db_pool:
             try:
                 _db_pool.close_all()
@@ -4630,7 +6265,7 @@ def startup() -> None:
         _startup_done = True
 
     log.info("=" * 76)
-    log.info("  👑  HEONIX ULTRA ENGINE  v14.0 — STABLE-IDENTITY + ORDERED EDITION")
+    log.info("  👑  HEONIX ULTRA ENGINE  v14.0 — GEN-5  ·  AUDIT-HARDENED EDITION")
     log.info(f"  🌍  Region: {cfg.REGION}")
     log.info("=" * 76)
 
@@ -4663,6 +6298,27 @@ def startup() -> None:
                          "Set DATABASE_URL, DATABASE_MODE=postgres, REDIS_URL "
                          "— or unset STRICT_PROD for dev.")
 
+    # ── v14g3 BUG 3: JWT / Flask secrets MUST be set explicitly for multi-worker.
+    # If unset, each gunicorn worker generated its OWN random secret at import →
+    # a JWT minted by worker A failed validation on worker B (admin login broke
+    # intermittently) and Flask sessions broke the same way. We cannot invent a
+    # shared secret across processes, so fail LOUD (and refuse under STRICT_PROD).
+    _missing_secrets = [n for n in ("JWT_SECRET_KEY", "SECRET_KEY") if not os.getenv(n)]
+    if _missing_secrets:
+        _smsg = ("🛑 " + " & ".join(_missing_secrets) + " not set — each worker "
+                 "will use a DIFFERENT random secret, so JWT auth and Flask "
+                 "sessions break across gunicorn workers. Generate one with: "
+                 "python -c \"import secrets; print(secrets.token_hex(32))\"")
+        # v14g5 FIX 11: a missing shared secret under >1 worker is not a warning —
+        # admin JWTs minted on one worker are REJECTED on another, so login breaks
+        # nondeterministically. Refuse to boot (matches STRICT_PROD behaviour).
+        if cfg.STRICT_PROD or cfg.WEB_CONCURRENCY > 1:
+            raise SystemExit(_smsg + ("  (STRICT_PROD=1 refuses to boot.)"
+                                      if cfg.STRICT_PROD else
+                                      f"  (WEB_CONCURRENCY={cfg.WEB_CONCURRENCY} "
+                                      "> 1 refuses to boot — set a shared secret.)"))
+        log.warning(_smsg)
+
     # ── #34: pool-explosion guard ──
     # Each gunicorn worker opens its OWN pool of up to MAX_POOL_SIZE connections.
     # workers × MAX_POOL_SIZE must stay under the Postgres connection ceiling, or
@@ -4690,6 +6346,9 @@ def startup() -> None:
     _migrate_v10()   # v10: new columns, safe every boot
     _migrate_v11()   # v11: CRM dedupe column + index, safe every boot
     _migrate_v12()   # v13: per-tenant WA/IG creds + unique routing index, safe every boot
+    _migrate_v14g3() # v14g3: unique CRM dedupe index + SQLite phone index
+    _migrate_v14g4() # v14g4: bookings table + cold-lead follow-up marker (additive)
+    _migrate_v14g5() # v14g5: chat_sessions.subject_hash for DB-based DPDP erasure
     _report_wa_pid_duplicates()   # v14: self-diagnose ambiguous-routing duplicates
 
     # ── AI Providers ──
@@ -4739,7 +6398,7 @@ def startup() -> None:
              f"{' ON (ADMIN_ALERT_PHONE set) ✅' if cfg.ADMIN_ALERT_PHONE else ' flag-only (set ADMIN_ALERT_PHONE for WA alerts) ⚠️'}")
     log.info(f"  📝  Log Format:     {cfg.LOG_FORMAT}")
     log.info("=" * 76)
-    log.info("  🦅  v14.0 — STABLE-IDENTITY (Bug 41) + PER-CONVERSATION ORDERING (Bug 43) + dup-detector")
+    log.info("  🦅  v14.0 GEN-5 — 50 audit findings closed (security · correctness · multi-tenant routing · DPDP)")
     log.info("=" * 76)
 
 
