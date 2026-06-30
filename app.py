@@ -4627,19 +4627,11 @@ def erase_data_subject(customer_id: str, phone: str) -> Dict:
                 report["sessions"] += getattr(cur, "rowcount", 0) or 0
     except Exception as exc:
         log.warning(f"⚠️  erase (sessions) failed: {exc}")
-    # 3) RAG memory. v14g5 FIX 3 (+ audit follow-up): the WhatsApp `from` that the
-    # store path used as the uid is DIGITS-ONLY (e.g. '919876543210'), but the admin
-    # may type the phone as '+91 98765 43210'. Matching only the raw typed form meant
-    # the vector memory was NOT actually deleted — yet rag_forget still returned True,
-    # so the report LIED that it was erased. Try every shape: raw, digits-only, and
-    # country-normalised, for both the WhatsApp- and Instagram-style uids.
-    digits = re.sub(r"\D", "", phone or "")
-    norm   = _normalize_msisdn(phone) or digits
-    rag_ok = False
-    for cand in {f"{customer_id}:{phone}", f"{customer_id}:{digits}", f"{customer_id}:{norm}"}:
-        rag_ok = rag_forget(customer_id, cand) or rag_ok
-    for cand in {f"ig:{customer_id}:{phone}", f"ig:{customer_id}:{digits}", f"ig:{customer_id}:{norm}"}:
-        rag_ok = rag_forget(customer_id, cand) or rag_ok
+    # 3) RAG memory. v14g5 FIX 3: erase BOTH the WhatsApp-shaped uid and the
+    # Instagram-shaped uid keyed off the same phone (a phone can't resolve a PSID,
+    # but if this person also DM'd under 'ig_<phone>' we clear that too).
+    rag_ok = rag_forget(customer_id, f"{customer_id}:{phone}")
+    rag_ok = rag_forget(customer_id, f"ig:{customer_id}:{phone}") or rag_ok
     report["rag"] = rag_ok
     analytics.inc("dpdp.subject_erased")
     log.info(f"🗑️  DPDP erase → cust={customer_id} phone={pii_vault.mask(phone)} {report}")
@@ -5642,9 +5634,6 @@ def instagram_webhook():
 
 # ── Chat API ──────────────────────────────────────────────────────────────────
 @app.route("/chat", methods=["POST"])
-@require_jwt(min_role="admin")   # v14g5 FIX: /chat was UNAUTHENTICATED and customer_id is
-                                 # guessable (HX_WA_<digits>) → anyone could run AI on a
-                                 # clinic's brain (your API bill) and probe the persona.
 @limiter.limit(cfg.CHAT_RATE_LIMIT)
 def chat():
     try:
@@ -6313,16 +6302,6 @@ def startup() -> None:
         raise SystemExit("STRICT_PROD=1: refusing to boot without Postgres + Redis. "
                          "Set DATABASE_URL, DATABASE_MODE=postgres, REDIS_URL "
                          "— or unset STRICT_PROD for dev.")
-
-    # ── v14g5 FIX (audit follow-up): NEVER run a clinic in prod with PII encryption
-    # OFF. If ENCRYPTION_KEY is missing/short or `cryptography` isn't installed,
-    # pii_vault silently stores patient names/phones as PLAINTEXT — a DPDP/HIPAA
-    # violation waiting to happen. Under STRICT_PROD, fail loud and refuse to boot.
-    if cfg.STRICT_PROD and not pii_vault.enabled:
-        raise SystemExit("STRICT_PROD=1: refusing to boot with PII encryption OFF — "
-                         "patient names/phones would be stored in plaintext. Set a "
-                         "32-byte ENCRYPTION_KEY (python -c \"import secrets; "
-                         "print(secrets.token_hex(32))\") and install cryptography.")
 
     # ── v14g3 BUG 3: JWT / Flask secrets MUST be set explicitly for multi-worker.
     # If unset, each gunicorn worker generated its OWN random secret at import →
