@@ -46,6 +46,10 @@
    P1-P6 column-check memo/Gemini client LRU/health-flag cache/one-txn
    migration backfill/bounded slot scan/shared lease scanner + lock backoff ·
    O1 leader-gated outbox drain · O2 WEB_CONCURRENCY-under-gunicorn warning.
+   HOTFIX 20-Jul (first live Postgres run): HF1 _execute escapes literal %
+   (%%-then-?→%s — a '%' inside a SQL COMMENT was parsed as a placeholder →
+   IndexError → Tally webhook 500) · HF2 that comment moved out of the SQL
+   string · HF3 TCP keepalives on both PG pools (idle-drop SSL EOF noise).
    PORTS (re-verified from a stale 223-item report — 3 real): #101 location
    messages acknowledged · #201 exact-match STOP/UNSUBSCRIBE opt-out ·
    #221 CRM refreshes a changed display name.
@@ -1544,13 +1548,20 @@ class PostgreSQLPool:
                  replica_dsn: str = ""):
         if not POSTGRES_AVAILABLE:
             raise RuntimeError("psycopg2 not installed. pip install psycopg2-binary")
+        # v16g4 FIX HF3 (hotfix, 20-Jul): managed Postgres (Render/Neon)
+        # closes idle TLS connections; a stale pooled handle then dies on
+        # next use with "SSL SYSCALL error: EOF" / "bad record mac" — the H5
+        # self-heal already discards them, but keepalives stop most handles
+        # from going stale in the first place.
+        _ka = dict(keepalives=1, keepalives_idle=30,
+                   keepalives_interval=10, keepalives_count=3)
         self._write = psycopg2.pool.ThreadedConnectionPool(
-            minconn=min_conn, maxconn=max_conn, dsn=dsn)
+            minconn=min_conn, maxconn=max_conn, dsn=dsn, **_ka)
         self._read  = None
         if replica_dsn:
             try:
                 self._read = psycopg2.pool.ThreadedConnectionPool(
-                    minconn=2, maxconn=max_conn, dsn=replica_dsn)
+                    minconn=2, maxconn=max_conn, dsn=replica_dsn, **_ka)
                 log.info("🐘 PostgreSQL read-replica pool ready.")
             except Exception as exc:
                 log.warning(f"⚠️  Read replica unavailable ({exc}) — reads use primary.")
@@ -5353,12 +5364,17 @@ def _execute(conn, sql: str, params: tuple = ()) -> Any:
     sure the day one appears, it screams instead of corrupting."""
     is_pg = POSTGRES_AVAILABLE and isinstance(conn, psycopg2.extensions.connection)
     if is_pg:
-        if "%" in sql:                                     # v15g4 FIX C4
-            log.error("🛑 _execute: literal '%' in SQL on Postgres — the "
-                      "blind ?→%s translation cannot handle this. Rewrite "
-                      f"the query with parameters. SQL: {sql[:120]}")
+        # v16g4 FIX HF1 (hotfix, 20-Jul): a literal '%' anywhere in the SQL
+        # TEXT — including inside a SQL comment — was passed straight to
+        # psycopg2's paramstyle parser after ?→%s translation, which then
+        # expected MORE parameters than given: "IndexError: tuple index out
+        # of range", a 500 on the live Tally webhook. The v15g4 C4 guard saw
+        # it and LOGGED, but still executed the doomed statement. Now literal
+        # % is escaped to %% FIRST (psycopg2 renders %% as a literal %), THEN
+        # ? becomes %s — the whole bug class is gone, so the guard scream is
+        # retired. House rule stands: parameters use ?, never raw %s.
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(sql.replace("?", "%s"), params)
+        cur.execute(sql.replace("%", "%%").replace("?", "%s"), params)
         if cur.description is None:
             # v16g4 FIX L15: INSERT/UPDATE/DDL produce no result set, yet the
             # cursor was returned open and lived until GC — loop-heavy paths
@@ -5614,13 +5630,18 @@ def save_customer_brain(customer_id: str, customer_name: str,
                          instagram_id: str = "", bot_name: str = "") -> None:
     now   = _now()
     is_pg = isinstance(_db_pool, PostgreSQLPool)
+    # v16g2 FIX N5: ? placeholders (_execute translates). v16g4 FIX HF2: the
+    # N5 note used to live INSIDE the SQL string as a `--` comment — and the
+    # note's own "%s"/"%-guard" text was the literal '%' that blew up the
+    # first real Postgres run of this INSERT (see FIX HF1). Commentary lives
+    # in Python now; SQL strings carry SQL only.
     if is_pg:
         sql = """
             INSERT INTO customer_brains
                 (customer_id, customer_name, business_type, system_prompt,
                  created_at, updated_at, whatsapp_phone, region,
                  owner_phone, instagram_id, bot_name)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?)  -- v16g2 FIX N5: ? placeholders ( _execute translates; the raw %s tripped the %-guard into a spurious ERROR on EVERY Tally onboarding once on Postgres)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT (customer_id) DO UPDATE SET
                 customer_name  = EXCLUDED.customer_name,
                 business_type  = EXCLUDED.business_type,
