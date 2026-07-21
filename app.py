@@ -5621,14 +5621,24 @@ _IST = timezone(timedelta(hours=5, minutes=30))
 def _now_ist() -> datetime:
     return datetime.now(_IST)
 
+def _mentions_current_time(reply: str) -> bool:
+    """v16.1 GEN-6 FIX R7-M2: with minute-exact time back in the prompt, a
+    cached reply that STATES the current clock time would go stale inside its
+    half-hour cache bucket — the exact regression v16g3 R3-L6 fixed by
+    rounding. Instead of rounding (observed live 22-Jul: '12:30 AM' shown at
+    12:50, reading as simply wrong), keep the time exact and refuse to CACHE
+    any reply that contains the current minute. Static times in replies
+    (working hours like '9:00 AM') still cache; only now-o'clock answers
+    stay fresh."""
+    hm = _now_ist().strftime("%I:%M")
+    return bool(reply) and (hm in reply or hm.lstrip("0") in reply)
+
+
 def _time_context() -> str:
     n = _now_ist()
-    # v16g3 FIX R3-L6: the reply is cached per HALF-HOUR bucket (B8) but the
-    # prompt injected minute precision — "it is 10:01 AM" could be served at
-    # 10:29. State the time at the bucket the cache already keys on.
-    n = n.replace(minute=(0 if n.minute < 30 else 30),
-                  second=0, microsecond=0)
-    return ("\n\n[REAL-TIME — India / IST] It is currently around "
+    # v16g3 FIX R3-L6 rounded this to the half-hour cache bucket; superseded
+    # by R7-M2 above — exact minute here, cache-side guard over there.
+    return ("\n\n[REAL-TIME — India / IST] It is currently exactly "
             + n.strftime("%A, %d %B %Y, %I:%M %p")
             + ". You DO know the current date, day and time — it is stated right "
               "here. If the user asks the time, date, or day, answer directly "
@@ -5775,7 +5785,8 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
                 _opid, _otok, brain.get("customer_id", ""))
         analytics.inc("escalation.ai")
     else:
-        if cacheable and provider != "cache" and not _identity_blocked:
+        if (cacheable and provider != "cache" and not _identity_blocked
+                and not _mentions_current_time(reply)):     # R7-M2
             resp_cache_put(_cache_hour_seed(base), cache_msg, reply)
         if channel != "api" and not _identity_blocked:        # v16g2 FIX M10 / R7-C1
             rag_store(brain.get("customer_id", ""), user_uid, user_text, reply)
