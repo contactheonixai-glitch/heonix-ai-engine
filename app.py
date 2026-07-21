@@ -4344,6 +4344,15 @@ def build_system_prompt(customer_name: str, business_desc: str) -> Tuple[str, st
     btype    = detect_business_type(business_desc)
     template = BUSINESS_TEMPLATES[btype]
     prompt   = template["prompt"].format(name=customer_name)
+    # v16.1 GEN-6 FIX R7-H1: business_desc was read ONLY to pick a template
+    # and then thrown away — the one piece of clinic-specific text collected
+    # at onboarding never reached the model. With nothing to ground on, a
+    # question like "what is your address?" has no honest answer available,
+    # and the model fills the gap itself (see R7-C1). Carry it through.
+    desc = (business_desc or "").strip()
+    if desc:
+        prompt += ("\n\nWhat the owner told us about this business — treat "
+                   "these as the ONLY authoritative facts you hold: " + desc)
     return template["bot_name"], prompt
 
 
@@ -5498,6 +5507,16 @@ _ESCALATION_RULE = (
 )
 _LANGUAGE_RULE = ("\n\nLANGUAGE: Always reply in the same language and script "
                   "the user used, no matter which language it is.")
+# v16.1 GEN-6 FIX R7-M1b: asked about news / world events, the model invented
+# answers (it has no internet). Fabricated current affairs from a clinic
+# assistant is the same defect class as R7-C1 — confident fiction. Scope it.
+_SCOPE_RULE = ("\n\nSCOPE: You have NO internet access and NO knowledge of "
+               "current news, events, prices, or the outside world beyond what "
+               "this prompt states. If asked about such things, say briefly, in "
+               "the user's own language, that you can only help with this "
+               "business's services and bookings, then steer back. Never "
+               "fabricate news, scores, or world facts. (The current date/time "
+               "given below IS known to you — answer those directly.)")
 
 
 def _mask_uid(uid: str) -> str:
@@ -5611,9 +5630,12 @@ def _time_context() -> str:
                   second=0, microsecond=0)
     return ("\n\n[REAL-TIME — India / IST] It is currently around "
             + n.strftime("%A, %d %B %Y, %I:%M %p")
-            + ". Use THIS actual current time to decide whether the business is "
-              "open or closed right now (compare it against the working hours "
-              "stated above). Never guess, assume, or invent the time.")
+            + ". You DO know the current date, day and time — it is stated right "
+              "here. If the user asks the time, date, or day, answer directly "
+              "from this line; never claim you lack real-time access. Use it to "
+              "decide whether the business is open or closed right now (compare "
+              "against the working hours stated above). Never guess, assume, or "
+              "invent the time.")   # v16.1 GEN-6 FIX R7-M1a
 
 def _cache_hour_seed(base: str) -> str:
     # Bucket the response cache by IST time so time-sensitive answers
@@ -5624,6 +5646,69 @@ def _cache_hour_seed(base: str) -> str:
     # flip exactly when the clinic does.
     n = _now_ist()
     return base + "\n#h=" + n.strftime("%Y%m%d%H") + ("0" if n.minute < 30 else "1")
+
+
+# ── v16.1 GEN-6 · FIX R7-C1 (LAUNCH-CRITICAL) ────────────────────────────────
+# Observed live on 21-Jul-2026: the greeting correctly said "Vakkai Care Dental"
+# (interpolated from customer_name) and the very next reply said "Smile Care
+# Dental is located at RS Puram, Coimbatore" — a clinic name AND an address that
+# appear nowhere in this codebase or in the brain. The healthcare template
+# already carries an explicit rule ("this is the ONLY clinic name you may ever
+# use", "Never invent, guess, or make up any clinic name, address, location,
+# doctor name, fees, or timings") and gemini-3.1-flash-lite ignored it.
+#
+# A prompt rule is a request, not a control. So the check moves into code: if
+# the model names a business whose distinctive word is not this clinic's, the
+# turn is refused instead of sent. The failure this exists to prevent is a
+# patient walking to another clinic's address.
+_GENERIC_BIZ_WORDS = {
+    "dental", "dentistry", "clinic", "clinics", "hospital", "hospitals",
+    "polyclinic", "medical", "medicals", "centre", "center", "care",
+    "health", "healthcare", "diagnostics", "nursing", "home", "speciality",
+    "specialty", "multispeciality", "multispecialty", "the", "and", "for",
+}
+_BIZ_TAIL = (r"Dental|Dentistry|Clinic|Clinics|Hospital|Hospitals|Polyclinic|"
+             r"Diagnostics|Nursing\s+Home|Medical\s+Cent(?:re|er)|"
+             r"Health\s+Cent(?:re|er)|Care\s+Cent(?:re|er)")
+# At least one Capitalised word must precede the tail, so a generic mention
+# ("please contact the clinic", "go to a hospital") never trips the guard.
+_BIZ_NAME_RE = re.compile(r"\b((?:[A-Z][\w&'\u2019.-]*\s+){1,3}(?:" + _BIZ_TAIL + r"))\b")
+
+_UNVERIFIED_LINES = {
+    "en": ("I don't have that detail confirmed on my side — let me check with "
+           "the clinic and come back to you. You can also call the clinic directly."),
+    "ta": ("\u0b85\u0ba8\u0bcd\u0ba4 \u0bb5\u0bbf\u0bb5\u0bb0\u0bae\u0bcd \u0b8e\u0ba9\u0bcd\u0ba9\u0bbf\u0b9f\u0bae\u0bcd \u0b89\u0bb1\u0bc1\u0ba4\u0bbf\u0baf\u0bbe \u0b87\u0bb2\u0bcd\u0bb2 \u2014 clinic-\u0b95\u0bbf\u0b9f\u0bcd\u0b9f \u0b95\u0bc7\u0b9f\u0bcd\u0b9f\u0bc1 \u0b9a\u0bca\u0bb2\u0bcd\u0bb1\u0bc7\u0ba9\u0bcd. "
+           "\u0ba8\u0bc7\u0bb0\u0b9f\u0bbf\u0baf\u0bbe\u0bb5\u0bc1\u0bae\u0bcd \u0ba4\u0bca\u0b9f\u0bb0\u0bcd\u0baa\u0bc1 \u0b95\u0bca\u0bb3\u0bcd\u0bb3\u0bb2\u0bbe\u0bae\u0bcd."),
+    "hi": ("\u092e\u0947\u0930\u0947 \u092a\u093e\u0938 \u092f\u0939 \u091c\u093e\u0928\u0915\u093e\u0930\u0940 \u092a\u0941\u0937\u094d\u091f \u0928\u0939\u0940\u0902 \u0939\u0948 \u2014 \u092e\u0948\u0902 \u0915\u094d\u0932\u093f\u0928\u093f\u0915 \u0938\u0947 \u092a\u0942\u091b\u0915\u0930 \u092c\u0924\u093e\u0924\u093e \u0939\u0942\u0901\u0964 "
+           "\u0906\u092a \u0938\u0940\u0927\u0947 \u0915\u094d\u0932\u093f\u0928\u093f\u0915 \u0938\u0947 \u092d\u0940 \u0938\u0902\u092a\u0930\u094d\u0915 \u0915\u0930 \u0938\u0915\u0924\u0947 \u0939\u0948\u0902\u0964"),
+}
+
+
+def _distinctive_tokens(name: str) -> set:
+    """The brand word(s) only. "Vakkai Care Dental" and "Smile Care Dental"
+    both reduce to a single token — {vakkai} vs {smile} — so the shared
+    generic words ("care", "dental") can't mask an impostor name."""
+    toks = re.findall(r"[A-Za-z][A-Za-z'\u2019-]*", (name or "").lower())
+    return {t for t in toks if t not in _GENERIC_BIZ_WORDS and len(t) > 2}
+
+
+def _guard_clinic_identity(reply: str, brain: Dict, user_text: str) -> Tuple[str, bool]:
+    """Refuse any reply that names a business other than this clinic.
+    Returns (reply, blocked). A blocked turn is never cached and never stored
+    to RAG — a fabricated answer must not become a remembered one."""
+    own = _distinctive_tokens(brain.get("customer_name") or "")
+    if not own or not reply:
+        return reply, False           # no distinctive name to compare against
+    for cand in _BIZ_NAME_RE.findall(reply):
+        if not (_distinctive_tokens(cand) & own):
+            log.error(f"\U0001f6d1 R7-C1 identity guard: model named "
+                      f"{cand!r} for clinic {brain.get('customer_name')!r} "
+                      f"\u2014 reply refused, not cached, not stored.")
+            analytics.inc("guard.identity_block")
+            lang = detect_language(user_text)
+            return _UNVERIFIED_LINES.get(lang, _UNVERIFIED_LINES["en"]), True
+    return reply, False
+
 
 
 def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
@@ -5665,11 +5750,14 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
     if memory:
         sys_prompt += ("\n\nRELEVANT MEMORY from earlier chats with this same "
                        "person (use naturally, don't recite):\n" + memory)
-    sys_prompt += _LANGUAGE_RULE + _ESCALATION_RULE
+    sys_prompt += _LANGUAGE_RULE + _ESCALATION_RULE + _SCOPE_RULE   # R7-M1b
     sys_prompt += _time_context()
 
     reply, provider = multi_ai_reply(sys_prompt, history, user_text,
                                      plan_tier=str(brain.get("plan_tier") or ""))  # v15g2 FIX L1
+
+    # v16.1 GEN-6 FIX R7-C1: check the model's output before anyone sees it.
+    reply, _identity_blocked = _guard_clinic_identity(reply, brain, user_text)
 
     escalated = ESCALATE_TOKEN in reply
     if escalated:
@@ -5687,9 +5775,9 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
                 _opid, _otok, brain.get("customer_id", ""))
         analytics.inc("escalation.ai")
     else:
-        if cacheable and provider != "cache":
+        if cacheable and provider != "cache" and not _identity_blocked:
             resp_cache_put(_cache_hour_seed(base), cache_msg, reply)
-        if channel != "api":                                  # v16g2 FIX M10
+        if channel != "api" and not _identity_blocked:        # v16g2 FIX M10 / R7-C1
             rag_store(brain.get("customer_id", ""), user_uid, user_text, reply)
 
     return reply, provider, escalated
