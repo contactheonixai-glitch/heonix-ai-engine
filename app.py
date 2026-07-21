@@ -1070,6 +1070,10 @@ class Config:
     # (recommended once live — prevents the silent SQLite/in-process fallback
     # that breaks dedupe + ghost-mute across gunicorn workers).
     STRICT_PROD: bool              = _env_bool("STRICT_PROD", False)       # v16g4 FIX M1
+    # v16g5 FIX R5-M11: promoted out of a raw per-import os.getenv into cfg,
+    # like every other setting. Comma-separated origins; empty = dev wildcard
+    # (refused under STRICT_PROD).
+    CORS_ORIGINS: str              = os.getenv("CORS_ORIGINS", "").strip()
 
     # ── v12 ── (hyper-scale / concurrency hardening)
     # JSON-bomb guard (#37): reject oversized request bodies before they hit RAM.
@@ -1192,7 +1196,14 @@ cfg = Config()
 
 # v16g4 FIX L7: the detailed build banner — shown only to DEBUG or a caller
 # holding METRICS_TOKEN; the anonymous landing page says just "HEONIX".
-ENGINE_BANNER = "HEONIX ULTRA ENGINE v16.0 GEN-4 (Usernames/BSUID · 131 audit fixes)"
+# v16g6 FIX R6-L1: FOUR version identities lived in one build (this banner
+# said GEN-4, /health said GEN-3, the shutdown log said GEN-3, the startup
+# banner said GEN-5). After a hotfix night, /health is the one thing that
+# must be trusted to say which build is live. One constant; all derive.
+ENGINE_VERSION = "v16.1"
+ENGINE_GEN     = "GEN-6"
+ENGINE_BANNER  = (f"HEONIX ULTRA ENGINE {ENGINE_VERSION} {ENGINE_GEN} "
+                  f"(Usernames/BSUID · 178 audit fixes)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1276,23 +1287,80 @@ class PIIVault:
     def enabled(self) -> bool:
         return self._enabled
 
+    # v16g5 FIX R5-C4: ciphertext is now VERSION-TAGGED. Before this, a value
+    # written while the vault was disabled sat in enc_phone as raw plaintext
+    # ("919876543210"); the day ENCRYPTION_KEY was set, decrypt() ran
+    # b64decode on it — which SUCCEEDS (bare digits are valid base64
+    # alphabet), produced garbage, failed the AESGCM tag, and returned
+    # "[ENCRYPTED]". Those rows were unreadable forever, and they are exactly
+    # the rows the reminder scanner, the follow-up scanner and DPDP erasure
+    # need. A "v1:" prefix makes ciphertext self-identifying, so an untagged
+    # value is recognised as legacy plaintext and returned as-is instead of
+    # being destroyed. Legacy UNTAGGED ciphertext (written by a pre-R5 build
+    # with the vault enabled) still decrypts via the fallback branch.
+    _CT_PREFIX = "v1:"
+
     def encrypt(self, plaintext: str) -> str:
         if not self._enabled or not plaintext:
             return plaintext
         nonce = os.urandom(12)
         ct    = self._aesgcm.encrypt(nonce, plaintext.encode("utf-8"), None)
-        return base64.b64encode(nonce + ct).decode("ascii")
+        return self._CT_PREFIX + base64.b64encode(nonce + ct).decode("ascii")
+
+    def _open(self, blob: str) -> Optional[str]:
+        """Attempt one AESGCM open. None = not our ciphertext."""
+        try:
+            raw = base64.b64decode(blob, validate=True)
+        except Exception:
+            return None
+        if len(raw) < 29:            # 12-byte nonce + 16-byte tag + ≥1 byte
+            return None
+        try:
+            return self._aesgcm.decrypt(raw[:12], raw[12:], None).decode("utf-8")
+        except Exception:
+            return None
 
     def decrypt(self, token: str) -> str:
-        if not self._enabled or not token:
+        if not token:
             return token
-        try:
-            raw   = base64.b64decode(token)
-            nonce, ct = raw[:12], raw[12:]
-            return self._aesgcm.decrypt(nonce, ct, None).decode("utf-8")
-        except Exception:
+        if not self._enabled:
+            # v16g6 FIX R6-C2: with the vault OFF (lost/typo'd ENCRYPTION_KEY —
+            # note _load fails SOFT), tagged ciphertext was returned VERBATIM.
+            # "v1:AAAA…" is truthy and != "[ENCRYPTED]", so it sailed past
+            # every downstream guard: brain_wa_creds sent it to Meta as a
+            # Bearer token (401 → the whole fleet false-flagged needs_reauth,
+            # blamed on token death instead of the real one-env-var cause) and
+            # the reminder scanner handed it to Meta as a phone number. Never
+            # give ciphertext to a caller as a value.
+            if token.startswith(self._CT_PREFIX):
+                log.error("❌ PII vault is DISABLED but tagged ciphertext was "
+                          "read — ENCRYPTION_KEY is missing/invalid on this "
+                          "deployment. Returning sentinel (v16g6 FIX R6-C2).")
+                return "[ENCRYPTED]"
+            return token
+        # Fast path: tagged ciphertext written by this build.
+        if token.startswith(self._CT_PREFIX):
+            out = self._open(token[len(self._CT_PREFIX):])
+            if out is not None:
+                return out
             log.error("❌ PII decryption failed — key mismatch or corrupt data.")
             return "[ENCRYPTED]"
+        # Untagged: could be legacy ciphertext OR legacy plaintext. Try to
+        # open it; if it isn't ours, it was written before encryption was
+        # enabled — hand back the plaintext rather than bricking the row.
+        out = self._open(token)
+        if out is not None:
+            return out
+        # Ciphertext-SHAPED but unopenable = a real key mismatch on a legacy
+        # row. Keep the old sentinel so every `!= "[ENCRYPTED]"` guard in the
+        # schedulers still fires (never leak a raw blob as a phone number).
+        try:
+            if len(base64.b64decode(token, validate=True)) >= 29:
+                log.error("❌ PII decryption failed — key mismatch or corrupt data.")
+                return "[ENCRYPTED]"
+        except Exception:
+            pass
+        return token
 
     def mask(self, value: str) -> str:
         # v15 FIX 20 / v16g2 FIX L7 / v16g3 FIX R3-M4: tiered. L7 only moved
@@ -1365,6 +1433,9 @@ def verify_password(plaintext: str, stored_hash: str) -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 ROLES = {"superadmin", "admin", "viewer"}
 _ROLE_RANK = {"viewer": 0, "admin": 1, "superadmin": 2}
+# v16g5 FIX R5-L3: issuer/audience binding for admin JWTs.
+_JWT_ISS = "heonix-engine"
+_JWT_AUD = "heonix-admin"
 
 
 def _tenant_forbidden(customer_id: str) -> bool:
@@ -1388,18 +1459,73 @@ def generate_jwt(user_id: str, role: str = "admin", tenant: str = "") -> str:
         "exp":  datetime.now(timezone.utc) + timedelta(hours=cfg.JWT_EXPIRY_HOURS),
         "jti":  uuid.uuid4().hex,
         "rgn":  cfg.REGION,
+        # v16g5 FIX R5-L3: bind the token to this issuer/audience so a token
+        # minted by another HEONIX deployment sharing an ENCRYPTION_KEY-derived
+        # secret cannot be replayed here.
+        "iss":  _JWT_ISS,
+        "aud":  _JWT_AUD,
     }
     if tenant:                       # v16g4 FIX M10: tenant-scoped admin token
         payload["tnt"] = tenant
     return pyjwt.encode(payload, cfg.JWT_SECRET_KEY, algorithm="HS256")
 
 
+def revoke_jwt(jti: str, ttl: int = 0) -> None:
+    """v16g5 FIX R5-L3: add a token id to the denylist until its natural
+    expiry. Backed by the shared cache, so a revoke lands fleet-wide on Redis
+    (and process-locally in dev). This is what makes /admin/logout real —
+    before this a leaked admin token stayed valid for the full expiry window
+    with no way to kill it."""
+    if not jti:
+        return
+    try:
+        brain_cache.set(f"jwtban:{jti}", "1",
+                        ttl=ttl or (cfg.JWT_EXPIRY_HOURS * 3600))
+    except Exception as exc:
+        log.warning(f"\u26a0\ufe0f  JWT revoke failed for {jti[:8]}: {exc}")
+
+
 def decode_jwt(token: str) -> Optional[Dict]:
     if not JWT_AVAILABLE:
         return None
     try:
-        return pyjwt.decode(token, cfg.JWT_SECRET_KEY, algorithms=["HS256"])
-    except pyjwt.InvalidTokenError:   # v14g3 BUG 19: ExpiredSignatureError ⊂ InvalidTokenError
+        # v16g6 FIX R6-M9: passing issuer= makes PyJWT raise
+        # MissingRequiredClaimError when `iss` is ABSENT — the exact legacy
+        # token the R5-L3 comment promised to tolerate — and the broad
+        # InvalidTokenError catch below turned that into None, logging every
+        # pre-R5 admin out after all. iss/aud are verified MANUALLY just
+        # below: strict when present, tolerated when absent, exactly as
+        # documented.
+        payload = pyjwt.decode(
+            token, cfg.JWT_SECRET_KEY, algorithms=["HS256"],
+            options={"require": ["exp"], "verify_aud": False})
+        _iss = payload.get("iss")
+        _aud = payload.get("aud")
+        if (_iss and _iss != _JWT_ISS) or (_aud and _aud != _JWT_AUD):
+            return None
+        # Denylist check (revoked / logged out).
+        _jti = payload.get("jti", "")
+        if _jti:
+            try:
+                if brain_cache.get(f"jwtban:{_jti}"):
+                    return None
+            except Exception as _rex:
+                # v16g6 FIX R6-M10: still fail OPEN (401ing every request on
+                # a Redis blip is worse than honouring a token for one gap) —
+                # but LOUDLY. With /admin/logout live (R6-C5), silence here
+                # means a banned token quietly works again. Counter + a
+                # once-per-5-min alarm make the gap visible; in no-Redis mode
+                # a revoke is per-worker by construction (ops constraint,
+                # STRICT_PROD requires Redis anyway).
+                try:
+                    analytics.inc("jwt.revocation_check_failed")
+                    if brain_cache.setnx("warn:jwtban_check", ttl=300):
+                        log.error(f"❌ JWT revocation check UNAVAILABLE — "
+                                  f"revoked tokens may be honoured: {_rex}")
+                except Exception:
+                    pass
+        return payload
+    except pyjwt.InvalidTokenError:   # v14g3 BUG 19: ExpiredSignatureError \u2282 InvalidTokenError
         return None
 
 
@@ -1639,7 +1765,7 @@ class SQLitePool:
         return conn
 
     @contextmanager
-    def get(self, read_only: bool = False) -> Generator:  # read_only ignored for SQLite
+    def get(self, read_only: bool = False) -> Generator:
         try:
             conn = self._pool.get(timeout=self._timeout)
         except queue.Empty:
@@ -1654,7 +1780,13 @@ class SQLitePool:
         broken = False
         try:
             yield conn
-            conn.commit()
+            # v16g5 FIX R5-L6: read_only was accepted and IGNORED, so every
+            # SELECT ended in a COMMIT — pointless WAL churn and a write-lock
+            # acquisition for a pure read on the path production runs today.
+            if read_only:
+                conn.rollback()
+            else:
+                conn.commit()
         except Exception:
             try:
                 conn.rollback()
@@ -1938,7 +2070,19 @@ def init_db() -> None:
     schema = _PG_SCHEMA if is_pg else _SQLITE_SCHEMA
     with _db_pool.get() as conn:
         if is_pg:
-            conn.cursor().execute(schema)
+            # v16g5 FIX R5-L4: the cursor was created inline and never closed
+            # (it lived until GC), the one place in the file that skipped the
+            # FIX L15 discipline. Multi-statement DDL still can't go through
+            # _execute (it would ?→%s-translate the schema text), so close it
+            # explicitly instead.
+            _cur = conn.cursor()
+            try:
+                _cur.execute(schema)
+            finally:
+                try:
+                    _cur.close()
+                except Exception:
+                    pass
         else:
             conn.executescript(schema)
     log.info("🗄️  Database schema initialised.")
@@ -1968,20 +2112,39 @@ def _migrate_v11() -> None:
     """v11: CRM phone_hash dedupe column + index. Idempotent on every boot.
     #13: each statement runs in its own connection, so when two gunicorn
     workers boot simultaneously, the loser's 'duplicate column' error is
-    swallowed and the schema is still correct. On Postgres we additionally
-    take an advisory lock so the backfill runs exactly once."""
+    swallowed and the schema is still correct. On Postgres the DDL and the
+    backfill SCAN each take their own try-advisory-xact lock — v16g6 FIX
+    R6-H7: xact locks die with their transaction, and the backfill ran on a
+    NEW connection, so the single lock above never actually covered it and
+    every booting worker ran the full 5,000-row scan concurrently."""
     is_pg = isinstance(_db_pool, PostgreSQLPool)
     if is_pg:
+        # v16g5 FIX R5-C3 (LAUNCH-CRITICAL): this used a SESSION-scoped
+        # pg_advisory_lock. Three compounding failures:
+        #   1. a failing ALTER aborts the Postgres transaction, so the
+        #      `finally` unlock ALSO fails ("current transaction is aborted");
+        #   2. a session advisory lock SURVIVES ROLLBACK, so the pool handed
+        #      that connection back with the lock still held;
+        #   3. pg_advisory_lock BLOCKS WITH NO TIMEOUT, so the next worker to
+        #      boot waited on it forever.
+        # One bad migration could therefore wedge every subsequent boot until
+        # the connection was killed by hand — and Render recycles workers
+        # routinely. pg_advisory_xact_lock is transaction-scoped: Postgres
+        # releases it on COMMIT *or* ROLLBACK, unconditionally. The try-variant
+        # never blocks, so a losing worker skips instead of hanging.
         try:
             with _db_pool.get() as conn:
-                _execute(conn, "SELECT pg_advisory_lock(427011)")
-                try:
+                _cur = _execute(conn, "SELECT pg_try_advisory_xact_lock(427011) AS got")
+                _row = _cur.fetchone()
+                _got = bool(_row["got"] if isinstance(_row, dict) else _row[0])
+                if _got:
                     _execute(conn, "ALTER TABLE crm_contacts "
                                    "ADD COLUMN IF NOT EXISTS phone_hash TEXT DEFAULT ''")
                     _execute(conn, "CREATE INDEX IF NOT EXISTS idx_crm_dedupe "
                                    "ON crm_contacts(customer_id, phone_hash)")
-                finally:
-                    _execute(conn, "SELECT pg_advisory_unlock(427011)")
+                else:
+                    log.info("🗄️  v11 migration: another worker holds the "
+                             "migration lock — skipping (no blocking wait).")
         except Exception as exc:
             log.warning(f"⚠️  v11 migration (pg) issue: {exc}")
     else:
@@ -2002,35 +2165,92 @@ def _migrate_v11() -> None:
     # per-row fault-isolated, and skipped instantly when nothing needs it.
     try:
         with _db_pool.get() as conn:
-            cur = _execute(conn,
-                "SELECT id, customer_id, enc_phone FROM crm_contacts "
-                "WHERE phone_hash='' OR phone_hash IS NULL LIMIT 5000")
-            rows = cur.fetchall()
+            # v16g5 FIX R5-L1: bounded, but now RESUMABLE. The old query had
+            # no cursor, so with >5,000 legacy rows the same first page was
+            # re-read on every boot forever and the rows past it were never
+            # reached. ORDER BY id + a persisted high-water mark walks the
+            # whole table across successive boots.
+            _mark = brain_cache.get("migrate:v11:backfill_after") or 0
+            try:
+                _mark = int(_mark)
+            except (TypeError, ValueError):
+                _mark = 0
+            # v16g6 FIX R6-H7: serialise the scan itself. This is a fresh
+            # transaction, so the DDL lock above is long gone.
+            _bf_lock_ok = True
+            if isinstance(_db_pool, PostgreSQLPool):
+                _c2 = _execute(conn,
+                    "SELECT pg_try_advisory_xact_lock(427012) AS got")
+                _r2 = _c2.fetchone()
+                _bf_lock_ok = bool(_r2["got"] if not isinstance(_r2, tuple)
+                                   else _r2[0])
+            if _bf_lock_ok:
+                cur = _execute(conn,
+                    "SELECT id, customer_id, enc_phone FROM crm_contacts "
+                    "WHERE (phone_hash='' OR phone_hash IS NULL) AND id > ? "
+                    "ORDER BY id LIMIT 5000", (_mark,))
+                rows = cur.fetchall()
+            else:
+                rows = []
+                log.info("🗄️  v11 backfill: another worker holds the scan "
+                         "lock — skipping this boot (v16g6 FIX R6-H7).")
         # v16g4 FIX P4: the backfill borrowed a pooled connection PER ROW —
         # up to 5,000 getconn/commit/putconn cycles every boot. Decrypt and
         # hash first (per-row fault-isolated), then apply every update on ONE
         # connection in ONE transaction.
         updates = []
+        # v16g6 FIX R6-H6: classify every skip. A TRANSIENT skip (key missing
+        # or wrong → "[ENCRYPTED]" / disabled-vault ciphertext passthrough)
+        # must NOT advance the mark — one boot with a lost ENCRYPTION_KEY
+        # used to move it past a whole page, stranding those rows behind it
+        # FOREVER once the key came back: phone_hash='' → invisible to
+        # dedupe, follow-ups and erasure. Only written rows and permanent
+        # junk (too few digits under a HEALTHY decrypt) may advance it.
+        _safe_ids = set()
         for r in rows:
             try:
                 phone = pii_vault.decrypt(r["enc_phone"])
                 # v16g2 FIX L13: with the vault disabled, decrypt() passes
-                # CIPHERTEXT through unchanged — hashing that poisons dedupe
-                # with rows that later look valid. Skip non-phone-shaped values.
+                # CIPHERTEXT through unchanged — hashing that poisons dedupe.
                 if (phone == "[ENCRYPTED]"
-                        or len(re.sub(r"\D", "", phone or "")) < 7
                         or (not pii_vault.enabled and len(phone or "") > 20)):
+                    continue                      # transient — retry next boot
+                if len(re.sub(r"\D", "", phone or "")) < 7:
+                    _safe_ids.add(r["id"])        # permanent junk — skip forever
                     continue
                 updates.append((_crm_phone_hash(r["customer_id"], phone), r["id"]))
+                _safe_ids.add(r["id"])
             except Exception:
-                continue
+                continue                          # unknown — treat as transient
         if updates:
             with _db_pool.get() as conn:
                 for row_hash, row_id in updates:
                     _execute(conn, "UPDATE crm_contacts SET phone_hash=? WHERE id=?",
                              (row_hash, row_id))
         if rows:
-            log.info(f"🗄️  v11 migration: backfilled phone_hash for {len(rows)} contacts")
+            # v16g5 FIX R5-L1: report what was actually WRITTEN, not what was
+            # scanned — the old line claimed a backfill even when every row
+            # was skipped by the L13 guard. Advance the high-water mark so the
+            # next boot resumes past this page instead of re-reading it.
+            # v16g6 FIX R6-H6: advance only across the longest PREFIX of this
+            # page whose rows were written or are permanently unfixable — the
+            # first transient row is a barrier the next boot resumes from.
+            # (Without Redis the mark is per-process; re-scanning is now
+            # merely redundant work, never data loss.)
+            try:
+                _last = _mark
+                for r in rows:
+                    if r["id"] in _safe_ids:
+                        _last = r["id"]
+                    else:
+                        break
+                if _last != _mark:
+                    brain_cache.set("migrate:v11:backfill_after", int(_last),
+                                    ttl=30 * 86400)
+            except Exception:
+                pass
+            log.info(f"🗄️  v11 migration: scanned {len(rows)} contacts, "
+                     f"backfilled phone_hash for {len(updates)}")
     except Exception as exc:
         log.warning(f"⚠️  v11 backfill skipped: {exc}")
 
@@ -2058,6 +2278,13 @@ def _column_exists(conn, table: str, column: str) -> bool:
             "AND table_schema = current_schema()", (table, column))  # v15 FIX 24
         _found = cur.fetchone() is not None
     else:
+        # v16g5 FIX R5-M8: PRAGMA cannot take a bound parameter, so the table
+        # name is interpolated — but it is now whitelisted against the
+        # identifier grammar first. Every current call site passes a literal;
+        # this makes sure the day one doesn't, it raises instead of executing
+        # attacker-shaped SQL in the one place this file interpolates.
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,62}", table or ""):
+            raise ValueError(f"unsafe table identifier: {table!r}")
         cur = _execute(conn, f"PRAGMA table_info({table})")
         _found = any((r[1] if not isinstance(r, dict) else r.get("name")) == column
                      for r in cur.fetchall())
@@ -2312,6 +2539,26 @@ def _migrate_v16() -> None:
         log.warning(f"⚠️  v16 migration issue: {exc}")
 
 
+def _migrate_v16g5() -> None:
+    """v16g5 FIX R5-H4: durable opt-out suppression table."""
+    is_pg = isinstance(_db_pool, PostgreSQLPool)
+    ddl = ("CREATE TABLE IF NOT EXISTS opt_outs ("
+           "id BIGSERIAL PRIMARY KEY, customer_id TEXT NOT NULL, "
+           "subject_hash TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+           if is_pg else
+           "CREATE TABLE IF NOT EXISTS opt_outs ("
+           "id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id TEXT NOT NULL, "
+           "subject_hash TEXT NOT NULL, created_at TEXT NOT NULL)")
+    for stmt in (ddl,
+                 "CREATE UNIQUE INDEX IF NOT EXISTS uq_optout "
+                 "ON opt_outs(customer_id, subject_hash)"):
+        try:
+            with _db_pool.get() as conn:
+                _execute(conn, stmt)
+        except Exception as exc:
+            log.warning(f"⚠️  v16g5 opt_outs migration issue: {exc}")
+
+
 def _migrate_v16g4() -> None:
     """v16g4 FIX M10: admin_users.tenant_id — admin JWTs carried role but no
     tenant claim, so every 'admin' token was fleet-wide; the v16 IDOR fix only
@@ -2520,10 +2767,25 @@ class DistributedCache:
         removed = 0
         if self._redis:
             try:
+                # v16g6 FIX R6-L9: one DELETE per key made erasure's resp:*
+                # flush a few thousand sequential round-trips inside a
+                # request. Pipeline in batches of 500.
+                _batch = []
+
+                def _flush(_b):
+                    _pipe = self._redis.pipeline(transaction=False)
+                    for _bk in _b:
+                        _pipe.delete(_bk)
+                    return sum(1 for _r in _pipe.execute() if _r)
+
                 for k in self._redis.scan_iter(match=f"heonix:{prefix}*",
                                                count=500):
-                    self._redis.delete(k)
-                    removed += 1
+                    _batch.append(k)
+                    if len(_batch) >= 500:
+                        removed += _flush(_batch)
+                        _batch = []
+                if _batch:
+                    removed += _flush(_batch)
             except Exception:
                 pass
         with self._lock:
@@ -2650,10 +2912,26 @@ class CustomerRateLimiter:
         workers = max(1, cfg.WEB_CONCURRENCY)
         return max(1, self._rpm // workers)
 
+    # v16g5 FIX R5-L5: the window math below ran on time.time() — a WALL
+    # clock. An NTP step BACKWARDS re-opens a window a caller already spent
+    # (limit silently doubles); a step FORWARDS skips one (legitimate patients
+    # dropped). Every other timer in this file already uses time.monotonic().
+    # v16g6 FIX R6-L11: pinning time.time()-time.monotonic() AT IMPORT made
+    # the anchor itself per-process — workers booted either side of an NTP
+    # step (or drifted apart over a long uptime) computed different `win`
+    # ids for the same instant, and the fleet limiter silently degraded to
+    # per-worker: the exact failure R5-L5 existed to fix. Fleet-comparable
+    # ids need the fleet's shared clock: time.time() directly. An NTP step
+    # now glitches at most ONE window and self-heals; permanent cross-worker
+    # skew is gone.
+    @classmethod
+    def _wall(cls) -> float:
+        return time.time()
+
     def is_allowed(self, customer_id: str) -> bool:
         # v16g3 FIX R3-M9: sliding-window approximation. ttl 120 keeps the
         # previous minute's counter readable for the weighted term.
-        now  = time.time()
+        now  = self._wall()                       # v16g5 FIX R5-L5
         win  = int(now // 60)
         count, distributed = brain_cache.incr_checked(
             f"rl:{customer_id}:{win}", ttl=120)     # v16g2 FIX L11 signal kept
@@ -2691,6 +2969,7 @@ class CircuitBreaker:
         self._state         = self.CLOSED
         self._opened_at     = 0.0
         self._probe_inflight = False     # v12 #22: single-probe gate for HALF_OPEN
+        self._probe_started_at = 0.0     # v16g5 FIX R5-H2
         self._lock          = threading.Lock()
 
     @property
@@ -2713,10 +2992,27 @@ class CircuitBreaker:
                 # concurrent caller fast-fails instead of stampeding a provider
                 # that just came back from the dead (which would re-trip it and
                 # could DDoS Gemini/OpenAI ourselves).
-                if self._probe_inflight:
+                # v16g5 FIX R5-H2: belt-and-braces for the finally above — a
+                # probe still "in flight" past the reset window is treated as
+                # abandoned and reclaimed, so the breaker can never wedge.
+                if (self._probe_inflight
+                        and time.monotonic() - self._probe_started_at
+                            < max(self._reset_timeout, 30.0)):
                     raise RuntimeError(f"CircuitBreaker [{self.name}] HALF_OPEN (probing)")
-                self._probe_inflight = True
+                if self._probe_inflight:
+                    log.warning(f"⚡ CircuitBreaker [{self.name}] reclaiming an "
+                                f"abandoned probe slot")
+                self._probe_inflight   = True
+                self._probe_started_at = time.monotonic()
                 is_probe = True
+        # v16g5 FIX R5-H2: _probe_inflight used to be cleared only on the three
+        # `except Exception` / success paths. A BaseException out of the probe
+        # — SystemExit, KeyboardInterrupt, a gevent/eventlet Timeout, a
+        # GeneratorExit from a killed worker thread — left it True FOREVER, and
+        # nothing else ever resets it: every later call raised
+        # "HALF_OPEN (probing)" and that provider was dead for the life of the
+        # process. The flag is now released in a finally, and an abandoned
+        # probe additionally ages out via _probe_started_at.
         try:
             result = func(*args, **kwargs)
             with self._lock:
@@ -2724,8 +3020,6 @@ class CircuitBreaker:
                 if self._state == self.HALF_OPEN:
                     self._state = self.CLOSED
                     log.info(f"⚡ CircuitBreaker [{self.name}] → CLOSED (recovered)")
-                if is_probe:
-                    self._probe_inflight = False
             return result
         except AIEmptyResponse:
             # v15 FIX 6 (HIGH): an empty/safety-blocked reply means the provider
@@ -2742,8 +3036,6 @@ class CircuitBreaker:
                     self._failures = 0
                     log.info(f"⚡ CircuitBreaker [{self.name}] → CLOSED "
                              f"(probe answered, empty reply)")
-                if is_probe:
-                    self._probe_inflight = False
             raise
         except Exception:
             with self._lock:
@@ -2752,13 +3044,17 @@ class CircuitBreaker:
                     # probe failed → straight back to OPEN, restart the timer.
                     self._state          = self.OPEN
                     self._opened_at      = time.monotonic()
-                    self._probe_inflight = False
                     log.error(f"⚡ CircuitBreaker [{self.name}] → OPEN (probe failed)")
                 elif self._failures >= self._threshold:
                     self._state     = self.OPEN
                     self._opened_at = time.monotonic()
                     log.error(f"⚡ CircuitBreaker [{self.name}] → OPEN (failures={self._failures})")
             raise
+        finally:
+            # v16g5 FIX R5-H2: the ONLY place the probe gate is released.
+            if is_probe:
+                with self._lock:
+                    self._probe_inflight = False
 
 
 _gemini_breaker   = CircuitBreaker("Gemini",   failure_threshold=5, reset_timeout=60.0)
@@ -2952,7 +3248,10 @@ def _retry_with_backoff(fn: Callable, *args, max_retries: int = 3,
     v15g4 FIX B7: the docstring above is finally TRUE — permanent 4xx-class
     errors are re-raised immediately instead of being retried.
     """
-    for attempt in range(max_retries + 1):
+    # v16g6 FIX R6-L3: MAX_RETRIES=-1 (accepted silently by _env_int) made
+    # range() empty — the loop never ran, the function fell off the end, and
+    # None propagated outward as the AI reply.
+    for attempt in range(max(0, max_retries) + 1):
         try:
             return fn(*args)
         except AIEmptyResponse:
@@ -2983,12 +3282,16 @@ def multi_ai_reply(
     GEMINI_MODEL_PREMIUM — the Config comment promised this since v11 while
     plan_tier was only ever SELECTed for the customer list. Dead promise, wired.
     """
-    _gemini_model = (cfg.GEMINI_MODEL_PREMIUM
-                     if (plan_tier or "").strip().lower() == "premium"
-                     else cfg.GEMINI_MODEL)
+    # v16g6 FIX R6-L2: this local used to be named `_gemini_model`, shadowing
+    # the module-level lru_cache'd factory of the same name — one future
+    # `_gemini_model(...)` call in this scope away from "'str' object is not
+    # callable".
+    _gemini_model_name = (cfg.GEMINI_MODEL_PREMIUM
+                          if (plan_tier or "").strip().lower() == "premium"
+                          else cfg.GEMINI_MODEL)
     providers = [
         ("gemini", _gemini_breaker,
-         lambda s, h, u, _m=_gemini_model: _call_gemini(s, h, u, _m)),
+         lambda s, h, u, _m=_gemini_model_name: _call_gemini(s, h, u, _m)),
         ("openai", _openai_breaker, _call_openai),
         ("claude", _claude_breaker, _call_claude),
     ]
@@ -3142,7 +3445,35 @@ def _wa_send_text(to_phone: str, message: str,
         return {"error": "not_configured"}
     url = f"{WHATSAPP_API_BASE}/{phone_id}/messages"
     last: Dict = {}
-    for chunk in _split_wa_chunks(message):
+    # v16g5 FIX R5-M3: a 4xx/5xx on chunk 2 raised AFTER chunk 1 had already
+    # been delivered; _meta_send_retry then restarted the whole loop and the
+    # patient received the first 4,096 characters TWICE — and a long clinical
+    # answer is exactly the message that chunks. Record per-chunk progress
+    # under a short-lived content-derived key so a retry RESUMES. Best-effort:
+    # a cache miss degrades to the old behaviour, never to a dropped message.
+    _chunks = _split_wa_chunks(message)
+    _ck = _done = None
+    if len(_chunks) > 1:
+        _ck = "wachunk:" + hashlib.sha256(
+            f"{to_phone}|{phone_id}|{message}".encode("utf-8")).hexdigest()[:24]
+        try:
+            _done = int(brain_cache.get(_ck) or 0)
+        except (TypeError, ValueError):
+            _done = 0
+        if _done >= len(_chunks):
+            # v16g6 FIX R6-M7: a STALE completion marker (the final delete
+            # below failed and was swallowed) made an identical repeat
+            # message within the TTL skip EVERY chunk and return {} — a
+            # silent non-send the caller records as delivered. A marker that
+            # claims "all chunks done" can only be stale on a NEW call: this
+            # call exists because the caller wants a send. Start fresh.
+            _done = 0
+        if _done:
+            log.info(f"📤 resuming chunked send at part {_done + 1}/{len(_chunks)} "
+                     f"(v16g5 FIX R5-M3)")
+    for _idx, chunk in enumerate(_chunks):
+        if _done and _idx < _done:
+            continue
         payload = {
             "messaging_product": "whatsapp",
             "recipient_type":    "individual",
@@ -3170,7 +3501,29 @@ def _wa_send_text(to_phone: str, message: str,
             if resp.status_code in (401, 403) or code in _WA_AUTH_FAIL_CODES:
                 raise WhatsAppAuthError(code, err.get("message", "auth failed"))
         resp.raise_for_status()
-        last = resp.json()
+        if _ck:                                          # v16g5 FIX R5-M3
+            try:
+                # v16g6 FIX R6-L10: progress is recorded BEFORE parsing the
+                # body — a Meta 200 with a non-JSON body used to raise first,
+                # so the retry re-sent this chunk: the exact duplicate R5-M3
+                # exists to prevent. Delivered is delivered.
+                brain_cache.set(_ck, _idx + 1, ttl=600)
+            except Exception:
+                pass
+        try:
+            last = resp.json()
+        except Exception:
+            last = {"note": "non-json 2xx body"}         # v16g6 FIX R6-L10
+    if _ck:
+        try:
+            brain_cache.delete(_ck)
+        except Exception:
+            try:
+                # v16g6 FIX R6-M7: second, independent chance to clear the
+                # marker; the resume guard above self-heals the rest.
+                brain_cache.set(_ck, 0, ttl=1)
+            except Exception:
+                pass
     return last
 
 
@@ -3207,11 +3560,33 @@ _IO_POOL = ThreadPoolExecutor(
 _shutdown_event = threading.Event()
 
 
+_IO_QUEUE_MAX = _env_int("IO_QUEUE_MAX", "2000")     # v16g5 FIX R5-L7
+
+
 def submit_bg(fn: Callable, *args, **kwargs) -> None:
     """Fire-and-forget onto the dedicated I/O pool (v14g3 BUG 5 — kept separate
     from the conversation-drain pool so alerts/audit/RAG never queue behind a
     slow AI call). Never raises into the caller. If the pool is shutting down
     (SIGTERM in flight), runs inline so in-progress work is never lost."""
+    # v16g5 FIX R5-L7: the pool is bounded in THREADS, not in QUEUED WORK.
+    # ThreadPoolExecutor's work queue is unbounded, so .submit() never raises
+    # under load — it just grows RAM until the dyno is OOM-killed, and the
+    # RuntimeError fallback below only fires AFTER shutdown. Shed load at an
+    # explicit depth instead: audit/analytics writes are the right thing to
+    # drop when the box is already drowning, and a dropped one is now COUNTED
+    # rather than silently swallowing memory.
+    try:
+        _q = getattr(_IO_POOL, "_work_queue", None)
+        if _q is not None and _q.qsize() > _IO_QUEUE_MAX:
+            analytics.inc("bg.shed")
+            if brain_cache.setnx("warn:bg_queue", ttl=300):
+                log.error(f"🛑 background I/O queue over {_IO_QUEUE_MAX} deep — "
+                          f"shedding fire-and-forget work (v16g5 FIX R5-L7). "
+                          f"The box is saturated; scale workers or check for a "
+                          f"stalled outbound provider.")
+            return
+    except Exception:
+        pass
     try:
         _IO_POOL.submit(fn, *args, **kwargs)
     except RuntimeError:
@@ -3481,7 +3856,7 @@ def _flag_channel_reauth(customer_id: str, detail: str) -> None:
                 pass
         # v14g5 FIX 8: bust the ROUTING caches too, not just the brain cache, so the
         # send path stops using the stale brain (with the dead token) immediately.
-        brain_cache.delete(customer_id)
+        brain_cache.delete(f"brain:{customer_id}")     # v16g6 FIX R6-L6
         if _pid:
             brain_cache.delete(f"wapid:{_pid}")
             brain_cache.delete(f"wa_route:{_pid}")
@@ -4310,6 +4685,62 @@ _L10N: Dict[str, Dict[str, str]] = {
                "செய்யவும்?"),
         "hi": ("📇 साझा करने के लिए धन्यवाद! उसमें से नंबर पढ़ नहीं पाया — "
                "कृपया अपना 10 अंकों का मोबाइल नंबर टाइप करें?"),
+    },
+    # ── v16g5 FIX R5-M2: four patient-facing strings still bypassed _t() and
+    # went out in English regardless of the conversation language, despite M8
+    # claiming full ta/hi/en coverage of every system string. ──────────────
+    "audio_unclear": {
+        "en": ("🎤 Sorry, I couldn't hear that clearly — could you please "
+               "type your message?"),
+        "ta": ("🎤 மன்னிக்கவும், அதைத் தெளிவாகக் கேட்க முடியவில்லை — உங்கள் "
+               "செய்தியை டைப் செய்ய முடியுமா?"),
+        "hi": ("🎤 माफ़ कीजिए, वह स्पष्ट सुनाई नहीं दिया — क्या आप अपना "
+               "संदेश टाइप कर सकते हैं?"),
+    },
+    "image_unreadable": {
+        "en": ("📎 Thanks for the image! I couldn't read it clearly — could "
+               "you briefly type what you'd like help with?"),
+        "ta": ("📎 படத்திற்கு நன்றி! அதைத் தெளிவாகப் படிக்க முடியவில்லை — "
+               "எதற்கு உதவி வேண்டும் என்று சுருக்கமாக டைப் செய்யவும்?"),
+        "hi": ("📎 इमेज के लिए धन्यवाद! मैं उसे साफ़ नहीं पढ़ पाया — कृपया "
+               "संक्षेप में टाइप करें कि आपको किसमें मदद चाहिए?"),
+    },
+    "media_ack": {
+        "en": ("📎 Thanks! I've received your file. Our team will review it "
+               "shortly. Meanwhile, feel free to type any question and I'll "
+               "help right away."),
+        "ta": ("📎 நன்றி! உங்கள் கோப்பு கிடைத்தது. எங்கள் குழு விரைவில் "
+               "பார்க்கும். இதற்கிடையில் எந்தக் கேள்வியையும் டைப் செய்யுங்கள், "
+               "உடனே உதவுகிறேன்."),
+        "hi": ("📎 धन्यवाद! आपकी फ़ाइल मिल गई। हमारी टीम जल्द ही देखेगी। इस "
+               "बीच कोई भी सवाल टाइप करें, मैं तुरंत मदद करूँगा।"),
+    },
+    "contact_ack": {
+        "en": ("📎 Thanks! I've received the contact. Our team will review it "
+               "shortly — meanwhile, feel free to type any question and I'll "
+               "help right away."),
+        "ta": ("📎 நன்றி! தொடர்பு விவரம் கிடைத்தது. எங்கள் குழு விரைவில் "
+               "பார்க்கும் — இதற்கிடையில் எந்தக் கேள்வியையும் டைப் "
+               "செய்யுங்கள், உடனே உதவுகிறேன்."),
+        "hi": ("📎 धन्यवाद! संपर्क मिल गया। हमारी टीम जल्द ही देखेगी — इस "
+               "बीच कोई भी सवाल टाइप करें, मैं तुरंत मदद करूँगा।"),
+    },
+    "optout_failed": {
+        "en": ("Sorry — I couldn't record that just now. Please send STOP "
+               "once more, or reply and our team will handle it."),
+        "ta": ("மன்னிக்கவும் — அதைப் பதிவு செய்ய முடியவில்லை. STOP என்று "
+               "மீண்டும் ஒருமுறை அனுப்பவும், அல்லது பதிலளியுங்கள், எங்கள் "
+               "குழு கவனிக்கும்."),
+        "hi": ("क्षमा करें — यह अभी दर्ज नहीं हो सका। कृपया एक बार फिर STOP "
+               "भेजें, या जवाब दें, हमारी टीम संभाल लेगी।"),
+    },
+    "ai_unavailable": {
+        "en": ("Sorry, our AI is temporarily unavailable. We'll get back to "
+               "you shortly!"),
+        "ta": ("மன்னிக்கவும், எங்கள் AI தற்காலிகமாக கிடைக்கவில்லை. விரைவில் "
+               "உங்களைத் தொடர்பு கொள்கிறோம்!"),
+        "hi": ("क्षमा करें, हमारा AI अभी उपलब्ध नहीं है। हम जल्द ही आपसे "
+               "संपर्क करेंगे!"),
     },
 }
 
@@ -5216,7 +5647,13 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
     # v14g3 BUG 15: also fold the detected LANGUAGE into the cache key, so a
     # reply produced for one language can't be served to a user who wrote the
     # same normalised text intending a different language.
-    cacheable = (memory == "")
+    # v16g6 FIX R6-H1: (prompt-hash, normalised text) alone let ANY two
+    # patients at one clinic who typed the same words share one reply for the
+    # full RESPONSE_CACHE_TTL — and the likeliest collisions ("how much?",
+    # "yes", "ok", "tomorrow") are precisely the context-dependent ones.
+    # Patient A's implant quote answers Patient B's cleaning question. Cache
+    # only genuine first turns: no RAG memory AND no conversation history.
+    cacheable = (memory == "" and not history)
     cache_msg = detect_language(user_text) + "|" + user_text
     if cacheable:
         cached = resp_cache_get(_cache_hour_seed(base), cache_msg)
@@ -5302,7 +5739,13 @@ class CRMContactValidator(BaseModel):
         phone = re.sub(r"[^\d+]", "", str(v))
         if len(phone) < 7:
             raise ValueError("Phone number too short")
-        return phone
+        # v16g6 FIX R6-H4: Meta always delivers E.164; this API kept whatever
+        # the admin typed. A bare 10-digit entry minted a DIFFERENT phone_hash
+        # than the same patient's webhook row — two CRM rows, split booking
+        # history, double follow-ups, and erasure reaching only one of them.
+        # Canonicalise through the SAME function the webhook path uses.
+        norm = _normalize_msisdn(phone)
+        return norm or phone
 
 
 class AdminLoginValidator(BaseModel):
@@ -5335,6 +5778,87 @@ def _iso_in(seconds: float) -> str:
     stays correct on both Postgres and SQLite."""
     return _iso_utc(datetime.now(timezone.utc)
                     + timedelta(seconds=seconds))   # v16g4 FIX L17
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 🔕  v16g5 FIX R5-H4 — DURABLE OPT-OUT SUPPRESSION
+#   Before this, a "STOP" flipped is_consented on whatever crm_contacts rows
+#   _find_subject_rows happened to match — and nothing else. It did NOT mute
+#   the AI, it did NOT stop appointment reminders (the reminder scanner reads
+#   `bookings` and never looks at consent at all), and when the subject had no
+#   matching CRM row — the common case for a BSUID patient whose row is keyed
+#   on a hash of the BSUID — it wrote NOTHING while still replying "you've
+#   been unsubscribed". Under DPDP that is telling a person you stopped and
+#   then continuing to message them.
+#   The suppression is stored in its own table, keyed by the same subject hash
+#   the rest of the engine uses, and is consulted by every outbound initiator.
+# ─────────────────────────────────────────────────────────────────────────────
+def opt_out_subject(customer_id: str, subject: str) -> bool:
+    """Record a durable opt-out. Returns True only when the row landed."""
+    try:
+        with _db_pool.get() as conn:
+            _execute(conn,
+                "INSERT INTO opt_outs (customer_id, subject_hash, created_at) "
+                "VALUES (?,?,?)",
+                (customer_id, _crm_phone_hash(customer_id, subject), _now()))
+        brain_cache.set(f"optout:{customer_id}:{subject}", "1", ttl=86400)
+        return True
+    except Exception as exc:
+        if _is_unique_violation(exc):        # already opted out — still success
+            brain_cache.set(f"optout:{customer_id}:{subject}", "1", ttl=86400)
+            return True
+        log.error(f"❌ opt-out NOT recorded (cust={customer_id}): {exc}")
+        analytics.inc("optout.write_failed")
+        return False
+
+
+def is_opted_out_checked(customer_id: str, subject: str) -> Tuple[bool, bool]:
+    """v16g6 FIX R6-H9: returns (suppressed, known). Failing CLOSED is right
+    for the SEND decision and catastrophic for a CONSUME decision — a caller
+    that marks one-shot work done on the strength of a DB blip loses that
+    work forever. Callers that consume leads must see the difference between
+    'this subject is suppressed' and 'I could not find out'."""
+    if not subject:
+        return False, True
+    ck = f"optout:{customer_id}:{subject}"
+    cached = brain_cache.get(ck)
+    if cached is not None:
+        return (bool(cached) and cached != "0"), True
+    try:
+        with _db_pool.get(read_only=True) as conn:
+            cur = _execute(conn,
+                "SELECT 1 FROM opt_outs WHERE customer_id=? AND subject_hash=? LIMIT 1",
+                (customer_id, _crm_phone_hash(customer_id, subject)))
+            hit = cur.fetchone() is not None
+        brain_cache.set(ck, "1" if hit else "0", ttl=3600)
+        return hit, True
+    except Exception as exc:
+        log.warning(f"⚠️  opt-out lookup failed (cust={customer_id}): {exc}")
+        return True, False               # fail closed, and SAY it's a guess
+
+
+def is_opted_out(customer_id: str, subject: str) -> bool:
+    """True = never initiate an outbound to this subject again. Fails CLOSED
+    on a cache miss + DB error: silence is the safe direction for consent.
+    v16g6 FIX R6-H9: now a thin wrapper — consuming callers use
+    is_opted_out_checked to tell suppression from lookup failure."""
+    return is_opted_out_checked(customer_id, subject)[0]
+
+
+def _wa_touch_window(customer_id: str, subject: str) -> None:
+    """v16g5 FIX R5-H1 support: remember that this subject messaged US, which
+    is what opens WhatsApp's 24-hour customer-service window for free text."""
+    try:
+        brain_cache.set(f"wawin:{customer_id}:{subject}", "1", ttl=24 * 3600)
+    except Exception:
+        pass
+
+
+def _wa_in_service_window(customer_id: str, subject: str) -> bool:
+    try:
+        return bool(brain_cache.get(f"wawin:{customer_id}:{subject}"))
+    except Exception:
+        return False
 
 
 def _is_unique_violation(exc: Exception) -> bool:
@@ -5373,8 +5897,24 @@ def _execute(conn, sql: str, params: tuple = ()) -> Any:
         # % is escaped to %% FIRST (psycopg2 renders %% as a literal %), THEN
         # ? becomes %s — the whole bug class is gone, so the guard scream is
         # retired. House rule stands: parameters use ?, never raw %s.
+        # v16g5 FIX R5-M7: HF1 fixed the `%` half of the C4 landmine and
+        # RETIRED the guard — but `?`→`%s` is still a blind whole-string
+        # replace, so a `?` inside a string literal or an identifier now
+        # corrupts silently with nothing watching. Re-arm the scream for the
+        # half that is still blind: count the `?` we are about to translate
+        # and refuse to execute when it doesn't match the parameter count.
+        # Count on the ORIGINAL sql: after %-escaping, a pattern like
+        # LIKE '%stat%' would alias into a false "%s" hit.
+        _holes = sql.count("?")
+        _translated = sql.replace("%", "%%").replace("?", "%s")
+        if _holes != len(params or ()):
+            raise ValueError(
+                f"SQL placeholder mismatch: {_holes} '?' translated but "
+                f"{len(params or ())} parameter(s) supplied. A literal '?' "
+                f"inside a string/identifier corrupts the ?→%s translation "
+                f"(v16g5 FIX R5-M7). Offending SQL: {sql[:200]}")
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute(sql.replace("%", "%%").replace("?", "%s"), params)
+        cur.execute(_translated, params)
         if cur.description is None:
             # v16g4 FIX L15: INSERT/UPDATE/DDL produce no result set, yet the
             # cursor was returned open and lived until GC — loop-heavy paths
@@ -5401,6 +5941,9 @@ def _db_true():
 # ─────────────────────────────────────────────────────────────────────────────
 # 📋  SOC 2 AUDIT TRAIL  (v8 FIX #6)
 # ─────────────────────────────────────────────────────────────────────────────
+_AUDIT_DETAIL_MAX = 4000     # v16g5 FIX R5-L8
+
+
 def audit(actor_id: str, action: str, resource: str,
           detail: Optional[Dict] = None, ip: Optional[str] = None) -> None:
     """Write an immutable audit record — async so it never blocks the request path.
@@ -5411,7 +5954,15 @@ def audit(actor_id: str, action: str, resource: str,
 
     def _write():
         try:
+            # v16g5 FIX R5-L8: detail was json.dumps'd with NO size cap, so a
+            # caller passing a large dict wrote an unbounded row into the one
+            # table that must stay cheap to query.
             detail_str = json.dumps(detail or {})
+            if len(detail_str) > _AUDIT_DETAIL_MAX:
+                detail_str = json.dumps({
+                    "_truncated": True,
+                    "_original_bytes": len(detail_str),
+                    "_head": detail_str[:_AUDIT_DETAIL_MAX]})
             with _db_pool.get() as conn:
                 _execute(conn,
                     "INSERT INTO audit_log (ts, actor_id, action, resource, detail, ip, region) "
@@ -5420,7 +5971,16 @@ def audit(actor_id: str, action: str, resource: str,
         except Exception as exc:
             log.warning(f"⚠️  Audit write failed: {exc}")
 
-    submit_bg(_write)   # v11 #11: bounded pool
+    # v16g6 FIX R6-M11: compliance writes went through the SAME
+    # shed-on-saturation queue as analytics — under load the audit trail was
+    # preferentially the first thing dropped (counted in bg.shed,
+    # indistinguishable from a dropped metric). Admin actions are rare:
+    # write synchronously; the bounded pool remains only as the fallback so
+    # a slow DB cannot stall a webhook path that audits.
+    try:
+        _write()
+    except Exception:
+        submit_bg(_write)   # v11 #11: bounded pool
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5437,12 +5997,25 @@ def outbox_publish(event_type: str, payload: Dict) -> bool:
     so one DB hiccup during a tick lost messages forever AND recorded them sent.
     """
     try:
+        # v16g6 FIX R6-C3: the outbox was the ONE store keeping patient
+        # numbers in cleartext (crm_contacts and bookings both AES-GCM their
+        # PII). Seal `to` at rest; the drain unseals just-in-time. encrypt()
+        # is a no-op when the vault is disabled, so dev behaviour is
+        # unchanged and no schema migration is needed.
+        if payload.get("to"):
+            payload = dict(payload, to=pii_vault.encrypt(str(payload["to"])))
         payload_str = json.dumps(payload)
         with _db_pool.get() as conn:
             _execute(conn,
                 "INSERT INTO outbox (event_type, payload, status, created_at) VALUES (?,?,?,?)",
                 (event_type, payload_str, "pending", _now()))
-        submit_bg(_process_outbox)   # v12 #18: drain now, don't wait for the tick
+        # v16g6 FIX R6-L7: EVERY publish kicked its own drain — a burst of N
+        # publishes produced N overlapping claim sweeps fighting over the
+        # same rows (row-atomic, so pure wasted DB churn). One kick per 1s
+        # window; the drain claims in batches of 20 and the janitor tick is
+        # the backstop for anything landing inside the window.
+        if brain_cache.setnx("outbox:kick", ttl=1):
+            submit_bg(_process_outbox)   # v12 #18: drain now, not next tick
         return True
     except Exception as exc:
         log.error(f"❌ Outbox publish failed: {exc}")
@@ -5519,6 +6092,12 @@ def _process_outbox() -> None:
             # moment the engine ran on Postgres. SQLite (TEXT column) hid this.
             payload = payload_raw if isinstance(payload_raw, dict) \
                       else json.loads(payload_raw)
+            # v16g6 FIX R6-C3: unseal the recipient written by outbox_publish.
+            # Rows from pre-GEN-6 builds are untagged cleartext and pass
+            # through decrypt() unchanged (the R5-C4 tag contract).
+            _to0 = payload.get("to")
+            if isinstance(_to0, str) and _to0.startswith("v1:"):
+                payload["to"] = pii_vault.decrypt(_to0)
             if event_type == "whatsapp.send":
                 # v14g3 BUG 9: route outbox sends through THIS clinic's OWN creds
                 # (was always the GLOBAL number, so a multi-tenant welcome went
@@ -5541,14 +6120,16 @@ def _process_outbox() -> None:
                     # it fell straight through to status='done', recording a
                     # never-sent welcome/reminder as delivered forever.
                     if isinstance(res, dict) and res.get("error"):
-                        raise RuntimeError(f"send not sent: {res.get('error')}")
+                        raise RuntimeError(
+                            f"permanent: send not sent: {res.get('error')}")
                 except WhatsAppAuthError as _ae:
                     _flag_channel_reauth(cust, f"outbox code={_ae.code}")
                     # v15g2 FIX M1: the message was NOT delivered — falling through
                     # to status='done' recorded a dead-token send as delivered
                     # forever (invisible in failed-row queries, never resent after
                     # the token is re-attached). Surface it as a permanent failure.
-                    raise RuntimeError(f"auth_dead: wa token code={_ae.code}")
+                    raise RuntimeError(
+                        f"permanent: auth_dead: wa token code={_ae.code}")
             elif event_type == "whatsapp.template":
                 # v14g4: scheduled sends (reminders / follow-ups) use an approved
                 # template so they deliver OUTSIDE the 24-hour window. Same per-
@@ -5566,10 +6147,12 @@ def _process_outbox() -> None:
                         payload.get("lang", "en"), payload.get("body_param", ""),
                         pid, tok)
                     if isinstance(res, dict) and res.get("error"):
-                        raise RuntimeError(f"template not sent: {res.get('error')}")
+                        raise RuntimeError(
+                            f"permanent: template not sent: {res.get('error')}")
                 except WhatsAppAuthError as _ae:
                     _flag_channel_reauth(cust, f"outbox tmpl code={_ae.code}")
-                    raise RuntimeError(f"auth_dead: wa token code={_ae.code}")  # v15g2 FIX M1
+                    raise RuntimeError(                            # v15g2 FIX M1
+                        f"permanent: auth_dead: wa token code={_ae.code}")
             # Add more event types here as the system grows.
             with _db_pool.get() as conn:
                 _execute(conn,
@@ -5597,11 +6180,17 @@ def _process_outbox() -> None:
                 log.info(f"⏸️  Outbox event {evt_id} deferred — WhatsApp breaker open "
                          f"(attempt budget preserved).")
                 continue
-            _permanent = any(m in _emsg for m in (
-                "not_configured", "not configured", "not sent:", "does not exist",
+            # v16g6 FIX R6-M5: failures WE originate are tagged explicitly at
+            # the raise site ("permanent: …") — a transient Meta 5xx whose
+            # body happened to contain "not sent:" was dead-lettered on
+            # attempt 1 by pure substring luck. Meta-body markers stay ONLY
+            # as a fallback for errors we don't originate. (Same driver-
+            # signals-over-sniffing discipline M11 applied to unique
+            # violations.)
+            _permanent = _emsg.startswith("permanent:") or any(m in _emsg for m in (
+                "not_configured", "not configured", "does not exist",
                 "unknown template", "invalid template", "template not found",
-                "recipient not", "132001", "131026",
-                "auth_dead"))   # v15g2 FIX M1: dead token = permanent, visible failure
+                "recipient not", "132001", "131026"))
             new_status = "failed" if (_permanent or attempts >= 4) else "pending"
             # v15g3 FIX 1 (HIGH): the old path retried a transient failure on the
             # very NEXT janitor tick (20s default — and instantly on every
@@ -5671,20 +6260,51 @@ def save_customer_brain(customer_id: str, customer_name: str,
                 instagram_id   = excluded.instagram_id,
                 bot_name       = excluded.bot_name
         """
+    # v16g6 FIX R6-M2: every PATIENT number is AES-GCM'd; the clinic owner's
+    # personal mobile — the emergency-escalation target — sat plaintext in
+    # Postgres AND in the Redis brain cache. Seal it at rest; callers get it
+    # back through _brain_unseal in the fetchers. Legacy plaintext rows pass
+    # through decrypt() unchanged (tag contract) — no migration required.
     with _db_pool.get() as conn:
         _execute(conn, sql, (customer_id, customer_name, business_type,
                              system_prompt, now, now, whatsapp_phone, cfg.REGION,
-                             owner_phone, instagram_id, bot_name))
-    brain_cache.delete(customer_id)
+                             pii_vault.encrypt(owner_phone or ""),
+                             instagram_id, bot_name))
+    brain_cache.delete(f"brain:{customer_id}")    # v16g6 FIX R6-L6
+    try:
+        # v16g6 FIX R6-L15: a clinic that edits its prompt kept the OLD
+        # per-prompt Gemini client cached until LRU aging evicted it — 64
+        # full system prompts held strongly on a 512MB dyno. Brain updates
+        # are rare; clearing the factory outright is cheap and exact.
+        _gemini_model.cache_clear()
+    except Exception:
+        pass
     analytics.inc("customer.saved")
     log.info(f"💾 Brain saved → {customer_id}")
 
 
+def _brain_unseal(b: Dict) -> Dict:
+    """v16g6 FIX R6-M2: caller-facing COPY with owner_phone decrypted. The
+    cache keeps the sealed form (Redis included); legacy plaintext passes
+    through decrypt() unchanged; unreadable ciphertext degrades to '' (no
+    alert target) rather than leaking garbage into a send."""
+    if not b:
+        return b
+    out = dict(b)
+    out["owner_phone"] = pii_vault.decrypt(out.get("owner_phone") or "")
+    if out["owner_phone"] == "[ENCRYPTED]":
+        out["owner_phone"] = ""
+    return out
+
+
 def get_customer_brain(customer_id: str) -> Optional[Dict]:
-    cached = brain_cache.get(customer_id)
+    cached = brain_cache.get(f"brain:{customer_id}")   # v16g6 FIX R6-L6:
+    # every other key in the file is namespaced (wapid:, igid:, ghost:,
+    # resp:, optout:, wawin:) — the bare id meant delete_prefix could never
+    # target brains, and any same-string key would collide.
     if cached:
         analytics.inc("cache.hit")
-        return cached
+        return _brain_unseal(cached)              # v16g6 FIX R6-M2
     analytics.inc("cache.miss")
     with _db_pool.get(read_only=True) as conn:
         cur = _execute(conn,
@@ -5693,8 +6313,8 @@ def get_customer_brain(customer_id: str) -> Optional[Dict]:
         row = cur.fetchone()
     if row:
         data = dict(row)
-        brain_cache.set(customer_id, data)
-        return data
+        brain_cache.set(f"brain:{customer_id}", data)   # sealed form · R6-L6
+        return _brain_unseal(data)                # v16g6 FIX R6-M2
     return None
 
 
@@ -5710,7 +6330,7 @@ def get_brain_by_wa_phone_id(phone_number_id: str) -> Optional[Dict]:
     ckey   = f"wapid:{phone_number_id}"
     cached = brain_cache.get(ckey)
     if cached:
-        return cached if cached != "__none__" else None
+        return _brain_unseal(cached) if cached != "__none__" else None   # R6-M2
     try:
         with _db_pool.get(read_only=True) as conn:
             if not _column_exists(conn, "customer_brains", "wa_phone_number_id"):
@@ -5723,7 +6343,7 @@ def get_brain_by_wa_phone_id(phone_number_id: str) -> Optional[Dict]:
         if row:
             data = dict(row)
             brain_cache.set(ckey, data, ttl=cfg.ROUTE_CACHE_TTL)
-            return data
+            return _brain_unseal(data)               # v16g6 FIX R6-M2
         brain_cache.set(ckey, "__none__", ttl=60)   # cache the miss briefly
     except Exception as exc:
         log.warning(f"⚠️  wa_phone_id route lookup failed: {exc}")
@@ -5738,7 +6358,7 @@ def get_brain_by_ig_id(ig_account_id: str) -> Optional[Dict]:
     ckey   = f"igid:{ig_account_id}"
     cached = brain_cache.get(ckey)
     if cached:
-        return cached if cached != "__none__" else None
+        return _brain_unseal(cached) if cached != "__none__" else None   # R6-M2
     try:
         with _db_pool.get(read_only=True) as conn:
             cur = _execute(conn,
@@ -5749,7 +6369,7 @@ def get_brain_by_ig_id(ig_account_id: str) -> Optional[Dict]:
         if row:
             data = dict(row)
             brain_cache.set(ckey, data, ttl=cfg.ROUTE_CACHE_TTL)
-            return data
+            return _brain_unseal(data)               # v16g6 FIX R6-M2
         brain_cache.set(ckey, "__none__", ttl=60)
     except Exception as exc:
         log.warning(f"⚠️  ig_id route lookup failed: {exc}")
@@ -5759,7 +6379,10 @@ def get_brain_by_ig_id(ig_account_id: str) -> Optional[Dict]:
 def brain_wa_creds(brain: Dict) -> Tuple[str, str]:
     """v13: THIS clinic's own (phone_id, token). Falls back to the GLOBAL env
     creds so your FIRST clinic and any pre-v13 setup keep working with zero extra
-    config. Returns ('','') only if neither per-clinic nor global creds exist."""
+    config. v16g6 FIX R6-C6: a clinic that OWNS a phone_id but has no usable
+    token gets ('','') — send disabled, reauth flagged — never the global
+    pair. The global fallback is reserved for brains with no
+    wa_phone_number_id at all."""
     pid_own = (brain.get("wa_phone_number_id") or "").strip()
     enc = (brain.get("wa_token_enc") or "").strip()
     tok_own = (pii_vault.decrypt(enc) if enc else "")
@@ -5775,10 +6398,23 @@ def brain_wa_creds(brain: Dict) -> Tuple[str, str]:
     # cross-WABA pair that Meta always 401/403s, which then false-flagged
     # needs_reauth on what was a CONFIG problem, not a dead token.
     if pid_own and not tok_own:
-        log.warning(f"⚠️  clinic {brain.get('customer_id','?')} has its own "
-                    f"phone_id but NO usable token — falling back to the "
-                    f"GLOBAL credential pair (v16g4 FIX H7). Re-attach the "
-                    f"token via /admin/customer/<id>/channel.")
+        # v16g6 FIX R6-C6: routing REACHED this brain via its own
+        # wa_phone_number_id — the clinic provably owns the line the patient
+        # wrote to. H7's global-pair fallback here replied from a DIFFERENT
+        # WhatsApp business identity, so the answer never appears in the
+        # thread the patient used (your number, or Clinic A's, answers
+        # Clinic B's patient). The safe failure is NO send + a loud reauth
+        # flag — never someone else's number.
+        log.error(f"❌ clinic {brain.get('customer_id','?')} owns phone_id "
+                  f"{pid_own} but has NO usable token — sends DISABLED for "
+                  f"this clinic until the token is re-attached via "
+                  f"/admin/customer/<id>/channel (v16g6 FIX R6-C6).")
+        try:
+            _flag_channel_reauth(brain.get("customer_id", ""),
+                                 "wa token unreadable/missing")
+        except Exception:
+            pass
+        return "", ""
     elif tok_own and not pid_own:
         log.warning(f"⚠️  clinic {brain.get('customer_id','?')} has a token "
                     f"but NO phone_id — falling back to the GLOBAL pair "
@@ -5859,7 +6495,18 @@ def save_messages_batch(session_id: str, turns: List[Tuple[str, str, str, int]])
             for role, content, provider, latency in turns]
     with _db_pool.get() as conn:
         if is_pg:
-            conn.cursor().executemany(sql, rows)
+            # v16g6 FIX R6-M12: the inline cursor was never closed — one
+            # leaked cursor per saved chat turn, the exact pattern R5-L4
+            # hunted down in init_db; it survived because executemany
+            # bypasses _execute, where the closing lives. R6-M13: the
+            # hand-built %s SQL above bypasses the placeholder guard for the
+            # same reason — it stays (executemany has no _execute path) but
+            # is now confined to this one audited, commented site.
+            _mcur = conn.cursor()
+            try:
+                _mcur.executemany(sql, rows)
+            finally:
+                _mcur.close()
         else:
             conn.executemany(sql, rows)
         # v16g2 FIX N5: one dialect-neutral UPDATE through _execute — the old
@@ -5979,10 +6626,21 @@ def _crm_phone_hash(customer_id: str, phone: str) -> str:
     wrong bookings, wrong erasure. Meta's docs are explicit that a BSUID must
     be used exactly as-is."""
     p = (phone or "").strip()
-    if _is_bsuid(p):                                   # v16 U2
+    if _is_bsuid(p) or p.startswith("ig_"):
+        # v16 U2 + v16g6 FIX R6-H5: an Instagram pseudo-address ("ig_<id>")
+        # must hash as the FULL exact string, exactly like a BSUID. The
+        # digits-only branch stripped the channel prefix, so the identity key
+        # lost the channel disambiguator — and an IG scoped-ID whose last-12
+        # digit tail matched a patient's phone number silently MERGED with
+        # that patient's CRM row.
         norm = p
     else:
-        norm = re.sub(r"\D", "", p)[-12:]   # digits only, country-code tolerant
+        # v16g6 FIX R6-H4: canonicalise HERE so no caller can bypass it —
+        # the last-12 rule then always sees the same country-coded spelling
+        # the webhook writes. (Legacy rows hashed from a bare national
+        # number converge onto the E.164 identity — the dedupe direction
+        # this fix exists to force.)
+        norm = re.sub(r"\D", "", _normalize_msisdn(p) or p)[-12:]
     return hashlib.sha256(f"{customer_id}|{norm}".encode()).hexdigest()[:40]
 
 
@@ -6089,6 +6747,7 @@ def crm_add_contact(customer_id: str, name: str, phone: str,
             insert_sql = cols + " RETURNING id"
         else:
             insert_sql = cols
+        _race_lost = False
         try:
             cur = _execute(conn, insert_sql, vals)
             if is_pg:
@@ -6098,21 +6757,28 @@ def crm_add_contact(customer_id: str, name: str, phone: str,
                 new_id = cur.lastrowid if hasattr(cur, "lastrowid") else None
         except Exception:
             # v14g3 BUG 10: lost the insert race against the unique dedupe index
-            # (uq_crm_dedupe — another worker just created this same lead). Fetch
-            # the existing row's id from a FRESH connection (the current PG txn may
-            # be aborted) and return it instead of erroring or duplicating.
+            # (uq_crm_dedupe — another worker just created this same lead).
+            # v16g6 FIX R6-M4: the recovery lookup used to open a SECOND
+            # pooled connection while STILL HOLDING the first — the only
+            # nested _db_pool.get() in the file. Ten concurrent threads in
+            # this branch deadlocked a pool_size=10 SQLite pool into
+            # "SQLite pool exhausted" after the 5s timeout. Release the
+            # insert connection first; recover on a fresh one below.
             new_id = None
-            try:
-                with _db_pool.get(read_only=True) as conn2:
-                    c2 = _execute(conn2,
-                        "SELECT id FROM crm_contacts WHERE customer_id=? AND phone_hash=?",
-                        (customer_id, phash))
-                    r2 = c2.fetchone()
-                    new_id = r2["id"] if r2 else None
-            except Exception:
-                new_id = None
-            analytics.inc("crm.contact.race_merged")
-            return new_id or 0
+            _race_lost = True
+
+    if _race_lost:
+        try:
+            with _db_pool.get(read_only=True) as conn2:
+                c2 = _execute(conn2,
+                    "SELECT id FROM crm_contacts WHERE customer_id=? AND phone_hash=?",
+                    (customer_id, phash))
+                r2 = c2.fetchone()
+                new_id = r2["id"] if r2 else None
+        except Exception:
+            new_id = None
+        analytics.inc("crm.contact.race_merged")
+        return new_id or 0
 
     analytics.inc("crm.contact.added")
     log.info(f"📋 CRM contact → customer={customer_id} phone={pii_vault.mask(phone)}")
@@ -6155,11 +6821,48 @@ def crm_attach_phone(customer_id: str, chat_id: str, real_phone: str) -> bool:
             old_hash = _crm_phone_hash(customer_id, digits)
             if ok and old_hash != phash:
                 cur = _execute(conn,
-                    "SELECT id, is_consented FROM crm_contacts "
+                    "SELECT id, is_consented, enc_notes, enc_email, "
+                    "contact_stage, created_at FROM crm_contacts "
                     "WHERE customer_id=? AND phone_hash=?",
                     (customer_id, old_hash))
                 _dup = cur.fetchone()
                 if _dup:
+                    # v16g6 FIX R6-M3: the merge kept ONLY is_consented — the
+                    # retired row's notes, email, stage and original
+                    # created_at were destroyed with it. Fold them into the
+                    # survivor (fill-if-empty; notes concatenate; earliest
+                    # created_at wins) BEFORE the delete, same transaction.
+                    _sv = _execute(conn,
+                        "SELECT id, enc_notes, enc_email, contact_stage, "
+                        "created_at FROM crm_contacts "
+                        "WHERE customer_id=? AND phone_hash=?",
+                        (customer_id, phash)).fetchone()
+                    if _sv:
+                        def _dec(v):
+                            _x = pii_vault.decrypt(v or "")
+                            return "" if _x == "[ENCRYPTED]" else _x
+                        _sets, _vals = [], []
+                        _dn, _sn = _dec(_dup["enc_notes"]), _dec(_sv["enc_notes"])
+                        if _dn and _dn not in _sn:
+                            _sets.append("enc_notes=?")
+                            _vals.append(pii_vault.encrypt(
+                                (_sn + "\n" + _dn).strip() if _sn else _dn))
+                        if _dec(_dup["enc_email"]) and not _dec(_sv["enc_email"]):
+                            _sets.append("enc_email=?")
+                            _vals.append(_dup["enc_email"])
+                        if ((_dup["contact_stage"] or "") not in ("", "lead")
+                                and (_sv["contact_stage"] or "lead") == "lead"):
+                            _sets.append("contact_stage=?")
+                            _vals.append(_dup["contact_stage"])
+                        if ((_dup["created_at"] or "") and
+                                str(_dup["created_at"]) < str(_sv["created_at"] or "9999")):
+                            _sets.append("created_at=?")
+                            _vals.append(_dup["created_at"])
+                        if _sets:
+                            _vals.append(_sv["id"])
+                            _execute(conn,
+                                f"UPDATE crm_contacts SET {', '.join(_sets)} "
+                                f"WHERE id=?", tuple(_vals))
                     if _dup["is_consented"]:
                         _execute(conn,
                             "UPDATE crm_contacts SET is_consented=? "
@@ -6167,10 +6870,12 @@ def crm_attach_phone(customer_id: str, chat_id: str, real_phone: str) -> bool:
                             (_db_true(), customer_id, phash))
                     _execute(conn, "DELETE FROM crm_contacts WHERE id=?",
                              (_dup["id"],))
+                    # v16g6 FIX R6-M3: re-key EVERY booking — the old
+                    # status='booked' filter orphaned cancelled/completed
+                    # history from the surviving identity (and from erasure).
                     _execute(conn,
                         "UPDATE bookings SET phone_hash=? "
-                        "WHERE customer_id=? AND phone_hash=? "
-                        "AND status='booked'",
+                        "WHERE customer_id=? AND phone_hash=?",
                         (phash, customer_id, old_hash))
                     _execute(conn,
                         "UPDATE chat_sessions SET subject_hash=? "
@@ -6456,7 +7161,32 @@ def booking_available_slots(customer_id: str, limit: int) -> List[Tuple[datetime
     step    = max(5, cfg.BOOKING_SLOT_MINUTES)
     open_m  = cfg.BOOKING_OPEN_HOUR * 60
     close_m = cfg.BOOKING_CLOSE_HOUR * 60
-    wkdays  = {int(x) for x in cfg.BOOKING_WEEKDAYS.split(",") if x.strip().isdigit()}
+    wkdays  = {int(x) for x in cfg.BOOKING_WEEKDAYS.split(",")
+               if x.strip().isdigit() and 0 <= int(x.strip()) <= 6}
+    # v16g5 FIX R5-M5: a typo'd BOOKING_WEEKDAYS ("Mon,Tue") produced an EMPTY
+    # weekday set and this function returned [] forever — the patient just saw
+    # "no slots available", with nothing anywhere saying why. Same for an
+    # inverted OPEN/CLOSE hour. Fail LOUD (hourly-throttled) instead of dark.
+    # v16g6 FIX R6-L5: BOOKING_CLOSE_HOUR=25 sailed past this guard and blew
+    # up later at d_loc.replace(hour=…) — an uncaught ValueError out of the
+    # offer builder, straight into handle_booking. Clamp to the calendar
+    # first; the loud guard below still catches a nonsensical clamped range.
+    open_m  = min(max(open_m, 0), 24 * 60)
+    close_m = min(max(close_m, 0), 24 * 60)
+    if not wkdays or open_m + step > close_m:
+        if brain_cache.setnx("warn:booking_cfg", ttl=3600):
+            log.critical(
+                f"🛑 BOOKING MISCONFIGURED — no slot can ever be offered. "
+                f"BOOKING_WEEKDAYS={cfg.BOOKING_WEEKDAYS!r} parsed to {sorted(wkdays)} "
+                f"(expects digits 0-6, Mon=0), OPEN_HOUR={cfg.BOOKING_OPEN_HOUR} "
+                f"CLOSE_HOUR={cfg.BOOKING_CLOSE_HOUR} SLOT_MINUTES={step}.")
+        analytics.inc("booking.misconfigured")
+        return []
+    # v16g6 R6-L13 (documented limitation): a FIXED minute offset is correct
+    # for IST (+330, no DST — the launch market) and WRONG for any DST
+    # region: this naive wall-clock drifts ±60min across transitions.
+    # Before selling outside fixed-offset zones, replace
+    # BOOKING_TZ_OFFSET_MIN with a per-clinic IANA zone via zoneinfo.
     off     = timedelta(minutes=cfg.BOOKING_TZ_OFFSET_MIN)
     now_utc = datetime.now(timezone.utc)
     now_loc = (now_utc + off).replace(tzinfo=None)        # naive local wall-clock
@@ -6469,13 +7199,29 @@ def booking_available_slots(customer_id: str, limit: int) -> List[Tuple[datetime
             # row to the end of time (a clinic with months of forward bookings
             # paid for all of them on every offer).
             _horizon = (now_utc + timedelta(days=cfg.BOOKING_DAYS_AHEAD + 1)).isoformat()
+            # v16g5 FIX R5-H3: widen the lower bound by one slot length so a
+            # booking that STARTED before `now` but still RUNS INTO the
+            # offerable window is seen by the overlap test.
+            _floor = (now_utc - timedelta(minutes=step * 4)).isoformat()
             cur = _execute(conn,
-                "SELECT slot_start FROM bookings WHERE customer_id=? AND status='booked' "
-                "AND slot_start >= ? AND slot_start < ?",
-                (customer_id, now_utc.isoformat(), _horizon))
+                "SELECT slot_start, slot_end FROM bookings WHERE customer_id=? "
+                "AND status='booked' AND slot_start >= ? AND slot_start < ?",
+                (customer_id, _floor, _horizon))
             # v14g5 FIX 38: key booked slots by canonical epoch-second, not raw ISO
             # string, so dedupe survives any future formatting drift (Z vs +00:00).
-            booked = {int(_parse_dt(r["slot_start"]).timestamp()) for r in cur.fetchall()}
+            # v16g5 FIX R5-H3: carry the END of each booking too. Exact-start
+            # equality alone meant a booking that did not sit on the CURRENT
+            # grid blocked nothing: change BOOKING_SLOT_MINUTES 30→20 and the
+            # engine happily offered 14:00–14:20 while 14:00–14:30 was taken,
+            # and the unique index (on slot_start) could not catch the 14:20
+            # collision either. Two patients, one chair.
+            for r in cur.fetchall():
+                _bs = int(_parse_dt(r["slot_start"]).timestamp())
+                try:
+                    _be = int(_parse_dt(r["slot_end"]).timestamp())
+                except Exception:
+                    _be = _bs + step * 60
+                booked.add((_bs, max(_be, _bs + 1)))
     except Exception as exc:
         log.warning(f"⚠️  booking slot scan failed: {exc}")
 
@@ -6492,7 +7238,11 @@ def booking_available_slots(customer_id: str, limit: int) -> List[Tuple[datetime
             start_utc   = (local_naive - off).replace(tzinfo=timezone.utc)
             if start_utc <= now_utc + timedelta(minutes=60):
                 continue
-            if int(start_utc.timestamp()) in booked:   # v14g5 FIX 38
+            # v16g5 FIX R5-H3: true half-open interval overlap
+            # (a.start < b.end AND a.end > b.start), not start equality.
+            _cs = int(start_utc.timestamp())
+            _ce = _cs + step * 60
+            if any(_cs < _be and _ce > _bs for _bs, _be in booked):
                 continue
             out.append((start_utc, start_utc + timedelta(minutes=step)))
             if len(out) >= limit:
@@ -6512,6 +7262,24 @@ def booking_create(customer_id: str, phone: str, name: str,
     now   = _now()
     try:
         with _db_pool.get() as conn:
+            # v16g6 FIX R6-C4: R5-H3 fixed interval overlap in the OFFER
+            # builder only. uq_book_slot indexes slot_start EQUALITY, so after
+            # a BOOKING_SLOT_MINUTES change a 14:00–14:30 row cannot block a
+            # 14:20 insert — the exact scenario the R5-H3 comment names is
+            # still committable from a stale offer. Re-verify half-open
+            # overlap INSIDE the insert transaction (ISO-8601 UTC strings
+            # compare lexicographically = chronologically). The durable DB
+            # guarantee — tstzrange EXCLUDE USING gist — belongs to the next
+            # migration slot; this closes the stale-offer window portably on
+            # both engines today.
+            _c = _execute(conn,
+                "SELECT 1 FROM bookings WHERE customer_id=? AND "
+                "status='booked' AND slot_start < ? AND slot_end > ? LIMIT 1",
+                (customer_id, end_iso, start_iso))
+            if _c.fetchone():
+                analytics.inc("booking.slot_conflict")
+                log.info(f"📅 booking overlap conflict (cust={customer_id})")
+                return "conflict"
             _execute(conn,
                 "INSERT INTO bookings (customer_id, phone_hash, enc_phone, enc_name, "
                 "slot_start, slot_end, status, reminders_sent, source, created_at, updated_at) "
@@ -6617,9 +7385,21 @@ _CANCEL_NO = {_norm_text(x) for x in _CANCEL_NO_RAW}     # v16g4 FIX M4
 # v16g4 port (audit item 201): exact-match global marketing opt-out keywords.
 # Deliberately an EXACT-message match (not a substring check) so an ordinary
 # sentence containing the word "stop" is never mistaken for an unsubscribe.
-_OPT_OUT_KEYWORDS = {
+# v16g6 FIX R6-H8: English-only consent in a Tamil-first product is not a
+# defensible posture under DPDP — a patient typing நிறுத்து could not
+# unsubscribe while every other system string was localised in v16g4.
+# ta/hi + romanised forms, normalised through _norm_text (the same
+# discipline _CANCEL_NO_RAW already uses), plus the standard template
+# quick-reply payloads, which arrive as button taps.
+_OPT_OUT_RAW = (
     "stop", "unsubscribe", "stop all", "opt out", "optout",
-}
+    "stop promotions", "stop promotion",
+    "நிறுத்து", "நிறுத்துங்க", "நிறுத்துங்கள்",
+    "niruthu", "niruthunga", "stop pannu", "stop pannunga",
+    "message vendam", "msg vendam", "sms vendam",
+    "बंद करो", "रोको", "band karo", "bandh karo", "message band karo",
+)
+_OPT_OUT_KEYWORDS = {_norm_text(x) for x in _OPT_OUT_RAW}
 
 
 def detect_booking_intent(text: str) -> Optional[str]:
@@ -6667,11 +7447,27 @@ def _booking_owner_of_slot(customer_id: str, start_iso: str) -> Optional[Dict]:
     index reports it as a 'conflict', which used to loop 'just taken' forever)."""
     try:
         with _db_pool.get(read_only=True) as conn:
+            # v16g6 FIX R6-L12: exact-string equality on slot_start breaks
+            # the moment two writers format the same instant differently
+            # (+00:00 vs Z, microseconds present or not) — B10's
+            # self-conflict detection then misses and the patient loops on
+            # "just taken". Match the parsed INSTANT over the enclosing
+            # minute window instead.
+            _t0 = _parse_dt(start_iso)
             cur = _execute(conn,
-                "SELECT id, phone_hash FROM bookings "
-                "WHERE customer_id=? AND slot_start=? AND status='booked' LIMIT 1",
-                (customer_id, start_iso))
-            row = cur.fetchone()
+                "SELECT id, phone_hash, slot_start FROM bookings "
+                "WHERE customer_id=? AND status='booked' "
+                "AND slot_start >= ? AND slot_start < ? LIMIT 8",
+                (customer_id,
+                 (_t0 - timedelta(minutes=1)).isoformat(),
+                 (_t0 + timedelta(minutes=1)).isoformat()))
+            for _r in cur.fetchall():
+                try:
+                    if _parse_dt(_r["slot_start"]) == _t0:
+                        return {"id": _r["id"], "phone_hash": _r["phone_hash"]}
+                except Exception:
+                    continue
+            row = None
         return dict(row) if row else None
     except Exception as exc:
         log.warning(f"⚠️  _booking_owner_of_slot failed: {exc}")
@@ -6712,10 +7508,16 @@ def handle_booking(brain: Dict, from_phone: str, user_text: str,
     # typed). Any other reply keeps the appointment: the safe default.
     pending_cancel = brain_cache.get(cancel_key)
     if pending_cancel:
-        brain_cache.delete(cancel_key)
+        # v16g6 FIX R6-M14: the window was consumed at the TOP, so an
+        # unrelated reply ("fine", "done", a question) silently destroyed
+        # the pending confirmation — the patient's later YES did nothing,
+        # and the AI answered with no idea a cancellation was pending.
+        # Consume the window only on the branches that RESOLVE it; the
+        # unmatched fall-through keeps it armed for its remaining TTL.
         # v16g3 FIX R3-L7: taps arrive as 'Title [id]' now — match button
         # ids by substring so readable history and the state machine coexist.
         if "cancel:yes" in low or _norm_text(text) in _CANCEL_YES:
+            brain_cache.delete(cancel_key)
             try:
                 _pending_id = int(pending_cancel)
             except (TypeError, ValueError):
@@ -6735,6 +7537,7 @@ def handle_booking(brain: Dict, from_phone: str, user_text: str,
             # v16g3 FIX R3-M5: the explicit keep-tap is never re-read as a
             # fresh cancel intent. v16g4 FIX M4: typed "no"/"vendam"/"नहीं"
             # count as the explicit keep too.
+            brain_cache.delete(cancel_key)               # v16g6 FIX R6-M14
             action = ("text", _t("keep_unchanged", lang))
         elif _norm_text(text) in _CANCEL_ACK:
             # v16g4 FIX M3: "ok"/"சரி"/"ठीक है" is an acknowledgement, not a
@@ -6747,17 +7550,24 @@ def handle_booking(brain: Dict, from_phone: str, user_text: str,
             # patient had to repeat themselves. The appointment still stays
             # (safe default) — but the intent now falls through to the normal
             # flow below and gets SERVED.
+            brain_cache.delete(cancel_key)               # v16g6 FIX R6-M14
             action = None
         else:
             # v16g4 FIX M4 (last residue of the A3/B11 class): "wait, what
-            # time was it?" inside the confirm window was swallowed with
-            # "your appointment is unchanged" and the question never reached
-            # the AI. The appointment stays (window consumed = safe default),
-            # and the message now falls through to be actually ANSWERED.
+            # time was it?" inside the confirm window was swallowed and the
+            # question never reached the AI. v16g6 FIX R6-M14: the window now
+            # stays ARMED for its remaining TTL — the question gets answered
+            # below, and a follow-up YES/NO still lands on the pending
+            # cancellation instead of doing nothing.
             return False
         if action is not None:
+            # v16g5 FIX R5-M1: this was the only _booking_dispatch call site
+            # in the file that omitted lang=, so a Tamil/Hindi patient
+            # confirming a cancellation got the English "Reply *YES* / *NO*"
+            # fallback wording — an M8 gap hiding in the most destructive
+            # branch of the state machine.
             _booking_dispatch(action, from_phone, out_pid, out_tok, customer_id,
-                              session_id, user_text)
+                              session_id, user_text, lang=lang)
             return True
 
     # v16g3 FIX R3-M5: a "No, keep it" tap landing AFTER the 5-min confirm
@@ -6795,7 +7605,20 @@ def handle_booking(brain: Dict, from_phone: str, user_text: str,
             # FIX 12: abandoning a reschedule must NOT lose the original booking —
             # we never cancelled it, so it simply stands.
             kept = _t("kept_note", lang) if prev_id else ""
-            action = ("text", _t("stop_booking", lang, kept=kept))  # v16g4 FIX M8
+            # v16g6 FIX R6-M15: inside a booking flow "stop" deliberately
+            # means "abort this flow", NOT the global unsubscribe (the R6-H8
+            # gate excludes active flows for exactly that reason). The
+            # narrower meaning is defensible; saying nothing about it is not
+            # — the patient hears "okay, stopped" and reasonably believes
+            # they unsubscribed. Say so, and say how to actually do it.
+            _note = {"ta": "நீங்கள் unsubscribe ஆகவில்லை — செய்திகளை "
+                           "நிறுத்த 'STOP' என்று மட்டும் தனியாக அனுப்புங்கள்.",
+                     "hi": "आप अनसब्सक्राइब नहीं हुए हैं — संदेश बंद करने "
+                           "के लिए केवल 'STOP' भेजें।",
+                     }.get(lang, "You are still subscribed — to stop "
+                                 "receiving messages, send just 'STOP'.")
+            action = ("text", _t("stop_booking", lang, kept=kept)   # v16g4 FIX M8
+                              + "\n" + _note)
         else:
             pick, stale_tap = None, False
             m_tap = re.search(r"slot:(\d+)", low)
@@ -7015,15 +7838,39 @@ def _booking_dispatch(action: Tuple, from_phone: str, out_pid: str, out_tok: str
 #   via template automatically when one is configured.
 # ═════════════════════════════════════════════════════════════════════════════
 def _publish_reminder(customer_id: str, phone: str, when_text: str, full_msg: str) -> bool:
-    # v16g2 FIX M8: propagate the publish outcome so the caller only consumes
-    # the reminder lead when the outbox row actually exists.
+    """v16g5 FIX R5-H1: FIX H2's own reasoning — "a cold lead is BY DEFINITION
+    outside the 24h customer-service window, so the free-text fallback burned
+    5 outbox retries per lead per tick" — applies VERBATIM to a 24-hour
+    appointment reminder: a patient who booked yesterday and hasn't messaged
+    since is outside the window too. H2 guarded _publish_followup and left
+    this twin free-texting. With REMINDER_TEMPLATE unset (the default ""),
+    every 24h reminder burned its attempt budget and dead-lettered while
+    `scheduler.reminders_scanned` read perfectly healthy.
+
+    Free text is still permitted for a reminder falling INSIDE the window
+    (the 2-hour lead for a patient who chatted this morning) — that one
+    genuinely delivers — but only when we can see an open session."""
+    # v16g5: BSUID-aware, matching _publish_followup (was missing here).
+    phone = _resolve_send_addr(customer_id, phone)
     if cfg.REMINDER_TEMPLATE:
         return outbox_publish("whatsapp.template", {
             "to": phone, "customer_id": customer_id,
             "template": cfg.REMINDER_TEMPLATE, "lang": cfg.REMINDER_TEMPLATE_LANG,
             "body_param": when_text})
-    return outbox_publish("whatsapp.send",
-                          {"to": phone, "customer_id": customer_id, "message": full_msg})
+    # No template. Free text can only land if this patient messaged us inside
+    # the last 24h — _wa_touch_window records that on every inbound.
+    if _wa_in_service_window(customer_id, phone):
+        return outbox_publish("whatsapp.send",
+                              {"to": phone, "customer_id": customer_id,
+                               "message": full_msg})
+    if brain_cache.setnx("warn:reminder_no_template", ttl=3600):
+        log.warning("⚠️  reminder skipped — REMINDER_TEMPLATE is unset and the "
+                    "patient is outside WhatsApp's 24h service window, so a "
+                    "business-initiated free text CANNOT be delivered "
+                    "(v16g5 FIX R5-H1). Approve a reminder template in Meta "
+                    "Business Manager and set REMINDER_TEMPLATE.")
+    analytics.inc("scheduler.reminder_no_template")
+    return False
 
 
 def _publish_followup(customer_id: str, phone: str, full_msg: str) -> bool:
@@ -7040,10 +7887,16 @@ def _publish_followup(customer_id: str, phone: str, full_msg: str) -> bool:
         analytics.inc("scheduler.followup_no_template")
         return False
     # v16g2 FIX M8: propagate the publish outcome (see _publish_reminder).
+    # v16g6 FIX R6-C1: `full_msg` — the per-lead LOCALISED body the caller
+    # builds via _t("followup", …) — was discarded, so every cold-lead nudge
+    # sent the literal English string "follow-up" as {{1}}. All the ta/hi
+    # localisation on this path was dead code. Pass it through, capped to
+    # Meta's template-parameter budget. Compare _publish_reminder, which
+    # passes when_text — same shape, one branch was wired and one was not.
     return outbox_publish("whatsapp.template", {
         "to": phone, "customer_id": customer_id,
         "template": cfg.FOLLOWUP_TEMPLATE, "lang": cfg.FOLLOWUP_TEMPLATE_LANG,
-        "body_param": "follow-up"})
+        "body_param": (full_msg or "follow-up")[:640]})
 
 
 def _scheduler_send_reminders() -> None:
@@ -7064,6 +7917,19 @@ def _scheduler_send_reminders() -> None:
     except Exception as exc:
         log.warning(f"⚠️  reminder scan failed: {exc}")
         return
+    # v16g6 FIX R6-M17: memoise consent lookups for the tick — the loop
+    # consulted is_opted_out up to twice per due booking, each cold lookup a
+    # synchronous DB round-trip inside the single-leader tick; with a few
+    # hundred bookings in the horizon that is a query storm, and the storm
+    # is what made R6-H9 reachable in the first place.
+    _oo_memo: Dict[Tuple[str, str], Tuple[bool, bool]] = {}
+
+    def _oo(cust: str, addr: str) -> Tuple[bool, bool]:
+        _k = (cust, addr)
+        if _k not in _oo_memo:
+            _oo_memo[_k] = is_opted_out_checked(cust, addr)
+        return _oo_memo[_k]
+
     for b in rows:
         try:
             start = _parse_dt(b["slot_start"])
@@ -7092,6 +7958,35 @@ def _scheduler_send_reminders() -> None:
                 # BSUID here. Prefer the real number if it was captured
                 # since; otherwise the BSUID itself is a valid recipient
                 # ('Send to BSUID').
+                # v16g5 FIX R5-H4: reminders read `bookings` and never
+                # consulted consent at ALL — a patient who texted STOP kept
+                # getting appointment reminders. Check the suppression under
+                # every spelling the booking may have been keyed on.
+                # v16g6 FIX R6-H9: fail-closed is right for the SEND, wrong
+                # for the CONSUME. A transient lookup blip returned True here
+                # and the block below then marked every due lead handled
+                # FOREVER — the patient misses the visit while the dashboard
+                # says the reminder went out. Suppressed (known) → consume;
+                # unknown → skip THIS tick, keep the leads, retry next tick.
+                _checks = [_oo(b["customer_id"], _p) for _p in          # R6-M17
+                           dict.fromkeys([phone, _resolve_send_addr(b["customer_id"], phone)])
+                           if _p]
+                if any(_sup and _known for _sup, _known in _checks):
+                    analytics.inc("scheduler.reminder_skipped_optout")
+                    for h in due:
+                        sent.add(str(h))
+                    with _db_pool.get() as conn:
+                        _execute(conn, "UPDATE bookings SET reminders_sent=?, "
+                                       "updated_at=? WHERE id=?",
+                                 (",".join(sorted(sent)), _now(), b["id"]))
+                    continue
+                if any(not _known for _sup, _known in _checks):
+                    analytics.inc("scheduler.reminder_optout_unknown")
+                    log.warning(f"⚠️  opt-out state UNKNOWN (lookup failing) "
+                                f"— holding reminder for booking "
+                                f"id={b.get('id')} until it can be verified "
+                                f"(v16g6 FIX R6-H9)")
+                    continue
                 phone   = _resolve_send_addr(b["customer_id"], phone)
                 when    = _fmt_local_dt(b["slot_start"])
                 # v14g5 FIX 24: word the lead from the ACTUAL remaining time, not
@@ -7141,9 +8036,22 @@ def _scheduler_send_reminders() -> None:
                     log.warning(f"⚠️  reminder publish failed — leads kept for "
                                 f"retry (booking id={b.get('id')})")
             if changed:
+                # v16g5 FIX R5-M6: `sorted(sent, key=lambda x: -int(x))`
+                # raised on ANY non-numeric token that ever reached
+                # reminders_sent (a partial write, a manual edit, a future
+                # lead format). The outer except swallowed it, so that
+                # booking's row NEVER updated again and re-entered the due set
+                # on every tick — only the 6h setnx claim contained it. Sort
+                # defensively and drop junk instead of exploding.
+                def _lead_key(x):
+                    try:
+                        return -int(x)
+                    except (TypeError, ValueError):
+                        return 0
+                _clean = sorted({x for x in sent if str(x).strip()}, key=_lead_key)
                 with _db_pool.get() as conn:
                     _execute(conn, "UPDATE bookings SET reminders_sent=?, updated_at=? WHERE id=?",
-                             (",".join(sorted(sent, key=lambda x: -int(x))), _now(), b["id"]))
+                             (",".join(_clean), _now(), b["id"]))
         except Exception as exc:
             log.warning(f"⚠️  reminder send failed (id={b.get('id')}): {exc}")
     if rows:
@@ -7172,13 +8080,30 @@ def _scheduler_followups() -> None:
         with _db_pool.get(read_only=True) as conn:
             # v14g5 FIX 16: only chase leads belonging to ACTIVE clinics (was also
             # messaging cold leads of soft-deleted clinics).
+            # v16g5 FIX R5-H5: the ONLY time signal was contact CREATION, so a
+            # patient who first messaged 25 hours ago and has been in
+            # conversation since this morning still matched — and got
+            # "just following up, anything I can help with?" mid-chat. Join
+            # the session's last_active and require THAT to be stale too.
+            # LEFT JOIN + COALESCE so a lead with no session row (an imported
+            # contact) still qualifies on created_at alone, as before.
             cur = _execute(conn,
                 "SELECT c.id, c.customer_id, c.enc_phone FROM crm_contacts c "
                 "JOIN customer_brains b ON b.customer_id=c.customer_id "
                 "WHERE (c.followed_up_at IS NULL OR c.followed_up_at='') "
                 "AND c.created_at <= ? AND c.created_at >= ? AND c.is_consented=? "
-                "AND b.is_active=? LIMIT 200",
-                (older_than, too_old, _db_true(), _db_true()))
+                "AND b.is_active=? "
+                # NOT EXISTS, not a LEFT JOIN + GROUP BY: with two sessions
+                # (one stale, one live) a join would keep the stale row and
+                # nudge an active patient anyway. This asks the right
+                # question — "has this subject been active AT ALL recently?"
+                "AND NOT EXISTS (SELECT 1 FROM chat_sessions s "
+                "                WHERE s.customer_id = c.customer_id "
+                "                  AND s.subject_hash = c.phone_hash "
+                "                  AND s.last_active > ?) "
+                "ORDER BY c.id "
+                "LIMIT 200",
+                (older_than, too_old, _db_true(), _db_true(), older_than))
             rows = [dict(r) for r in cur.fetchall()]
     except Exception as exc:
         log.warning(f"⚠️  followup scan failed: {exc}")
@@ -7200,6 +8125,23 @@ def _scheduler_followups() -> None:
                 log.warning(f"⚠️  followup skipped — Instagram lead has no "
                             f"WhatsApp address (contact id={c.get('id')}, "
                             f"cust={c.get('customer_id')})")
+            elif phone and phone != "[ENCRYPTED]" \
+                    and not (_fo := is_opted_out_checked(c["customer_id"], phone))[1]:
+                # v16g6 FIX R6-M16 (R6-H9's twin in the followup scanner):
+                # the opt-out lookup FAILED — unknown is neither consent nor
+                # suppression. The old code fell through to _mark_followed
+                # and consumed the lead FOREVER on a DB blip. Hold it (no
+                # mark); the next tick retries.
+                analytics.inc("scheduler.followup_optout_unknown")
+                log.warning(f"⚠️  followup held — opt-out state unknown "
+                            f"(contact id={c.get('id')})")
+                continue
+            elif phone and phone != "[ENCRYPTED]" and _fo[0]:
+                # v16g5 FIX R5-H4 · v16g6 R6-M16: a suppressed lead is still
+                # marked below (nothing can opt back in today — the day that
+                # flow exists it must clear followed_up_at) — but only a
+                # KNOWN verdict may consume it.
+                analytics.inc("scheduler.followup_skipped_optout")
             elif phone and phone != "[ENCRYPTED]":
                 brain = get_customer_brain(c["customer_id"])
                 bot   = (brain.get("bot_name") if brain else "") or "our team"
@@ -7270,7 +8212,10 @@ def _find_subject_rows(customer_id: str, phone: str,
     hashes = {_crm_phone_hash(customer_id, p)
               for p in dict.fromkeys(
                   [phone, digits, _normalize_msisdn(phone or "")]) if p}
-    rows: List[Dict] = []
+    rows:  List[Dict] = []
+    exact: List[Dict] = []      # v16g5 FIX R5-M4
+    fuzzy: List[Dict] = []
+    want_full = _normalize_msisdn(phone or "")
     try:
         with _db_pool.get(read_only=True) as conn:
             has_uid = _column_exists(conn, "crm_contacts", "wa_user_id")
@@ -7290,7 +8235,31 @@ def _find_subject_rows(customer_id: str, phone: str,
                     dec = pii_vault.decrypt(d.get("enc_phone") or "")
                     if (dec and dec != "[ENCRYPTED]"
                             and re.sub(r"\D", "", dec)[-10:] == digits[-10:]):
-                        rows.append(d)
+                        # v16g5 FIX R5-M4: a last-10 match is a COLLISION, not
+                        # an identity: +91 98765 43210 and +1 998765 43210
+                        # share a tail. Tolerable for a read; this helper also
+                        # backs erase_data_subject() (irreversible) and
+                        # set_consent_api(). Separate EXACT country-aware
+                        # matches from mere tail matches and prefer the exact
+                        # set when one exists.
+                        if (want_full
+                                and _normalize_msisdn(dec) == want_full):
+                            exact.append(d)
+                        else:
+                            fuzzy.append(d)
+        # Exact wins outright. A tail-only match is trusted ONLY when it is
+        # unambiguous (exactly one) — two candidates means we cannot tell the
+        # subjects apart, and guessing would erase a stranger's records.
+        if exact:
+            rows.extend(exact)
+        elif len(fuzzy) == 1:
+            rows.extend(fuzzy)
+        elif fuzzy:
+            log.error(f"🛑 _find_subject_rows: {len(fuzzy)} contacts share the "
+                      f"last 10 digits of {pii_vault.mask(phone)} under "
+                      f"{customer_id} and none matched exactly — REFUSING to "
+                      f"guess (v16g5 FIX R5-M4). Pass the full E.164 number.")
+            analytics.inc("dpdp.ambiguous_subject")
     except Exception as exc:
         log.warning(f"⚠️  _find_subject_rows failed: {exc}")
     return rows
@@ -7382,10 +8351,47 @@ def erase_data_subject(customer_id: str, phone: str) -> Dict:
                   f"numreq_window:{customer_id}:{p}",
                   f"numreq_inflight:{customer_id}:{p}",
                   f"bk_offer:{customer_id}:{p}",
+                  # v16g6 FIX R6-M1: two keys added since this list was last
+                  # touched. wawin is the flag that AUTHORISES free-text
+                  # sends — erasure must revoke it with everything else.
+                  f"bk_offer_recent:{customer_id}:{p}",
+                  f"wawin:{customer_id}:{p}",
                   f"bk_cancel:{customer_id}:{p}",
                   f"ghost:{customer_id}:{p}",
                   f"ghost:ig:{customer_id}:{p}"):
             brain_cache.delete(k)
+    # 5) v16g6 FIX R6-C3: the OUTBOX. Queued reminders/follow-ups for this
+    # subject held their number in the payload and were still DELIVERED
+    # AFTER erasure — the one table this function never touched. Cancel
+    # every not-yet-sent row whose `to` matches any candidate spelling
+    # (payloads written before this build are cleartext; new ones are
+    # sealed — compare via decrypt so both generations match).
+    try:
+        _digs = {re.sub(r"\D", "", c)[-12:] for c in cands
+                 if re.sub(r"\D", "", c)}
+        with _db_pool.get() as conn:
+            cur = _execute(conn,
+                "SELECT id, payload FROM outbox "
+                "WHERE status IN ('pending','processing','failed')")
+            _kill = []
+            for r in cur.fetchall():
+                _pid = r["id"] if not isinstance(r, tuple) else r[0]
+                _raw = r["payload"] if not isinstance(r, tuple) else r[1]
+                try:
+                    _p = _raw if isinstance(_raw, dict) else json.loads(_raw)
+                except Exception:
+                    continue
+                if _p.get("customer_id") != customer_id:
+                    continue
+                _to = pii_vault.decrypt(str(_p.get("to", "")))
+                if (_to in cands
+                        or re.sub(r"\D", "", _to)[-12:] in _digs):
+                    _kill.append(_pid)
+            for _i in _kill:
+                _execute(conn, "DELETE FROM outbox WHERE id=?", (_i,))
+            report["outbox"] = len(_kill)
+    except Exception as exc:
+        log.warning(f"⚠️  erase (outbox) failed: {exc}")
     analytics.inc("dpdp.subject_erased")
     log.info(f"🗑️  DPDP erase → cust={customer_id} phone={pii_vault.mask(phone)} {report}")
     return report
@@ -7401,9 +8407,15 @@ def _janitor_loop() -> None:
     outbox rows (#25), and old webhook_log rows (#32); re-queue any outbox row
     left 'processing' by a crashed worker."""
     tick        = max(5, _env_int("OUTBOX_TICK", "20"))
-    heavy_every = max(1, int(3600 / tick))     # ~ once an hour
     med_every   = max(1, int(300 / tick))      # v14g4: ~ every 5 minutes
     n = 0
+    # v16g5 FIX R5-H6b: the heavy block used to fire on `n % heavy_every`,
+    # where `n` is a PER-PROCESS tick counter reset on every restart. A worker
+    # recycled more often than hourly — the norm on Render's free tier — never
+    # reached the heavy block AT ALL: bookings never flipped to 'completed',
+    # idempotency/webhook_log/done-outbox never pruned, stuck rows never
+    # requeued. v16g6 FIX R6-H3: anchor to a SHARED expiring lease — the
+    # only clock that survives restarts AND elects one leader fleet-wide.
     while not _shutdown_event.wait(timeout=tick):
         n += 1
         # v16g4 FIX O1: every gunicorn worker ran the drain each tick — N
@@ -7417,6 +8429,25 @@ def _janitor_loop() -> None:
                 _process_outbox()
             except Exception as exc:
                 log.warning(f"⚠️  Janitor (outbox) error: {exc}")
+            finally:
+                # v16g5 FIX R5-M10: the lease was ACQUIRED every tick and never
+                # RELEASED, so it expired on its own ~1s before the next tick.
+                # Janitors across workers aren't tick-synchronised, so a worker
+                # waking inside that window found it held and skipped — some
+                # ticks NOBODY drained, doubling worst-case welcome/reminder
+                # latency for no reason. Release it the moment we're done.
+                try:
+                    # v16g6 FIX R6-H2: delete("lock:outbox:drain") only ever
+                    # worked on Redis, where prefix concatenation lined up by
+                    # coincidence. The local store writes "__lock__outbox:drain",
+                    # so in no-Redis mode the R5-M10 release was a NO-OP and
+                    # the skipped-tick behaviour it removed came straight back
+                    # — and a raw delete bypasses the holder-token check, so
+                    # any worker could free any holder's lease. Use the real
+                    # check-and-del release.
+                    brain_cache.unlock("outbox:drain", _ob_lease)
+                except Exception:
+                    pass
         try:
             brain_cache.prune_local()          # v12 #35
         except Exception:
@@ -7440,47 +8471,76 @@ def _janitor_loop() -> None:
                 except Exception as exc:
                     log.warning(f"⚠️  scheduler (followups) error: {exc}")
 
-        if n % heavy_every:
+        # v16g6 FIX R6-H3: R5-H6b swapped a per-process TICK counter for a
+        # per-process MONOTONIC timer — `_last_heavy` re-armed on every boot,
+        # so a worker recycled faster than hourly (the Render free-tier norm)
+        # STILL never reached this block: bookings never flipped to
+        # 'completed', idempotency/webhook_log/done-outbox never pruned,
+        # stuck rows never requeued — the named failure was unchanged, only
+        # the mechanism moved. The gate must live OUTSIDE the process: one
+        # shared expiring setnx = hourly cadence AND single-leader election
+        # in a single atomic call (no-Redis dev degrades to per-process,
+        # the documented single-worker case).
+        if not brain_cache.setnx("janitor:heavy:ran", ttl=3600):
             continue
 
         now_     = datetime.now(timezone.utc)
         day_ago  = (now_ - timedelta(days=1)).isoformat()
         week_ago = (now_ - timedelta(days=7)).isoformat()
         stuck    = (now_ - timedelta(minutes=15)).isoformat()
-        try:
-            with _db_pool.get() as conn:
-                # v16g2 FIX N7: appointments whose time has passed become
-                # 'completed' — NOTHING ever flipped them, so past 'booked'
-                # rows (and their enc_phone/enc_name PII) were immortal and
-                # the retention purge's completed-branch was dead code.
-                _execute(conn, "UPDATE bookings SET status='completed', updated_at=? "
-                               "WHERE status='booked' AND slot_end < ?",
-                         (_now(), now_.isoformat()))
-                _execute(conn, "DELETE FROM idempotency_keys WHERE created_at < ?", (day_ago,))
-                _execute(conn, "DELETE FROM outbox WHERE status='done' AND created_at < ?", (day_ago,))
-                # v16g2 FIX M11: a stuck row that has burned its attempt budget
-                # becomes 'failed' (visible, cleanable) instead of a zombie the
-                # claimer's attempts<5 filter can never pick up again — invisible
-                # loss + slow bloat, defeating the dead-letter visibility.
-                _execute(conn,
-                    "UPDATE outbox SET attempts=attempts+1, next_attempt_at=?, "
-                    "status = CASE WHEN attempts >= 4 THEN 'failed' "
-                    "ELSE 'pending' END "
-                    "WHERE status='processing' "
-                    # v15 FIX 7: was `created_at < ?` — an event created 20 min
-                    # ago but claimed 5s ago (legitimately mid-send) got flipped
-                    # back to 'pending' and SENT TWICE. COALESCE covers legacy
-                    # rows claimed before processed_at stamping existed.
-                    "AND COALESCE(processed_at, created_at) < ?",
-                    (_iso_in(30), stuck))
-                # v16g2 FIX M11: dead-letters stay visible for a week, then out.
-                _execute(conn, "DELETE FROM outbox WHERE status='failed' "
-                               "AND created_at < ?", (week_ago,))
-                _execute(conn, "DELETE FROM webhook_log WHERE processed_at < ?", (week_ago,))
-            log.info("🧹 Janitor: housekeeping done (idempotency / outbox / webhook_log).")
-        except Exception as exc:
-            log.warning(f"⚠️  Janitor (cleanup) error: {exc}")
-
+        # v16g5 FIX R5-H6 (HIGH): all seven statements below shared ONE
+        # transaction and ONE `except`. Any single failure — a missing column
+        # on a partly-migrated DB, a lock timeout, one bad row — rolled back
+        # ALL of them, permanently, once an hour, forever. Bookings never
+        # flipped to 'completed' (so the retention purge's completed-branch
+        # stayed dead code, defeating FIX N7), and nothing ever pruned. Each
+        # statement now runs in its OWN transaction and is fault-isolated, the
+        # discipline the migration code has used since v11.
+        _chores = [
+            # v16g2 FIX N7: past appointments become 'completed' so their
+            # enc_phone/enc_name PII stops being immortal.
+            ("bookings→completed",
+             "UPDATE bookings SET status='completed', updated_at=? "
+             "WHERE status='booked' AND slot_end < ?", (_now(), now_.isoformat())),
+            ("idempotency prune",
+             "DELETE FROM idempotency_keys WHERE created_at < ?", (day_ago,)),
+            ("outbox done prune",
+             "DELETE FROM outbox WHERE status='done' AND created_at < ?", (day_ago,)),
+            # v16g2 FIX M11: a stuck row that has burned its attempt budget
+            # becomes 'failed' (visible, cleanable) instead of a zombie the
+            # claimer's attempts<5 filter can never pick up again.
+            # v15 FIX 7: measure from the CLAIM time, not row creation.
+            ("stuck-row requeue",
+             "UPDATE outbox SET attempts=attempts+1, next_attempt_at=?, "
+             "status = CASE WHEN attempts >= 4 THEN 'failed' ELSE 'pending' END "
+             "WHERE status='processing' AND COALESCE(processed_at, created_at) < ?",
+             (_iso_in(30), stuck)),
+            # v16g2 FIX M11: dead-letters stay visible for a week, then out.
+            ("dead-letter prune",
+             "DELETE FROM outbox WHERE status='failed' AND created_at < ?", (week_ago,)),
+            ("webhook_log prune",
+             "DELETE FROM webhook_log WHERE processed_at < ?", (week_ago,)),
+            # v16g5 FIX R5-L9 companion: opt-outs are permanent by design and
+            # are deliberately NOT pruned here.
+            # v16g6 FIX R6-C3: a pending row that no claimer ever picked up
+            # (attempts stuck, next_attempt_at pathologies) was retained
+            # FOREVER with its payload — nothing pruned status='pending'.
+            # A week-old undelivered welcome/reminder is dead either way.
+            ("outbox pending age-out",
+             "DELETE FROM outbox WHERE status='pending' AND created_at < ?",
+             (week_ago,)),
+        ]
+        _ok = _fail = 0
+        for _label, _sql, _prm in _chores:
+            try:
+                with _db_pool.get() as conn:
+                    _execute(conn, _sql, _prm)
+                _ok += 1
+            except Exception as exc:
+                _fail += 1
+                log.warning(f"⚠️  Janitor chore '{_label}' failed "
+                            f"(others continue): {exc}")
+        log.info(f"🧹 Janitor: housekeeping {_ok} ok, {_fail} failed.")
         # v14g4: DPDP retention purge (chat logs + dead bookings) — no-op unless
         # DATA_RETENTION_DAYS > 0. Never touches live CRM/lead data.
         if cfg.ENABLE_SCHEDULER:
@@ -7511,7 +8571,29 @@ try:
 except Exception as _pf_exc:   # pragma: no cover
     log.warning(f"⚠️  ProxyFix unavailable ({_pf_exc}) — client IPs may be the LB's.")
 
-CORS(app, resources={r"/*": {"origins": os.getenv("CORS_ORIGINS", "*")}})
+# v16g5 FIX R5-M11: this was a wildcard by default across EVERY route —
+# /admin/*, /crm/*, the DPDP erasure endpoint — and read through a raw
+# os.getenv instead of cfg (the pattern FIX L8 cleaned up for the Tally
+# secret). Webhooks stay open (Meta posts server-side, so CORS is irrelevant
+# there); the admin/CRM surface is same-origin unless CORS_ORIGINS names the
+# dashboard explicitly. STRICT_PROD refuses the wildcard outright.
+_cors_origins = [o.strip() for o in (cfg.CORS_ORIGINS or "").split(",") if o.strip()]
+if not _cors_origins:
+    if cfg.STRICT_PROD:
+        raise SystemExit("STRICT_PROD=1: set CORS_ORIGINS to your dashboard "
+                         "origin(s). A wildcard would let any website call "
+                         "/admin/* and /crm/* from a logged-in browser.")
+    _cors_origins = ["*"]
+    log.warning("⚠️  CORS_ORIGINS unset → '*' (dev default). Set it to your "
+                "dashboard origin before launch (v16g5 FIX R5-M11).")
+CORS(app, resources={
+    r"/whatsapp-webhook":  {"origins": "*"},
+    r"/instagram-webhook": {"origins": "*"},
+    r"/tally-webhook":     {"origins": "*"},
+    r"/health":            {"origins": "*"},
+    r"/ready":             {"origins": "*"},
+    r"/*":                 {"origins": _cors_origins},
+})
 
 limiter = Limiter(
     get_remote_address,
@@ -7746,7 +8828,11 @@ def verify_tally_signature(raw_body: bytes, headers: dict) -> bool:
                       "under STRICT_PROD/REQUIRE_WEBHOOK_SIGNATURE (v16g4 FIX H4)")
             return False
         return True
-    sig = headers.get("Tally-Signature", "") or headers.get("tally-signature", "")
+    # v16g5 FIX R5-C2: `headers` is now the case-insensitive Werkzeug object
+    # (a plain dict still works — the explicit spellings below cover it).
+    sig = (headers.get("Tally-Signature", "")
+           or headers.get("tally-signature", "")
+           or headers.get("TALLY-SIGNATURE", "") or "")
     digest   = hmac.new(tally_secret.encode(), raw_body, hashlib.sha256).digest()
     expected = base64.b64encode(digest).decode("ascii")
     return hmac.compare_digest(expected, sig)
@@ -7799,7 +8885,7 @@ def health():
     ai_active = [k for k, v in AI_PROVIDERS_ACTIVE.items() if v]
     return jsonify({
         "status":           "UP" if db_ok else "DEGRADED",
-        "engine":           "HEONIX Ultra v16.0 GEN-3",
+        "engine":           f"HEONIX Ultra {ENGINE_VERSION} {ENGINE_GEN}",
         "region":           cfg.REGION,
         "timestamp":        _now(),
         "db_mode":          cfg.DATABASE_MODE,
@@ -7963,7 +9049,15 @@ def tally_webhook():
     payload_hash = hashlib.sha256(raw_body).hexdigest()[:24]
 
     # Tally signature verification (FIX #14)
-    if not verify_tally_signature(raw_body, dict(request.headers)):
+    # v16g5 FIX R5-C2 (LAUNCH-CRITICAL): this used to pass
+    # `dict(request.headers)`, which THROWS AWAY Werkzeug's case-insensitive
+    # lookup and preserves whatever casing arrived on the wire. Only two exact
+    # spellings were probed, so a header delivered as "Tally-signature" or
+    # "TALLY-SIGNATURE" matched neither → compare_digest("", sig) → 401 on
+    # every legitimate onboarding. That is v15 FIX 3 resurrected through a
+    # different door: the day TALLY_WEBHOOK_SECRET is set, signups die
+    # silently. Pass the header object itself.
+    if not verify_tally_signature(raw_body, request.headers):
         analytics.inc("webhook.tally.sig_fail")
         return jsonify({"error": "Invalid webhook signature"}), 401
 
@@ -8067,9 +9161,31 @@ def tally_webhook():
         if raw.extra_notes:
             sys_prompt += f"\n\nAdditional context: {raw.extra_notes}"
 
+        # v16g5 FIX R5-C1 (LAUNCH-CRITICAL): owner_phone used to fall back to
+        # `wa_phone` — the clinic's own WABA line. FIX H1 already established
+        # that a WABA line CANNOT message itself (that is why the welcome
+        # refuses that target), but the same number was still persisted as the
+        # owner's, and owner_phone is the destination for every EMERGENCY
+        # escalation (send_owner_alert_async). Result: every "chest pain",
+        # "bleeding", "I need a doctor now" alert was addressed to the line
+        # that generated it and silently rejected by Meta. An UNSET owner
+        # phone that screams at boot beats a set one that black-holes.
+        _owner_for_brain = own_phone
+        if _owner_for_brain and _owner_for_brain == wa_phone:
+            log.critical(f"🛑 Tally: owner phone == WABA line for {customer_id} "
+                         f"— storing NO owner phone. EMERGENCY OWNER ALERTS "
+                         f"ARE DISABLED for this clinic until a distinct "
+                         f"owner number is attached (v16g5 FIX R5-C1).")
+            analytics.inc("onboard.owner_phone_is_waba")
+            _owner_for_brain = ""
+        elif not _owner_for_brain:
+            log.critical(f"🛑 Tally: NO owner phone for {customer_id} — "
+                         f"emergency owner alerts are DISABLED until one is "
+                         f"attached via /admin/customer/<id>/channel.")
+            analytics.inc("onboard.owner_phone_missing")
         save_customer_brain(customer_id, raw.customer_name,
                             raw.business_type, sys_prompt, wa_phone,   # v15g4 FIX B5
-                            owner_phone=(own_phone or wa_phone),
+                            owner_phone=_owner_for_brain,
                             instagram_id=raw.instagram_id,
                             bot_name=bot_name)
 
@@ -8083,12 +9199,10 @@ def tally_webhook():
         # was wa_phone, often the WABA line itself, which can't receive from
         # itself. No template configured / no distinct owner number → the send
         # is SKIPPED with a loud log instead of burned.
-        _welcome_to = own_phone
-        if _welcome_to and _welcome_to == wa_phone:
-            log.warning(f"⚠️  Tally: owner phone equals the WABA line for "
-                        f"{customer_id} — a line can't message itself; "
-                        f"welcome skipped. Collect a distinct owner number.")
-            _welcome_to = ""
+        # v16g6 FIX R6-L4: the equality re-check that used to sit here was
+        # unreachable — R5-C1 already blanks _owner_for_brain for exactly
+        # that condition a few lines up. Dead code removed.
+        _welcome_to = _owner_for_brain
         if _welcome_to and cfg.WELCOME_TEMPLATE:
             outbox_publish("whatsapp.template", {
                 "to":          _welcome_to,
@@ -8105,6 +9219,14 @@ def tally_webhook():
                         f"free text cannot be delivered (v16g4 FIX H1). "
                         f"Approve a welcome template in Meta Business Manager "
                         f"and set WELCOME_TEMPLATE.")
+        else:
+            # v16g5 FIX R5-M12: the no-owner-number case fell off the end of
+            # this if/elif with ZERO output — onboarding completed, no welcome
+            # was ever sent, and nothing said why.
+            log.warning(f"⚠️  Welcome for {customer_id} SKIPPED — no usable "
+                        f"owner number on the form (a WABA line cannot message "
+                        f"itself). Collect a distinct owner mobile.")
+            analytics.inc("onboard.welcome_skipped_no_target")
 
         log_webhook(source_ip, payload_hash, customer_id, "SUCCESS")
         actor = g.jwt_user["sub"] if hasattr(g, "jwt_user") else "webhook"
@@ -8199,6 +9321,13 @@ def _resolve_inbound_brain(phone_number_id: str, from_phone: str) -> Optional[st
                         cid = row["customer_id"]
                         brain_cache.set(ckey, cid, ttl=600)
                         return cid
+                    # v16g5 FIX R5-L2: only HITS were cached here, so the
+                    # "__none__" branch read above was dead code for this path
+                    # and every unroutable inbound cost a fresh DB round-trip
+                    # on a PUBLIC webhook — a free amplifier for anyone
+                    # spraying unknown phone_number_ids. Cache the miss too
+                    # (short TTL so attaching a number still goes live fast).
+                    brain_cache.set(ckey, "__none__", ttl=60)
         except Exception as exc:
             log.warning(f"⚠️  inbound route lookup failed: {exc}")
 
@@ -8338,6 +9467,10 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
         # #13: scope ghost-mute + session per (customer, patient) so one patient
         # texting two clinics is two independent conversations.
         guid = f"{customer_id}:{from_phone}"
+        # v16g5 FIX R5-H1: an inbound message is what opens WhatsApp's 24-hour
+        # customer-service window — record it so the reminder path can tell
+        # whether free text is deliverable at all.
+        _wa_touch_window(customer_id, from_phone)
         if ghost_is_muted(guid):                 # human owner has taken over
             analytics.inc("ghost.skipped")
             return
@@ -8352,8 +9485,8 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
         elif msg_type == "audio":
             user_text = transcribe_voice_note(msg.get("audio", {}).get("id", ""), out_tok)
             if not user_text:
-                send_whatsapp_sync(from_phone,
-                    "🎤 Sorry, I couldn't hear that clearly — could you please type your message?",
+                send_whatsapp_sync(from_phone,                    # v16g5 R5-M2
+                    _t("audio_unclear", _user_lang(customer_id, from_phone)),
                     out_pid, out_tok, customer_id)  # v14: ordered reply
                 return
             analytics.inc("voice.transcribed")
@@ -8363,9 +9496,8 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
             caption = (msg.get("image", {}).get("caption") or "").strip()
             desc    = understand_image_media(msg.get("image", {}).get("id", ""), out_tok)
             if not desc:
-                send_whatsapp_sync(from_phone,
-                    "📎 Thanks for the image! I couldn't read it clearly — could you "
-                    "briefly type what you'd like help with?",
+                send_whatsapp_sync(from_phone,                    # v16g5 R5-M2
+                    _t("image_unreadable", _user_lang(customer_id, from_phone)),
                     out_pid, out_tok, customer_id)
                 analytics.inc("whatsapp.image_unreadable")
                 return
@@ -8411,10 +9543,8 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
             # generic media acknowledgement instead.
             if not (_is_bsuid(from_phone) and brain_cache.get(
                     f"numreq_asked:{customer_id}:{from_phone}")):
-                send_whatsapp_sync(from_phone,
-                    "📎 Thanks! I've received the contact. Our team will "
-                    "review it shortly — meanwhile, feel free to type any "
-                    "question and I'll help right away.",
+                send_whatsapp_sync(from_phone,                    # v16g5 R5-M2
+                    _t("contact_ack", _user_lang(customer_id, from_phone)),
                     out_pid, out_tok, customer_id)
                 analytics.inc("whatsapp.media_ack")
                 return
@@ -8485,9 +9615,8 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
             return
         elif msg_type in ("image", "document", "video", "sticker"):
             # #16: acknowledge media instead of silently black-holing it
-            send_whatsapp_sync(from_phone,
-                "📎 Thanks! I've received your file. Our team will review it shortly. "
-                "Meanwhile, feel free to type any question and I'll help right away.",
+            send_whatsapp_sync(from_phone,                        # v16g5 R5-M2
+                _t("media_ack", _user_lang(customer_id, from_phone)),
                 out_pid, out_tok, customer_id)  # v14: ordered reply
             analytics.inc("whatsapp.media_ack")
             return
@@ -8512,10 +9641,19 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
         # "stop"), and when NO booking flow is mid-conversation — inside a
         # booking offer/cancel-confirm, "stop" already means "abort this
         # flow" (see handle_booking) and must keep that narrower meaning.
-        if (msg_type == "text"
-                and user_text.strip().lower() in _OPT_OUT_KEYWORDS
+        # v16g6 FIX R6-H8: (1) strip().lower() can never match Tamil/Hindi —
+        # compare via _norm_text like every other matcher in this file;
+        # (2) template quick-replies ("Stop promotions") arrive as msg_type
+        # 'button' or 'interactive', and a tap on the unsubscribe button did
+        # NOTHING — user_text already carries the tapped text by this point.
+        if (msg_type in ("text", "button", "interactive")
+                and _norm_text(user_text) in _OPT_OUT_KEYWORDS
                 and not (brain_cache.get(f"bk_cancel:{customer_id}:{from_phone}")
                          or brain_cache.get(f"bk_offer:{customer_id}:{from_phone}"))):
+            # v16g5 FIX R5-H4: the durable suppression FIRST — this is what
+            # actually stops reminders and follow-ups. The CRM consent flip
+            # stays as a secondary signal for the ops views.
+            _opt_ok = opt_out_subject(customer_id, from_phone)
             for _r in _find_subject_rows(customer_id, from_phone):
                 try:
                     with _db_pool.get() as _c:
@@ -8525,6 +9663,21 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
                              _r["id"]))
                 except Exception as exc:
                     log.warning(f"⚠️  opt-out update failed (id={_r.get('id')}): {exc}")
+            if not _opt_ok:
+                # Never claim "you've been unsubscribed" when nothing was
+                # written — that was the old behaviour for every BSUID patient
+                # with no matching CRM row.
+                log.critical(f"🛑 opt-out NOT persisted for cust={customer_id} "
+                             f"— telling the patient to retry rather than "
+                             f"lying about it (v16g5 FIX R5-H4).")
+                _confirm = _t("optout_failed", _user_lang(customer_id,
+                                                          from_phone, user_text))
+                save_messages_batch(session_id, [
+                    ("user",  user_text, "whatsapp", 0),
+                    ("model", _confirm,  "local",    0)])
+                send_whatsapp_sync(from_phone, _confirm, out_pid, out_tok, customer_id)
+                analytics.inc("whatsapp.optout_failed")
+                return
             _confirm = _t("opted_out", _user_lang(customer_id, from_phone,
                                                   user_text))
             save_messages_batch(session_id, [
@@ -8623,7 +9776,8 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
                 brain, history, user_text,
                 user_uid=guid, channel="whatsapp")
         except RuntimeError:
-            reply     = "Sorry, our AI is temporarily unavailable. We'll get back to you shortly!"
+            reply     = _t("ai_unavailable",                       # v16g5 R5-M2
+                           _user_lang(customer_id, from_phone, user_text))
             provider  = "fallback"
             escalated = False
         latency_ms = int((time.monotonic() - t0) * 1000)
@@ -8694,6 +9848,25 @@ def whatsapp_webhook():
                     if _k:
                         name_map[_k] = _nm
                         uid_map[_k]  = _cu
+            # v16g6 FIX R6-M6: delivery/read/FAILED callbacks arrive as
+            # value.statuses and were dropped on the floor — a send the API
+            # accepted (200) but never delivered (131047 outside the 24h
+            # window, 131026 undeliverable, blocked recipient) was invisible.
+            # On a build whose whole point was template-window correctness,
+            # that meant no feedback loop at all. Count every status; log
+            # failures loudly with Meta's exact code + title.
+            for _st in value.get("statuses", []):
+                _s = (_st.get("status") or "").lower()
+                if _s:
+                    analytics.inc(f"whatsapp.status.{_s}")
+                if _s == "failed":
+                    _errs = _st.get("errors") or []
+                    _e0   = (_errs[0] if _errs else {}) or {}
+                    log.error(f"❌ WA delivery FAILED "
+                              f"wamid={str(_st.get('id',''))[:28]} "
+                              f"to={pii_vault.mask(str(_st.get('recipient_id','')))} "
+                              f"code={_e0.get('code')} "
+                              f"{str(_e0.get('title') or _e0.get('message') or '')[:160]}")
             for msg in value.get("messages", []):        # #7: all msgs
                 from_phone = msg.get("from", "")
                 wamid      = msg.get("id", "")
@@ -8829,6 +10002,36 @@ def _process_ig_message(sender: str, recipient: str, message: dict) -> None:
         brain_cache.set(skey, session_id, ttl=3600)   # v15g2 FIX M3: sliding TTL
 
         _is_health = _brain_is_health(brain)   # v16g4 FIX P3: cached per brain version
+
+        # v16g6 FIX R6-H8 (IG): WhatsApp has had a global marketing opt-out
+        # since v16g4; Instagram had NONE — an IG lead could never
+        # unsubscribe from cold-lead follow-ups. Same exact-match gate, same
+        # durable suppression, keyed exactly the way IG subjects are stored
+        # everywhere else in this file ("ig_<sender>").
+        if _norm_text(user_text) in _OPT_OUT_KEYWORDS:
+            _ig_subj = f"ig_{sender}"
+            _opt_ok = opt_out_subject(customer_id, _ig_subj)
+            for _r in _find_subject_rows(customer_id, _ig_subj):
+                try:
+                    with _db_pool.get() as _c:
+                        _execute(_c,
+                            "UPDATE crm_contacts SET is_consented=? WHERE id=?",
+                            (False if isinstance(_db_pool, PostgreSQLPool) else 0,
+                             _r["id"]))
+                except Exception as exc:
+                    log.warning(f"⚠️  IG opt-out update failed "
+                                f"(id={_r.get('id')}): {exc}")
+            if _opt_ok:
+                _ack = ("You will no longer receive promotional messages "
+                        "from us. / இனி எங்களிடமிருந்து விளம்பரச் "
+                        "செய்திகள் அனுப்பப்படாது.")
+                analytics.inc("optout.instagram")
+            else:
+                _ack = ("Sorry — we couldn't record that just now. "
+                        "Please send STOP once more.")
+            send_instagram_sync(sender, _ack, ig_own, ig_tok, customer_id)
+            return
+
         gov = govern_message(user_text, uid,
                              bot_name=(brain.get("bot_name") or ""),
                              owner_phone=(brain.get("owner_phone") or ""),
@@ -8857,7 +10060,8 @@ def _process_ig_message(sender: str, recipient: str, message: dict) -> None:
             reply, provider, escalated = ai_reply_pipeline(
                 brain, history, user_text, user_uid=uid, channel="instagram")
         except RuntimeError:
-            reply     = "Sorry, our AI is temporarily unavailable. We'll get back to you shortly!"
+            reply     = _t("ai_unavailable",                       # v16g5 R5-M2
+                           _user_lang(customer_id, f"ig_{sender}", user_text))
             provider  = "fallback"
             escalated = False
         latency_ms = int((time.monotonic() - t0) * 1000)
@@ -8949,7 +10153,10 @@ def chat():
     elif cfg.STRICT_PROD:
         return jsonify({"error": "/chat requires CHAT_API_KEY under STRICT_PROD"}), 401
     try:
-        req = ChatRequestValidator(**request.get_json(silent=True) or {})
+        _body = request.get_json(silent=True)
+        # v16g6 FIX R6-M8: a non-dict JSON body ([1,2], "hello") is truthy,
+        # so ** raised TypeError OUTSIDE the ValidationError catch → 500.
+        req = ChatRequestValidator(**(_body if isinstance(_body, dict) else {}))
     except ValidationError as exc:
         return jsonify({"error": "Validation failed", "detail": exc.errors()}), 422
 
@@ -9026,7 +10233,9 @@ def admin_login():
         return jsonify({"error": "Auth unavailable — pyjwt is not installed "
                         "on this deployment"}), 503
     try:
-        req = AdminLoginValidator(**request.get_json(silent=True) or {})
+        _body = request.get_json(silent=True)
+        # v16g6 FIX R6-M8: non-dict JSON gave a cheap unauthenticated 500.
+        req = AdminLoginValidator(**(_body if isinstance(_body, dict) else {}))
     except ValidationError as exc:
         return jsonify({"error": "Validation failed", "detail": exc.errors()}), 422
 
@@ -9064,6 +10273,27 @@ def admin_login():
     if _tenant:
         resp["tenant_id"] = _tenant
     return jsonify(resp), 200
+
+
+# ── Admin: Logout (JWT revocation) ────────────────────────────────────────────
+@app.route("/admin/logout", methods=["POST"])
+@limiter.limit(cfg.ADMIN_RATE_LIMIT)
+@require_jwt(min_role="viewer")
+def admin_logout():
+    """v16g6 FIX R6-C5: revoke_jwt shipped in R5 with ZERO call sites — the
+    denylist was checked on every request and nothing could ever write to it,
+    so a leaked admin token stayed valid for the full JWT_EXPIRY_HOURS with no
+    kill switch (revoke_jwt's own docstring promised this route existed).
+    This is the missing write half: ban this token's jti until its natural
+    expiry — fleet-wide when Redis backs the cache."""
+    _jti = g.jwt_user.get("jti", "")
+    _exp = int(g.jwt_user.get("exp", 0) or 0)
+    _ttl = max(60, _exp - int(time.time())) if _exp else 0
+    revoke_jwt(_jti, ttl=_ttl)
+    audit(g.jwt_user.get("sub", "unknown"), "admin.logout", "admin_users",
+          ip=request.remote_addr)
+    analytics.inc("admin.logout")
+    return jsonify({"status": "logged_out"}), 200
 
 
 # ── Admin: Create Admin User ───────────────────────────────────────────────────
@@ -9175,7 +10405,7 @@ def delete_customer(customer_id: str):
             _execute(conn,
                 "UPDATE customer_brains SET is_active=?, updated_at=? WHERE customer_id=?",
                 (False if is_pg else 0, _now(), customer_id))
-    brain_cache.delete(customer_id)
+    brain_cache.delete(f"brain:{customer_id}")         # v16g6 FIX R6-L6
     # bust every routing cache that could still point at this (now freed) number
     if old_wa_pid:
         brain_cache.delete(f"wapid:{old_wa_pid}")
@@ -9271,7 +10501,7 @@ def set_customer_channel(customer_id: str):
     # v15g4 FIX B2: OLD ids and the wa_route:* cid entries included — the old
     # code busted only the NEW wapid, leaving the previous number's routing
     # (and this clinic's stale creds) served from cache for up to 10 minutes.
-    brain_cache.delete(customer_id)
+    brain_cache.delete(f"brain:{customer_id}")         # v16g6 FIX R6-L6
     for pid in {wa_pid, old_wa_pid}:
         if pid:
             brain_cache.delete(f"wapid:{pid}")
@@ -9347,7 +10577,7 @@ def smoke_test_channel(customer_id: str):
                 _execute(conn,
                     "UPDATE customer_brains SET channel_status=?, updated_at=? "
                     "WHERE customer_id=?", ("ok", _now(), customer_id))
-        brain_cache.delete(customer_id)
+        brain_cache.delete(f"brain:{customer_id}")     # v16g6 FIX R6-L6
         analytics.inc("smoke_test.pass")
         _resp = {"channel": "whatsapp", "ok": True,
                  "wa_phone_number_id": pid,
@@ -9471,6 +10701,12 @@ def crm_add_contact_api():
         contact.customer_id, contact.name, contact.phone,
         contact.email, contact.notes, contact.contact_stage, contact.is_consented,
     )
+    if not contact_id:
+        # v16g6 FIX R6-L8: 201 with contact_id 0 — the insert lost the race
+        # AND the recovery re-lookup failed. Nothing verifiably exists;
+        # saying "created" with a fake id poisons the caller's records.
+        return jsonify({"error": "Contact could not be verified as created — "
+                                 "please retry"}), 503
     actor = g.jwt_user.get("sub", "unknown")
     audit(actor, "crm.add_contact", contact.customer_id,
           {"stage": contact.contact_stage, "consented": contact.is_consented},
@@ -9716,7 +10952,8 @@ def _shutdown_handler(signum, frame):
                 _db_pool.close_all()
             except Exception:
                 pass
-        log.info("✅ HEONIX Ultra v16.0 GEN-3 shut down cleanly.")   # v16g2 FIX C1
+        log.info(f"✅ HEONIX Ultra {ENGINE_VERSION} {ENGINE_GEN} "
+                 f"shut down cleanly.")                              # v16g2 FIX C1
     t = threading.Thread(target=_drain, name="drain", daemon=True)
     t.start()
     t.join(timeout=10)        # bounded — gunicorn's graceful-timeout is the boss
@@ -9807,7 +11044,8 @@ def startup() -> None:
         _startup_done = True
 
     log.info("=" * 76)
-    log.info("  👑  HEONIX ULTRA ENGINE  v16.0 GEN-4  ·  ROUND-4 CLOSE-OUT (50 FIXES + 3 PORTS)")
+    log.info(f"  👑  HEONIX ULTRA ENGINE  {ENGINE_VERSION} {ENGINE_GEN}"
+             f"  ·  ROUND-6 CLOSE-OUT (47 FIXES)")
     log.info(f"  🌍  Region: {cfg.REGION}")
     log.info("=" * 76)
 
@@ -9907,6 +11145,7 @@ def startup() -> None:
     _migrate_v15g4() # v15g4: purge-path indexes (D4) + SQLite idx_wh_customer (D5)
     _migrate_v16()   # v16: crm_contacts.wa_user_id (WhatsApp usernames/BSUID)
     _migrate_v16g4() # v16g4 FIX M10: admin_users.tenant_id
+    _migrate_v16g5() # v16g5 FIX R5-H4: durable opt_outs suppression table
     _report_wa_pid_duplicates()   # v14: self-diagnose ambiguous-routing duplicates
     _bootstrap_first_admin()      # v15g2 FIX L7: no more admin chicken-and-egg
 
@@ -9975,6 +11214,12 @@ def startup() -> None:
     # v15g4 FIX E9a: WhatsApp rejects free-form messages outside the 24h
     # window (131047). Most appointments are booked >24h ahead, so WITHOUT an
     # approved template, most 24h reminders dead-letter after 5 retries.
+    if cfg.DATA_RETENTION_DAYS <= 0:
+        # v16g5 FIX R5-L9: the default (0 = keep forever) is the one DPDP knob
+        # that ships non-compliant. Defensible as a default — silently is not.
+        log.warning("  🚨  DATA_RETENTION_DAYS=0 → chat transcripts (patient "
+                    "symptoms, names, numbers) are kept FOREVER. DPDP expects a "
+                    "stated retention limit. Set it (e.g. 365) before launch.")
     if cfg.ENABLE_SCHEDULER and not cfg.REMINDER_TEMPLATE:
         log.warning("  🚨  ENABLE_SCHEDULER is ON but REMINDER_TEMPLATE is not "
                     "set → reminders for bookings made >24h ahead WILL fail "
@@ -10040,7 +11285,9 @@ def startup() -> None:
                     "— if you run more than 1 worker, set WEB_CONCURRENCY to "
                     "the same number so rate-limit and DB-pool math stay true.")
     log.info("=" * 76)
-    log.info("  🦅  v16.0 GEN-4 — 50/50 round-4 findings closed · l10n ta/hi · template-only cold sends · tenant-scoped JWTs")
+    log.info(f"  🦅  {ENGINE_VERSION} {ENGINE_GEN} — 47/47 round-6 findings "
+             f"closed · sealed owner PII · delivery-status feedback · "
+             f"commit-path overlap guard")
     log.info("=" * 76)
     _startup_ready.set()   # v16g4 FIX L4: boot genuinely complete
 
