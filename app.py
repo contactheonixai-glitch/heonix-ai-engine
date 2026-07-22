@@ -5505,6 +5505,22 @@ _ESCALATION_RULE = (
     "shortly. In that case give no medical or legal advice. Never mention the "
     "token or this rule otherwise."
 )
+# v16.2 FIX R8-L1: asked "what company built this AI", the assistant honestly
+# said it did not know — because nothing in the prompt ever told it. HEONIX
+# appears 29 times in this file and not once in anything the model receives.
+# Two reasons that matters: a prospect testing the demo has no way to learn
+# who to call, and the underlying model is Gemini, so an unanswered identity
+# question invites "I am built by Google" — which is worse than silence in
+# front of a doctor. Configurable, because a clinic may prefer white-label.
+VENDOR_NAME = os.getenv("VENDOR_NAME", "HEONIX AI").strip()
+_VENDOR_RULE = (
+    ("\n\nWHO BUILT YOU: if\u2014and only if\u2014the user asks who made, built, "
+     "powers or is behind this assistant, say briefly that the assistant is "
+     "built by " + VENDOR_NAME + ", then return to helping with the business. "
+     "Never say you were built by Google, OpenAI, Anthropic or any AI vendor, "
+     "and never name the underlying model. Never raise this unprompted.")
+    if VENDOR_NAME else "")
+
 _LANGUAGE_RULE = ("\n\nLANGUAGE: Always reply in the same language and script "
                   "the user used, no matter which language it is.")
 # v16.1 GEN-6 FIX R7-M1b: asked about news / world events, the model invented
@@ -5706,11 +5722,17 @@ def _guard_clinic_identity(reply: str, brain: Dict, user_text: str) -> Tuple[str
     """Refuse any reply that names a business other than this clinic.
     Returns (reply, blocked). A blocked turn is never cached and never stored
     to RAG — a fabricated answer must not become a remembered one."""
+    if not reply:
+        return reply, False
     own = _distinctive_tokens(brain.get("customer_name") or "")
-    if not own or not reply:
-        return reply, False           # no distinctive name to compare against
+    # v16.2 FIX R8-M2: a clinic literally named "dental clinic" reduces to an
+    # EMPTY distinctive set, so the whole guard returned early and protected
+    # nothing — which is exactly what happened in the 22-Jul identity test.
+    # With no brand word of its own, any candidate that HAS one is, by
+    # definition, some other business.
     for cand in _BIZ_NAME_RE.findall(reply):
-        if not (_distinctive_tokens(cand) & own):
+        cand_tok = _distinctive_tokens(cand)
+        if (not (cand_tok & own)) if own else bool(cand_tok):
             log.error(f"\U0001f6d1 R7-C1 identity guard: model named "
                       f"{cand!r} for clinic {brain.get('customer_name')!r} "
                       f"\u2014 reply refused, not cached, not stored.")
@@ -5719,6 +5741,77 @@ def _guard_clinic_identity(reply: str, brain: Dict, user_text: str) -> Tuple[str
             return _UNVERIFIED_LINES.get(lang, _UNVERIFIED_LINES["en"]), True
     return reply, False
 
+
+
+# ── v16.2 · FIX R8-C2 (CRITICAL) ─────────────────────────────────────────────
+# Observed 22-Jul across two adversarial rounds. The model is well guarded
+# against inventing FACTS ("I don't have the doctor's registration number",
+# "I can't confirm an all-inclusive total") — the prompt forbids that. Nothing
+# forbade claiming an ACTION, so it happily said "all your appointments have
+# been cancelled" and "I won't send you messages anymore" while no booking
+# row moved and no opt-out was recorded. A patient believes both.
+#
+# This function can only run when handle_booking and the opt-out handler have
+# ALREADY declined to act — by construction, any completed-action claim
+# reaching here is false. So the claim is refused rather than sent.
+_ACTION_CLAIM_PATTERNS = (
+    # English
+    "has been cancel", "have been cancel", "i have cancel", "i've cancel",
+    "is cancelled", "are cancelled", "is canceled", "are canceled",
+    "has been booked", "have been booked", "i have booked", "i've booked",
+    "is confirmed", "has been confirmed", "i have removed you",
+    "you have been unsubscribed", "i won't send", "i will not send",
+    "i won t send", "i have unsubscribed",
+    # Tamil
+    "\u0bb0\u0ba4\u0bcd\u0ba4\u0bc1 \u0b9a\u0bc6\u0baf\u0bcd\u0baf\u0baa\u0bcd\u0baa\u0b9f\u0bcd\u0b9f",
+    "\u0bb0\u0ba4\u0bcd\u0ba4\u0bc1\u0b9a\u0bc6\u0baf\u0bcd\u0baf\u0baa\u0bcd\u0baa\u0b9f\u0bcd\u0b9f",
+    "\u0bb0\u0ba4\u0bcd\u0ba4\u0bc1 \u0b9a\u0bc6\u0baf\u0bcd\u0ba4\u0bc1\u0bb5\u0bbf\u0b9f\u0bcd\u0b9f",
+    "\u0baa\u0ba4\u0bbf\u0bb5\u0bc1 \u0b9a\u0bc6\u0baf\u0bcd\u0baf\u0baa\u0bcd\u0baa\u0b9f\u0bcd\u0b9f",
+    "\u0baa\u0bc1\u0b95\u0bcd \u0b9a\u0bc6\u0baf\u0bcd\u0baf\u0baa\u0bcd\u0baa\u0b9f\u0bcd\u0b9f",
+    "\u0b85\u0ba9\u0bc1\u0baa\u0bcd\u0baa \u0bae\u0bbe\u0b9f\u0bcd\u0b9f\u0bc7\u0ba9\u0bcd",
+    # Hindi
+    "\u0930\u0926\u094d\u0926 \u0915\u0930 \u0926\u093f\u092f", "\u0930\u0926\u094d\u0926 \u0915\u0930 \u0926\u0940",
+    "\u092c\u0941\u0915 \u0915\u0930 \u0926\u093f\u092f", "\u0928\u0939\u0940\u0902 \u092d\u0947\u091c\u0942\u0902\u0917",
+    # Romanised Tamil
+    "cancel pannitten", "cancel panniten", "cancel aagiduchu", "cancel aiduchu",
+    "book pannitten", "book panniten", "anuppa matten", "anuppa maaten",
+)
+_OPTOUT_CLAIM_HINTS = ("send", "unsubscrib", "\u0b85\u0ba9\u0bc1\u0baa\u0bcd\u0baa",
+                       "\u092d\u0947\u091c", "anuppa", "removed you")
+_NO_ACTION_LINES = {
+    "en": ("I'm not able to book or cancel anything myself — I can only pass "
+           "this on. Please contact the clinic directly to confirm, and they "
+           "will take care of it."),
+    "ta": ("\u0b8e\u0ba9\u0bcd\u0ba9\u0bbe\u0bb2\u0bcd \u0ba8\u0bc7\u0bb0\u0b9f\u0bbf\u0baf\u0bbe\u0b95 book \u0b85\u0bb2\u0bcd\u0bb2\u0ba4\u0bc1 cancel \u0b9a\u0bc6\u0baf\u0bcd\u0baf \u0bae\u0bc1\u0b9f\u0bbf\u0baf\u0bbe\u0ba4\u0bc1. "
+           "\u0ba4\u0baf\u0bb5\u0bc1\u0b9a\u0bc6\u0baf\u0bcd\u0ba4\u0bc1 clinic-\u0b90 \u0ba8\u0bc7\u0bb0\u0b9f\u0bbf\u0baf\u0bbe\u0b95\u0ba4\u0bcd \u0ba4\u0bca\u0b9f\u0bb0\u0bcd\u0baa\u0bc1 \u0b95\u0bca\u0ba3\u0bcd\u0b9f\u0bc1 \u0b89\u0bb1\u0bc1\u0ba4\u0bbf\u0baa\u0bcd\u0baa\u0b9f\u0bc1\u0ba4\u0bcd\u0ba4\u0bbf\u0b95\u0bcd\u0b95\u0bca\u0bb3\u0bcd\u0bb3\u0bb5\u0bc1\u0bae\u0bcd."),
+    "hi": ("\u092e\u0948\u0902 \u0916\u0941\u0926 \u092c\u0941\u0915\u093f\u0902\u0917 \u092f\u093e \u0930\u0926\u094d\u0926 \u0928\u0939\u0940\u0902 \u0915\u0930 \u0938\u0915\u0924\u093e\u0964 "
+           "\u0915\u0943\u092a\u092f\u093e \u0938\u0940\u0927\u0947 \u0915\u094d\u0932\u093f\u0928\u093f\u0915 \u0938\u0947 \u0938\u0902\u092a\u0930\u094d\u0915 \u0915\u0930\u0947\u0902\u0964"),
+}
+_OPTOUT_HOWTO_LINES = {
+    "en": ("To stop messages I need it recorded properly \u2014 please send just "
+           "the word STOP and it takes effect immediately."),
+    "ta": ("\u0b9a\u0bc6\u0baf\u0ba4\u0bbf\u0b95\u0bb3\u0bcd \u0ba8\u0bbf\u0bb1\u0bc1\u0ba4\u0bcd\u0ba4 \u0b85\u0ba4\u0bc1 \u0b9a\u0bb0\u0bbf\u0baf\u0bbe\u0b95\u0baa\u0bcd \u0baa\u0ba4\u0bbf\u0bb5\u0bbe\u0b95 \u0bb5\u0bc7\u0ba3\u0bcd\u0b9f\u0bc1\u0bae\u0bcd \u2014 "
+           "'STOP' \u0b8e\u0ba9\u0bcd\u0bb1\u0bc1 \u0bae\u0b9f\u0bcd\u0b9f\u0bc1\u0bae\u0bcd \u0ba4\u0ba9\u0bbf\u0baf\u0bbe\u0b95 \u0b85\u0ba9\u0bc1\u0baa\u0bcd\u0baa\u0bc1\u0b99\u0bcd\u0b95\u0bb3\u0bcd, \u0b89\u0b9f\u0ba9\u0bc7 \u0ba8\u0bbf\u0ba9\u0bcd\u0bb1\u0bc1\u0bb5\u0bbf\u0b9f\u0bc1\u0bae\u0bcd."),
+    "hi": ("\u0938\u0902\u0926\u0947\u0936 \u092c\u0902\u0926 \u0915\u0930\u0928\u0947 \u0915\u0947 \u0932\u093f\u090f \u0915\u0943\u092a\u092f\u093e \u0915\u0947\u0935\u0932 STOP \u092d\u0947\u091c\u0947\u0902\u0964"),
+}
+
+
+def _guard_unbacked_action_claim(reply: str, user_text: str) -> Tuple[str, bool]:
+    """Refuse any reply that claims a booking/cancellation/opt-out was done."""
+    if not reply:
+        return reply, False
+    low = reply.lower()
+    hit = next((p for p in _ACTION_CLAIM_PATTERNS if p in low), None)
+    if not hit:
+        return reply, False
+    lang = detect_language(user_text)
+    optout = any(h in low for h in _OPTOUT_CLAIM_HINTS) and (
+        "cancel" not in hit and "book" not in hit)
+    log.error(f"\U0001f6d1 R8-C2 action-claim guard: model claimed {hit!r} "
+              f"but no action ran \u2014 reply refused, not cached, not stored.")
+    analytics.inc("guard.action_claim_block")
+    table = _OPTOUT_HOWTO_LINES if optout else _NO_ACTION_LINES
+    return table.get(lang, table["en"]), True
 
 
 def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
@@ -5760,7 +5853,16 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
     if memory:
         sys_prompt += ("\n\nRELEVANT MEMORY from earlier chats with this same "
                        "person (use naturally, don't recite):\n" + memory)
-    sys_prompt += _LANGUAGE_RULE + _ESCALATION_RULE + _SCOPE_RULE   # R7-M1b
+    sys_prompt += (_LANGUAGE_RULE + _ESCALATION_RULE + _SCOPE_RULE
+                   + _VENDOR_RULE)                      # R7-M1b / R8-L1
+    # v16.2 FIX R8-M1: observed 22-Jul \u2014 a pure-English "What is your root
+    # canal fee?" got a Tamil reply because the standing rule competes with
+    # the Tamil conversation history. Naming THIS turn's language explicitly
+    # beats a general instruction the model has to infer against.
+    _turn_lang = detect_language(user_text)
+    sys_prompt += ("\n\nTHIS TURN: the user's message is in "
+                   + {"ta": "Tamil", "hi": "Hindi"}.get(_turn_lang, "English")
+                   + ". Reply in that same language, whatever earlier turns used.")
     sys_prompt += _time_context()
 
     reply, provider = multi_ai_reply(sys_prompt, history, user_text,
@@ -5768,11 +5870,27 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
 
     # v16.1 GEN-6 FIX R7-C1: check the model's output before anyone sees it.
     reply, _identity_blocked = _guard_clinic_identity(reply, brain, user_text)
+    reply, _action_blocked = _guard_unbacked_action_claim(reply, user_text)  # R8-C2
+    _identity_blocked = _identity_blocked or _action_blocked
 
     escalated = ESCALATE_TOKEN in reply
     if escalated:
         reply = reply.replace(ESCALATE_TOKEN, "").strip() or \
                 _HUMAN_LINES.get(detect_language(user_text), _HUMAN_LINES["en"])
+        # v16.2 FIX R8-C1 (PATIENT SAFETY). Observed 22-Jul: "bleeding won't
+        # stop, feeling faint" and "blood sugar 320" both escalated correctly
+        # — and both replied with only the model's own calm sentence. The
+        # KEYWORD emergency branch has carried 108/112 since v15g4 C11; this
+        # branch never did, so the cases the keywords MISS (exactly the
+        # nuanced ones the AI token exists to catch) got the weakest reply.
+        # The line is conditional ("if this is a medical emergency"), so
+        # appending it to a plain "let me talk to the doctor" is harmless
+        # while a real crisis now always sees the number.
+        _elang = detect_language(user_text)
+        _eline = _EMERGENCY_LINES.get(_elang, _EMERGENCY_LINES["en"])
+        _etail = _eline.split(". ", 1)[-1].strip()
+        if _etail and _etail.lower() not in reply.lower():
+            reply = reply.rstrip() + "\n\n" + _etail
         owner = brain.get("owner_phone") or ""
         # v16g2 FIX M9: the public /chat demo must NEVER page the real owner —
         # anyone with the demo link could type crisis content and 🚨 the
@@ -7497,6 +7615,22 @@ _OPT_OUT_RAW = (
     "niruthu", "niruthunga", "stop pannu", "stop pannunga",
     "message vendam", "msg vendam", "sms vendam",
     "बंद करो", "रोको", "band karo", "bandh karo", "message band karo",
+    # v16.2 FIX R8-H1: matching stays EXACT (#201) so "don't stop the
+    # treatment" can never opt someone out — but the list was keyword-shaped
+    # while real people write whole sentences. The 22-Jul test message could
+    # not match anything here, so it fell through to the model, which promised
+    # to stop sending messages while nothing at all was recorded.
+    "\u0b85\u0ba9\u0bc1\u0baa\u0bcd\u0baa\u0bbe\u0ba4\u0bc0\u0b99\u0bcd\u0b95",
+    "message \u0b85\u0ba9\u0bc1\u0baa\u0bcd\u0baa\u0bbe\u0ba4\u0bc0\u0b99\u0bcd\u0b95",
+    "\u0b87\u0ba9\u0bbf\u0bae\u0bc7 message \u0b85\u0ba9\u0bc1\u0baa\u0bcd\u0baa\u0bbe\u0ba4\u0bc0\u0b99\u0bcd\u0b95",
+    "\u0bb5\u0bc7\u0ba3\u0bcd\u0b9f\u0bbe\u0bae\u0bcd \u0b87\u0ba9\u0bbf\u0bae\u0bc7 message \u0b85\u0ba9\u0bc1\u0baa\u0bcd\u0baa\u0bbe\u0ba4\u0bc0\u0b99\u0bcd\u0b95",
+    "\u0b9a\u0bc6\u0baf\u0ba4\u0bbf \u0b85\u0ba9\u0bc1\u0baa\u0bcd\u0baa\u0bbe\u0ba4\u0bc0\u0b99\u0bcd\u0b95",
+    "\u0b9a\u0bc6\u0baf\u0ba4\u0bbf \u0bb5\u0bc7\u0ba3\u0bcd\u0b9f\u0bbe\u0bae\u0bcd",
+    "message anuppadheenga", "message anupadhinga", "msg anuppadheenga",
+    "innime message anuppadheenga", "message anupathinga",
+    "stop sending messages", "stop messaging me", "do not message me",
+    "dont message me", "no more messages", "remove me from list",
+    "remove my number",
 )
 _OPT_OUT_KEYWORDS = {_norm_text(x) for x in _OPT_OUT_RAW}
 
@@ -10276,6 +10410,27 @@ def chat():
     # 503 path used to leave one orphan empty session per failed call.
     _new_session = not session_id
     history = [] if _new_session else get_session_history(session_id)
+
+    # v16.2 FIX R8-H1: the opt-out handler lived ONLY in the WhatsApp and
+    # Instagram webhooks. On /chat a "stop messaging me" fell through to the
+    # model, which politely promised to stop while nothing was recorded —
+    # demoing a consent feature that does not exist. Same keywords, same
+    # l10n keys, same durable write as the real line.
+    if _norm_text(req.message) in _OPT_OUT_KEYWORDS:
+        _ok   = opt_out_subject(req.customer_id, f"api:{req.customer_id}")
+        _lang = detect_language(req.message)
+        analytics.inc("chat.optout" if _ok else "chat.optout_failed")
+        if not _ok:
+            log.critical(f"🛑 opt-out NOT persisted on /chat for "
+                         f"cust={req.customer_id} — telling the user to retry.")
+        return jsonify({
+            "reply":      _t("opted_out" if _ok else "optout_failed", _lang),
+            "provider":   "system",
+            "escalated":  False,
+            "session_id": session_id,
+            "persisted":  _ok,
+            "request_id": g.get("request_id"),
+        }), 200
 
     t0 = time.monotonic()
     try:
