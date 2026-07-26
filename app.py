@@ -945,7 +945,17 @@ class Config:
     OPENAI_MODEL: str           = os.getenv("OPENAI_MODEL",    "gpt-4o-mini")
     ANTHROPIC_MODEL: str        = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
     AI_MAX_TOKENS: int          = _env_int("AI_MAX_TOKENS", "1000")
-    AI_TIMEOUT_SECS: float      = _env_float("AI_TIMEOUT_SECS", "30")
+    # v16.3 FIX R9-C2 (ROOT CAUSE). gunicorn's DEFAULT worker timeout is 30s
+    # and the start command sets no --timeout, so the old 30s AI budget raced
+    # the worker reaper dead even. When Gemini ran slow — and it was already
+    # visibly degrading at 5.6s and 9.5s per reply — gunicorn killed the worker
+    # mid-request. A killed worker drops the socket with no HTTP status at all,
+    # which is precisely the browser-side "Can't reach the engine" seen in the
+    # red-team session, and why it looked like a crash from the payload rather
+    # than a timeout. Budget now sits well under the worker timeout set in
+    # gunicorn.conf.py, so the engine always wins the race and can return its
+    # own graceful degraded reply instead of vanishing.
+    AI_TIMEOUT_SECS: float      = _env_float("AI_TIMEOUT_SECS", "20")
 
     # ── WhatsApp Cloud API ──
     WHATSAPP_TOKEN: str         = os.getenv("WHATSAPP_TOKEN", "")
@@ -4790,6 +4800,42 @@ def _user_lang(customer_id: str, uid: str, text: str = "") -> str:
     return cfg.DEFAULT_LANG if cfg.DEFAULT_LANG in _L10N_SUPPORTED else "en"
 
 
+# ── v16.3 · FIX R9-C1 (INGRESS HARDENING) ────────────────────────────────────
+# Context, because this one is easy to get wrong in a way that looks right.
+# A red-team message ("John'; DROP TABLE patients;--") appeared to take the
+# engine down, and the obvious reading is SQL injection. It is not: every
+# query here is parameterised, and the payload was replayed against this build
+# — 200 OK, all 12 tables intact, the string stored as literal text. Stripping
+# quotes and semicolons would therefore buy no safety at all while corrupting
+# every legitimate O'Brien, D'Souza and Naik-Patil that ever books a slot.
+#
+# What DOES need removing is the class of bytes that breaks storage and logs
+# rather than SQL:
+#   • NUL (0x00) — psycopg2 refuses to adapt a string containing it, so the
+#     insert raises before it ever reaches Postgres. SQLite accepts it happily,
+#     which is exactly why local testing cannot see this. Same shape as the
+#     HF1 bug that only surfaced on the live database.
+#   • other C0/C1 control characters — corrupt JSON log lines and terminal
+#     output, and serve no purpose in a patient message.
+#   • bidi/zero-width overrides (U+202A-E, U+2066-9, U+200B-F) — invisible
+#     characters that let a message render one way to a human reviewer and
+#     another way to the model.
+# Newlines and tabs stay: patients format addresses with them.
+_CTRL_CHARS_RE = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def scrub_inbound(text: Any) -> str:
+    """Make inbound text safe to STORE and LOG. Not a SQL defence — that is
+    what parameterised queries are for, and they already work."""
+    if not text:
+        return ""
+    out = _CTRL_CHARS_RE.sub("", str(text))
+    # NFC keeps Indic matras composed (see v15g4 FIX A1) and collapses the
+    # look-alike codepoints used to smuggle homoglyph clinic names.
+    return unicodedata.normalize("NFC", out).strip()
+
+
 def _norm_text(text):
     """Lowercase + strip punctuation → stable matching.
     v15g4 FIX A1 (CRITICAL, root-cause): Indic matras and virama are Unicode
@@ -5938,7 +5984,7 @@ class ChatRequestValidator(BaseModel):
     @field_validator("message", "session_id", mode="before")
     @classmethod
     def strip_str(cls, v: Any) -> str:
-        return str(v).strip() if v else ""
+        return scrub_inbound(v)          # v16.3 FIX R9-C1
 
 
 class CRMContactValidator(BaseModel):
@@ -9709,7 +9755,7 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
             return
 
         if msg_type == "text":
-            user_text = msg.get("text", {}).get("body", "").strip()
+            user_text = scrub_inbound(msg.get("text", {}).get("body", ""))  # R9-C1
             if not user_text:
                 return
             # #40: bound text before any regex / classification work
