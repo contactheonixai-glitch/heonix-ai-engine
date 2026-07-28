@@ -1074,6 +1074,18 @@ class Config:
     # the 24-hour window (error 131047) — an emergency alert could silently
     # die. Create ONE approved utility template with a single {{1}} body
     # parameter (e.g. name it "heonix_owner_alert", body: "{{1}}") and set:
+    # v16.5 R11-H1: booking alerts mask the patient number by default, matching
+    # every other owner alert in this file. A clinic running the AI on a SEPARATE
+    # line has no patient chat to look the number up in, so they can flip this —
+    # deliberately opt-in, because it puts patient PII into a WhatsApp thread.
+    # v16.6 R12-H1: a CAP, deliberately not a hard "one booking per number".
+    # One number legitimately books for a family — a mother holding slots for
+    # two children, a follow-up booked alongside a checkup. Blocking the second
+    # booking would break real patients to stop a rare prankster. Three lets
+    # families through and still stops anyone hoarding a clinic's day.
+    MAX_ACTIVE_BOOKINGS_PER_PHONE: int = min(50, max(1,
+        _env_int("MAX_ACTIVE_BOOKINGS_PER_PHONE", 3)))
+    OWNER_ALERT_FULL_PHONE: bool   = _env_bool("OWNER_ALERT_FULL_PHONE", False)
     OWNER_ALERT_TEMPLATE: str      = os.getenv("OWNER_ALERT_TEMPLATE", "")
     OWNER_ALERT_TEMPLATE_LANG: str = os.getenv("OWNER_ALERT_TEMPLATE_LANG", "en")
     # #2: set STRICT_PROD=1 to REFUSE booting without Postgres + Redis
@@ -4272,7 +4284,40 @@ BUSINESS_TEMPLATES: Dict[str, Dict] = {
         ),
     },
     "healthcare": {
-        "keywords": ["clinic", "health", "doctor", "medical", "hospital", "dental", "pharmacy", "wellness", "patient"],
+        "keywords": [
+            # v16.4 FIX R10-C1 (SAFETY). The original nine words missed seven
+            # of twenty real clinic types tested on 26-Jul: physiotherapy,
+            # IVF/fertility, diagnostic lab, dialysis, homeopathy, maternity
+            # nursing home and oncology all fell through to ELITE — whose
+            # prompt carries NO diagnosis/prescription refusal and NO
+            # anti-fabrication rule. For a healthcare business that is a
+            # safety gap, not a branding one. Deliberately excluded: bare
+            # "lab"/"labs" (AI Lab, design lab) and "care" (car care, pet
+            # care, customer care) — healthcare is checked FIRST, so a
+            # false positive there hijacks every other vertical.
+            "clinic", "clinics", "health", "healthcare", "doctor", "doctors",
+            "medical", "medicine", "medicines", "hospital", "hospitals",
+            "dental", "dentist", "dentistry", "pharmacy", "pharmacies",
+            "wellness", "patient", "patients",
+            # specialities that carry no generic healthcare word
+            "physiotherapy", "physio", "rehab", "rehabilitation",
+            "ivf", "fertility", "maternity", "obstetrics", "gynaecology",
+            "gynecology", "paediatric", "pediatric", "dermatology",
+            "cardiology", "neurology", "psychiatry", "orthopaedic",
+            "orthopedic", "oncology", "cancer", "chemotherapy", "dialysis",
+            "nephrology", "urology", "gastroenterology", "pulmonology",
+            "endocrinology", "rheumatology",
+            # diagnostics and procedures
+            "diagnostic", "diagnostics", "pathology", "radiology", "imaging",
+            "ultrasound", "sonography", "endoscopy", "biopsy", "vaccination",
+            "immunisation", "immunization",
+            # traditional and allied systems
+            "homeopathy", "homeopathic", "ayurveda", "ayurvedic", "siddha",
+            "unani", "naturopathy", "physician", "surgeon", "surgery",
+            "surgical", "nursing", "nurse", "therapist", "therapy",
+            "optical", "optometry", "optician", "ophthalmology",
+            "veterinary", "orthodontic", "endodontic", "periodontal",
+        ],
         "bot_name": "HELIO",
         "prompt": (
             "You are HELIO, a compassionate AI health assistant for \"{name}\". "
@@ -4341,7 +4386,13 @@ def detect_business_type(description: str) -> str:
     emergency classifier uses) + an explicit priority order with healthcare
     first — for a clinics-first product, ties break toward HELIO."""
     norm  = _norm_text(description)
-    order = ("healthcare", "legal", "education", "restaurant", "ecommerce", "saas")
+    # v16.4 FIX R10-M1: ecommerce sat before saas, and its keyword list holds
+    # the very generic "product" and "order" — so "our software product" was
+    # claimed by PULSE before APEX was ever consulted. saas keywords
+    # (software, saas, platform, api, dashboard) are far more specific, so it
+    # goes first. restaurant still precedes both, keeping "food delivery app"
+    # on NOVA where it belongs.
+    order = ("healthcare", "legal", "education", "restaurant", "saas", "ecommerce")
     extra = tuple(k for k in BUSINESS_TEMPLATES
                   if k not in order and k != "default")
     for btype in order + extra:
@@ -4590,6 +4641,16 @@ _L10N: Dict[str, Dict[str, str]] = {
                "சமீபத்தியதை பார்க்க 'my appointment' என அனுப்பவும்."),
         "hi": ("वह अपॉइंटमेंट पहले ही बदल चुका है — नवीनतम देखने के लिए "
                "'my appointment' भेजें।"),
+    },
+    "booking_limit": {
+        "en": ("You already have {n} upcoming appointments on this number. "
+               "Reply 'my appointment' to see or change them, or call the "
+               "clinic if you need another one."),
+        "ta": ("\u0b87\u0ba8\u0bcd\u0ba4 \u0ba8\u0bae\u0bcd\u0baa\u0bb0\u0bbf\u0bb2\u0bcd \u0b8f\u0bb1\u0bcd\u0b95\u0ba9\u0bb5\u0bc7 {n} \u0b85\u0baa\u0bcd\u0baa\u0bbe\u0baf\u0bcd\u0ba3\u0bcd\u0b9f\u0bcd\u0bae\u0bc6\u0ba9\u0bcd\u0b9f\u0bcd "
+               "\u0b89\u0bb3\u0bcd\u0bb3\u0ba9. \u0b85\u0bb5\u0bb1\u0bcd\u0bb1\u0bc8\u0baa\u0bcd \u0baa\u0bbe\u0bb0\u0bcd\u0b95\u0bcd\u0b95 \u0b85\u0bb2\u0bcd\u0bb2\u0ba4\u0bc1 \u0bae\u0bbe\u0bb1\u0bcd\u0bb1 'my appointment' \u0b8e\u0ba9 "
+               "\u0b85\u0ba9\u0bc1\u0baa\u0bcd\u0baa\u0bb5\u0bc1\u0bae\u0bcd. \u0bae\u0bc7\u0bb2\u0bc1\u0bae\u0bcd \u0ba4\u0bc7\u0bb5\u0bc8\u0baf\u0bc6\u0ba9\u0bbf\u0ba9\u0bcd clinic-\u0b90 \u0ba4\u0bca\u0b9f\u0bb0\u0bcd\u0baa\u0bc1 \u0b95\u0bca\u0bb3\u0bcd\u0bb3\u0bb5\u0bc1\u0bae\u0bcd."),
+        "hi": ("\u0907\u0938 \u0928\u0902\u092c\u0930 \u092a\u0930 \u092a\u0939\u0932\u0947 \u0938\u0947 {n} \u0905\u092a\u0949\u0907\u0902\u091f\u092e\u0947\u0902\u091f \u0939\u0948\u0902\u0964 "
+               "\u0926\u0947\u0916\u0928\u0947 \u092f\u093e \u092c\u0926\u0932\u0928\u0947 \u0915\u0947 \u0932\u093f\u090f 'my appointment' \u092d\u0947\u091c\u0947\u0902\u0964"),
     },
     "keep_unchanged": {
         "en": "👍 No problem — your appointment is unchanged.",
@@ -5567,6 +5628,27 @@ _VENDOR_RULE = (
      "and never name the underlying model. Never raise this unprompted.")
     if VENDOR_NAME else "")
 
+# ── v16.4 · FIX R10-C2 (CRITICAL, CROSS-VERTICAL) ───────────────────────────
+# Measured 26-Jul: the healthcare prompt is 793 chars and carries "never
+# invent the clinic name, address, doctor name, fees or timings" plus the
+# diagnosis/prescription refusal. The default (ELITE) prompt is 258 chars and
+# carries NEITHER — and NOVA, PULSE, SAGE, APEX and LEX are no better. So the
+# exact defect class that produced "Smile Care Dental at RS Puram" was fixed
+# for clinics only, while every other vertical shipped wide open.
+#
+# Rather than paste the rule into seven templates and let them drift apart,
+# it becomes universal — one rule, appended to every prompt, phrased in
+# business-neutral language. The healthcare template keeps its own stricter
+# medical wording on top; this is the floor, not the ceiling.
+_INTEGRITY_RULE = (
+    "\n\nFACTUAL INTEGRITY: the ONLY facts you have about this business are "
+    "the ones stated in this prompt. Never invent or guess a business name, "
+    "address, branch, phone number, price, package, staff or owner name, "
+    "qualification, timing, or availability. If you are asked for something "
+    "not stated above, say plainly that you don't have that detail confirmed "
+    "and offer to have the business confirm it. A wrong detail sends a "
+    "customer to the wrong place \u2014 saying 'I'll check' is always better.")
+
 _LANGUAGE_RULE = ("\n\nLANGUAGE: Always reply in the same language and script "
                   "the user used, no matter which language it is.")
 # v16.1 GEN-6 FIX R7-M1b: asked about news / world events, the model invented
@@ -5733,15 +5815,73 @@ def _cache_hour_seed(base: str) -> str:
 # the model names a business whose distinctive word is not this clinic's, the
 # turn is refused instead of sent. The failure this exists to prevent is a
 # patient walking to another clinic's address.
+# v16.4 FIX R10-C3b: every word in _BIZ_TAIL below MUST also appear here.
+# A tail word is a business-TYPE word, never a brand word — but the guard
+# only knew the healthcare ones, so when "Physiotherapy" was added to the
+# tail list it was still being scored as distinctive. Result: own="Haroon
+# Physiotherapy" vs impostor="Prime Rehab Physiotherapy" shared the token
+# {physiotherapy}, the sets intersected, and the impostor passed. Caught by
+# the cross-vertical guard matrix on 26-Jul. Keep the two lists in sync.
 _GENERIC_BIZ_WORDS = {
+    # healthcare
     "dental", "dentistry", "clinic", "clinics", "hospital", "hospitals",
     "polyclinic", "medical", "medicals", "centre", "center", "care",
     "health", "healthcare", "diagnostics", "nursing", "home", "speciality",
-    "specialty", "multispeciality", "multispecialty", "the", "and", "for",
+    "specialty", "multispeciality", "multispecialty",
+    "physiotherapy", "ayurveda", "homeopathy", "labs", "scans", "fertility",
+    # restaurant / hospitality
+    "restaurant", "restaurants", "cafe", "café", "caf", "bakery", "bakes",
+    # "caf" because _distinctive_tokens matches [A-Za-z] only, so it
+    # tokenises "Café" as "caf" — without this, two different cafés
+    # share a token and the impostor slips through (R10-C3c).
+    "kitchen", "kitchens", "hotel", "hotels", "resort", "resorts", "dhaba",
+    "mess", "biryani", "tiffin",
+    # education
+    "school", "schools", "academy", "college", "institute", "institution",
+    "tuition", "tuitions", "coaching", "learning",
+    # legal
+    "associates", "advocates", "law", "firm", "legal", "chambers",
+    # retail
+    "store", "stores", "mart", "supermarket", "boutique", "showroom",
+    "emporium", "traders",
+    # tech
+    "technologies", "software", "softwares", "solutions", "systems",
+    "digital",
+    # ELITE service businesses
+    "gym", "fitness", "salon", "spa", "studio", "studios", "motors",
+    "garage", "builders", "construction", "constructions", "properties",
+    "realtors", "realty", "travels", "tours", "packers", "movers",
+    "interiors", "enterprises", "agencies", "services",
+    # connectives
+    "the", "and", "for",
 }
-_BIZ_TAIL = (r"Dental|Dentistry|Clinic|Clinics|Hospital|Hospitals|Polyclinic|"
-             r"Diagnostics|Nursing\s+Home|Medical\s+Cent(?:re|er)|"
-             r"Health\s+Cent(?:re|er)|Care\s+Cent(?:re|er)")
+# v16.4 FIX R10-C3: this list decided WHICH business names the guard can even
+# see, and it only knew healthcare words — live-tested 26-Jul, a restaurant
+# persona naming a rival restaurant passed straight through while the
+# identical clinic case blocked. Every vertical the engine sells to now has
+# vocabulary here, or its guard is decoration.
+_BIZ_TAIL = (
+    # healthcare
+    r"Dental|Dentistry|Clinic|Clinics|Hospital|Hospitals|Polyclinic|"
+    r"Diagnostics|Labs|Scans|Physiotherapy|Ayurveda|Homeopathy|"
+    r"Nursing\s+Home|Medical\s+Cent(?:re|er)|Health\s+Cent(?:re|er)|"
+    r"Care\s+Cent(?:re|er)|Fertility\s+Cent(?:re|er)|"
+    # restaurant / hospitality  (NOVA)
+    r"Restaurant|Restaurants|Cafe|Café|Bakery|Bakes|Kitchen|Kitchens|"   # noqa: RUF001 — literal é, not an escape (R10-C3c)
+    r"Hotel|Hotels|Resort|Resorts|Dhaba|Mess|Biryani|Tiffin\s+Cent(?:re|er)|"
+    # education  (SAGE)
+    r"School|Schools|Academy|College|Institute|Institution|Tuitions?|"
+    r"Coaching\s+Cent(?:re|er)|Learning\s+Cent(?:re|er)|"
+    # legal  (LEX)
+    r"Associates|Advocates|Law\s+Firm|Legal\s+Services|Chambers|"
+    # retail / ecommerce  (PULSE)
+    r"Stores?|Mart|Supermarket|Boutique|Showroom|Emporium|Traders|"
+    # saas / tech  (APEX)
+    r"Technologies|Softwares?|Solutions|Systems|Labs\.|Digital|"
+    # ELITE catch-all: the service businesses that actually land on default
+    r"Gym|Fitness\s+Cent(?:re|er)|Salon|Spa|Studio|Studios|Motors|Garage|"
+    r"Builders|Constructions?|Properties|Realtors|Realty|Travels|Tours|"
+    r"Packers|Movers|Interiors|Enterprises|Agencies|Services")
 # At least one Capitalised word must precede the tail, so a generic mention
 # ("please contact the clinic", "go to a hospital") never trips the guard.
 _BIZ_NAME_RE = re.compile(r"\b((?:[A-Z][\w&'\u2019.-]*\s+){1,3}(?:" + _BIZ_TAIL + r"))\b")
@@ -5900,7 +6040,7 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
         sys_prompt += ("\n\nRELEVANT MEMORY from earlier chats with this same "
                        "person (use naturally, don't recite):\n" + memory)
     sys_prompt += (_LANGUAGE_RULE + _ESCALATION_RULE + _SCOPE_RULE
-                   + _VENDOR_RULE)                      # R7-M1b / R8-L1
+                   + _VENDOR_RULE + _INTEGRITY_RULE)    # R7-M1b / R8-L1 / R10-C2
     # v16.2 FIX R8-M1: observed 22-Jul \u2014 a pure-English "What is your root
     # canal fee?" got a Tamil reply because the standing rule competes with
     # the Tamil conversation history. Naming THIS turn's language explicitly
@@ -7513,14 +7653,57 @@ def booking_available_slots(customer_id: str, limit: int) -> List[Tuple[datetime
     return out
 
 
+def booking_active_count_for_phone(customer_id: str, phone: str,
+                                   exclude_id=None) -> int:
+    """How many upcoming slots this number already holds at this clinic.
+    exclude_id lets a RESCHEDULE ignore the slot it is about to replace —
+    without it, a patient at the cap could never move their appointment."""
+    phash   = _crm_phone_hash(customer_id, phone)
+    now_iso = datetime.now(timezone.utc).isoformat()
+    try:
+        with _db_pool.get(read_only=True) as conn:
+            if exclude_id:
+                cur = _execute(conn,
+                    "SELECT COUNT(*) FROM bookings WHERE customer_id=? AND "
+                    "phone_hash=? AND status='booked' AND slot_start >= ? AND id != ?",
+                    (customer_id, phash, now_iso, exclude_id))
+            else:
+                cur = _execute(conn,
+                    "SELECT COUNT(*) FROM bookings WHERE customer_id=? AND "
+                    "phone_hash=? AND status='booked' AND slot_start >= ?",
+                    (customer_id, phash, now_iso))
+            row = cur.fetchone()
+            return int(row[0]) if row else 0
+    except Exception as exc:
+        # v16.6 R12-H1: fail OPEN. A counting outage must not stop a real
+        # patient from booking — the cap exists to blunt a nuisance, not to
+        # gate care. The overlap guard below still prevents double-booked slots.
+        log.warning(f"\u26a0\ufe0f  active-booking count failed (cust={customer_id}): {exc}")
+        return 0
+
+
 def booking_create(customer_id: str, phone: str, name: str,
-                   start_iso: str, end_iso: str, source: str = "whatsapp") -> str:
-    """Insert a booking. Returns 'ok' | 'conflict' | 'error'.
+                   start_iso: str, end_iso: str, source: str = "whatsapp",
+                   replacing_id=None) -> str:
+    """Insert a booking. Returns 'ok' | 'conflict' | 'limit' | 'error'.
     v15g2 FIX L5: EVERY exception used to be reported as a slot conflict, so a
     DB outage told the patient 'sorry, that slot was just taken'. A unique-index
     violation (uq_book_slot, the race-safe guard) is 'conflict'; anything else
     is an infrastructure 'error' and is logged loudly. ('ok' stays truthy, so
     any legacy truthiness check keeps working.)"""
+    # v16.6 FIX R12-H1: audited 26-Jul — ONE number could hold unlimited
+    # slots. booking_create never counted, and handle_booking only looked for
+    # an existing appointment on a RESCHEDULE, so repeating "book pannunga"
+    # just handed out another slot every time. A single number could take a
+    # clinic's whole day. The cap lives here, at the DB chokepoint every path
+    # funnels through, so no future caller can bypass it by accident.
+    _held = booking_active_count_for_phone(customer_id, phone,
+                                           exclude_id=replacing_id)
+    if _held >= cfg.MAX_ACTIVE_BOOKINGS_PER_PHONE:
+        analytics.inc("booking.limit_blocked")
+        log.info(f"\U0001f6d1 booking cap hit (cust={customer_id}, "
+                 f"holds={_held}, cap={cfg.MAX_ACTIVE_BOOKINGS_PER_PHONE})")
+        return "limit"
     phash = _crm_phone_hash(customer_id, phone)
     now   = _now()
     try:
@@ -7764,7 +7947,8 @@ def _booking_status_text(b: Optional[Dict], lang: str = "en") -> str:
 
 def handle_booking(brain: Dict, from_phone: str, user_text: str,
                    out_pid: str, out_tok: str, customer_id: str,
-                   session_id: str, subject_name: str = "") -> bool:
+                   session_id: str, subject_name: str = "",
+                   channel: str = "whatsapp") -> bool:   # v16.5 R11-H1
     """Deterministic booking state machine. Returns True if it handled the
     message (caller should then stop). Returns False to let the normal AI run.
     v14g5 FIX 12: a RESCHEDULE no longer cancels the existing appointment up-front;
@@ -7776,6 +7960,8 @@ def handle_booking(brain: Dict, from_phone: str, user_text: str,
     offer_key  = f"bk_offer:{customer_id}:{from_phone}"
     cancel_key = f"bk_cancel:{customer_id}:{from_phone}"   # v15g2 FIX C2b
     booked_ok  = False                                     # v16 U3
+    _owner_event = ""      # v16.5 R11-H1: "new" | "rescheduled" | "cancelled"
+    _owner_slot  = ""      # set together with _owner_event, never alone
     text      = (user_text or "").strip()
     low       = text.lower()
     lang      = _user_lang(customer_id, from_phone, text)  # v16g4 FIX M8
@@ -7806,6 +7992,8 @@ def handle_booking(brain: Dict, from_phone: str, user_text: str,
                 # v16g4 FIX M5: only claim "Cancelled" when the row actually
                 # transitioned — a DB blip no longer lies to the patient.
                 if booking_cancel_by_id(b["id"]):
+                    _owner_event = "cancelled"                # v16.5 R11-H1
+                    _owner_slot  = b["slot_start"]
                     action = ("text", _t("cancelled_ok", lang,
                                          when=_fmt_local_dt(b['slot_start'])))
                 else:
@@ -7847,6 +8035,16 @@ def handle_booking(brain: Dict, from_phone: str, user_text: str,
             # branch of the state machine.
             _booking_dispatch(action, from_phone, out_pid, out_tok, customer_id,
                               session_id, user_text, lang=lang)
+            # v16.7 FIX R13-H1: the confirm-window has its OWN dispatch and
+            # returns here, so it never reached the notifier in the shared tail
+            # below — the R11 cancellation alert set its flag and was then
+            # thrown away. The doctor's slot silently freed up with no message.
+            # Missed by the R11 tests because they asserted "handle_booking
+            # CALLS notify_owner_booking" via AST, which was true of the other
+            # path; only driving a real cancel end-to-end exposed it.
+            if _owner_event:
+                notify_owner_booking(brain, _owner_event, subject_name,
+                                     from_phone, _owner_slot, channel=channel)
             return True
 
     # v16g3 FIX R3-M5: a "No, keep it" tap landing AFTER the 5-min confirm
@@ -7923,7 +8121,8 @@ def handle_booking(brain: Dict, from_phone: str, user_text: str,
             elif pick is not None and 1 <= pick <= len(offers):
                 start_iso, end_iso = offers[pick - 1]
                 res = booking_create(customer_id, from_phone, subject_name,
-                                     start_iso, end_iso)
+                                     start_iso, end_iso,
+                                     replacing_id=prev_id)   # v16.6 R12-H1
                 if res == "ok":
                     brain_cache.delete(offer_key)
                     # only NOW retire the old slot — the reschedule has succeeded
@@ -7939,8 +8138,23 @@ def handle_booking(brain: Dict, from_phone: str, user_text: str,
                     _msg_key = ("booked_rescheduled" if (prev_id and _retired)
                                 else "booked_confirmed")
                     booked_ok = True                       # v16 U3
+                    # v16.5 R11-H1: reuse the SAME condition the patient's
+                    # confirmation rides on, so the owner is told exactly when
+                    # (and only when) a row really moved.
+                    _owner_event = ("rescheduled" if (prev_id and _retired)
+                                    else "new")
+                    _owner_slot  = start_iso
                     action = ("text", _t(_msg_key, lang,
                                          when=_fmt_local_dt(start_iso)))
+                elif res == "limit":
+                    # v16.6 R12-H1: reached only from a stale offer — the
+                    # pre-check below normally stops this before slots are
+                    # ever shown. Clear the offer so they are not stuck.
+                    brain_cache.delete(offer_key)
+                    _held = booking_active_count_for_phone(customer_id, from_phone)
+                    action = ("text", _t("booking_limit", lang, n=_held))
+                    notify_owner_booking(brain, "limit_hit", subject_name,
+                                         from_phone, "", channel=channel)
                 elif res == "conflict":
                     # v15g4 FIX B10: if the "taken" slot is the patient's OWN
                     # current appointment (rescheduling onto the time they
@@ -8012,13 +8226,30 @@ def handle_booking(brain: Dict, from_phone: str, user_text: str,
                 # FIX 12: capture (do NOT cancel) the current appointment.
                 existing = booking_upcoming_for_phone(customer_id, from_phone)
                 prev_id  = existing["id"] if existing else None
-            action = _booking_offer_action(customer_id, prev_id=prev_id,
-                                           lang=lang)   # v16g4 FIX M8
+            # v16.6 R12-H1: check BEFORE showing times. Offering a slot list
+            # and then refusing the pick is a bad way to tell someone they are
+            # at the limit. A reschedule replaces rather than adds, so it is
+            # never pre-checked.
+            _held = (0 if intent == "reschedule"
+                     else booking_active_count_for_phone(customer_id, from_phone))
+            if _held >= cfg.MAX_ACTIVE_BOOKINGS_PER_PHONE:
+                analytics.inc("booking.limit_prechecked")
+                action = ("text", _t("booking_limit", lang, n=_held))
+                notify_owner_booking(brain, "limit_hit", subject_name,
+                                     from_phone, "", channel=channel)
+            else:
+                action = _booking_offer_action(customer_id, prev_id=prev_id,
+                                               lang=lang)   # v16g4 FIX M8
 
     if action is None:
         return False
     _booking_dispatch(action, from_phone, out_pid, out_tok, customer_id,
                       session_id, user_text, lang=lang)   # v16g4 FIX M8
+    # v16.5 R11-H1: patient first, owner second — the confirmation the patient
+    # is waiting on never queues behind a notification.
+    if _owner_event:
+        notify_owner_booking(brain, _owner_event, subject_name, from_phone,
+                             _owner_slot, channel=channel)
     if booked_ok:
         # v16 U3: booking secured → if this patient is username-only (BSUID)
         # and we hold no real number, ask exactly once. Reminders need it;
@@ -8048,6 +8279,58 @@ def _booking_offer_action(customer_id: str, note: str = "", prev_id=None,
             for s, e in slots]                        # v16g2 FIX C4: unused `i`
     body = ((note + "\n\n") if note else "") + _t("offer_header", lang)
     return ("list", body, rows, {"slots": offers, "prev_id": prev_id})
+
+
+# ── v16.5 · FIX R11-H1 (REVENUE-CRITICAL) ────────────────────────────────────
+# Audited 26-Jul: owner alerts fired for emergencies, human-handoff requests,
+# VIP leads and AI escalations — but NEVER for an actual booking. handle_booking
+# does not call send_owner_alert_async at all. So the assistant could fill a
+# doctor's whole day and the doctor would learn about it only by calling a JSON
+# admin endpoint with a JWT, which no clinic owner will ever do.
+#
+# That is the first question every prospect asks — "fine, but how do I see the
+# appointments?" — and "check the API" is not an answer. The alert goes to the
+# place they already live: their own WhatsApp.
+#
+# Failure here must never cost the booking: the send is fire-and-forget and the
+# whole call is wrapped, because a notification problem is not a booking problem.
+_BOOKING_EVENT_LINES = {
+    "new":         "\U0001f4c5 NEW BOOKING",
+    "rescheduled": "\U0001f501 RESCHEDULED",
+    "cancelled":   "\u274c CANCELLED",
+    # v16.6 R12-H1: not a diary change — a heads-up that one number is trying
+    # to take a fourth slot. This is the signal a doctor actually wants when
+    # they ask "what if someone prank-books me?".
+    "limit_hit":   "\u26a0\ufe0f BOOKING LIMIT HIT \u2014 this number tried to book again",
+}
+
+
+def notify_owner_booking(brain: Dict, event: str, subject_name: str,
+                         patient_phone: str, slot_iso: str,
+                         channel: str = "whatsapp") -> None:
+    """Tell the clinic owner, on WhatsApp, that their diary just changed."""
+    try:
+        # v16g2 FIX M9 precedent: a public demo must never page a real owner.
+        # handle_booking is currently reachable only from the WhatsApp webhook,
+        # so this is belt-and-braces for whoever wires it up next.
+        if channel == "api":
+            return
+        owner = (brain.get("owner_phone") or "").strip()
+        if not owner:
+            return
+        head = _BOOKING_EVENT_LINES.get(event, _BOOKING_EVENT_LINES["new"])
+        who  = (subject_name or "").strip() or "Patient"
+        num  = (patient_phone if cfg.OWNER_ALERT_FULL_PHONE
+                else pii_vault.mask(patient_phone))
+        when = _fmt_local_dt(slot_iso) if slot_iso else ""
+        when = ("was " + when) if (event == "cancelled" and when) else when
+        body = f"{head}\n{who} \u00b7 {num}" + (f"\n{when}" if when else "")
+        _opid, _otok = brain_wa_creds(brain)
+        send_owner_alert_async(owner, body, _opid, _otok,
+                               brain.get("customer_id", ""))
+        analytics.inc(f"owner_alert.booking_{event}")
+    except Exception as exc:                       # never break a booking
+        log.warning(f"\u26a0\ufe0f  booking owner-alert failed ({event}): {exc}")
 
 
 def _booking_dispatch(action: Tuple, from_phone: str, out_pid: str, out_tok: str,
@@ -10045,7 +10328,8 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
         # a hallucinated time or double-booked slot.
         if cfg.ENABLE_BOOKING and handle_booking(
                 brain, from_phone, user_text, out_pid, out_tok, customer_id,
-                session_id, subject_name=profile_name):
+                session_id, subject_name=profile_name,
+                channel="whatsapp"):                     # v16.5 R11-H1
             return
 
         history = get_session_history(session_id)
