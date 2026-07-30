@@ -4328,6 +4328,20 @@ BUSINESS_TEMPLATES: Dict[str, Dict] = {
             "instead say you will check and confirm, or ask the patient to contact the clinic directly. "
             "Answer general health queries and help schedule appointments with empathy and clarity. "
             "NEVER provide diagnoses or prescribe treatments. "
+            # v16.8 FIX R14-C1. Observed twice: asked \"I am 5 months pregnant,
+            # is a dental X-ray safe?\" and \"I have a pacemaker, is an
+            # ultrasonic scaler safe?\", HELIO answered with clinical safety
+            # verdicts — lead aprons, which scalers interfere, whether
+            # antibiotic prophylaxis is needed. None of that is a diagnosis or
+            # a prescription, so the rule above did not reach it. Naming the
+            # category explicitly is what closes the vocabulary gap.
+            "NEVER judge whether any procedure, X-ray, anaesthetic, medicine or "
+            "device is safe, unsafe, required or not required for a patient who "
+            "has told you about a medical condition, pregnancy, implant, "
+            "pacemaker, allergy or ongoing medication. That judgement belongs to "
+            "the treating doctor who can see the full history. Say clearly that "
+            "you cannot advise on it, tell them to raise it with the doctor "
+            "(and their specialist where relevant), and offer to book. "
             "Always recommend a licensed professional for serious concerns. "
             "All data is handled per DPDP Act / HIPAA compliance. "
             "Always respond in the same language the user writes in."
@@ -6000,6 +6014,91 @@ def _guard_unbacked_action_claim(reply: str, user_text: str) -> Tuple[str, bool]
     return table.get(lang, table["en"]), True
 
 
+# ── v16.8 · FIX R14-C2 (PATIENT SAFETY) ──────────────────────────────────────
+# Prompt rules are requests; the R14-C1 wording above is a request too, and the
+# previous version of it was ignored twice on exactly this topic — once giving
+# a pregnant patient X-ray guidance, once telling a pacemaker patient which
+# drills are safe. Worse, the pacemaker question was asked twice nine minutes
+# apart and answered correctly once and unsafely once: prompt compliance is
+# probabilistic, so a doctor testing the demo cannot be shown a stable answer.
+#
+# Detection needs THREE signals together, because any one alone is harmless:
+#   1. the PATIENT disclosed a condition/state (pregnancy, pacemaker, blood
+#      thinner, diabetes, implant, chemo...),
+#   2. the REPLY reaches a safety verdict ("is safe", "not required",
+#      "avoid", "romba safe"...), and
+#   3. the REPLY names a procedure, drug or device the verdict is about.
+# All three means a clinical judgement about THIS patient. Any fewer means
+# ordinary conversation — "it is safe to come during working hours" must pass.
+#
+# Both directions are refused. "Unsafe / avoid it" is not the cautious side:
+# talking a patient out of needed treatment is its own harm.
+_PATIENT_CONDITION_TERMS = (
+    "pregnan", "\u0b95\u0bb0\u0bcd\u0baa\u0bcd\u0baa", "garbh", "conceive", "trimester", "breastfeed",
+    "pacemaker", "stent", "bypass", "heart condition", "cardiac", "cardiolog",
+    "blood thinner", "warfarin", "aspirin", "anticoagul",
+    "diabet", "sugar level", "\u0b9a\u0bb0\u0bcd\u0b95\u0bcd\u0b95\u0bb0\u0bc8",
+    "bp ", "blood pressure", "hypertens", "thyroid",
+    "asthma", "epilep", "seizure", "kidney", "dialysis", "liver", "hepatit",
+    "cancer", "chemo", "radiation therapy", "tumour", "tumor",
+    "hiv", "immune", "transplant", "implant", "prosthe",
+    "allerg", "penicillin", "anaesthes", "anesthes",
+    "on medication", "medicine eduthu", "tablet eduthu", "maruthu",
+)
+_SAFETY_VERDICT_TERMS = (
+    "is safe", "are safe", "safe to", "safe-ah", "safe-dhan", "safe dhan",
+    "generally safe", "completely safe", "perfectly safe", "romba safe",
+    "not safe", "unsafe", "should avoid", "must avoid", "avoid taking",
+    "do not require", "does not require", "not required", "no need for",
+    "is required", "you will need", "recommended for you", "contraindicat",
+    "\u0baa\u0bbe\u0ba4\u0bc1\u0b95\u0bbe\u0baa\u0bcd", "\u0b86\u0baa\u0ba4\u0bcd\u0ba4\u0bc1", "\u0ba4\u0bb5\u0bbf\u0bb0\u0bcd\u0b95\u0bcd\u0b95",
+)
+_PROCEDURE_TERMS = (
+    "x-ray", "xray", "scan", "ct ", "mri", "radiograph",
+    "anaesthe", "anesthe", "sedation", "injection",
+    "antibiotic", "prophylax", "painkiller", "tablet", "medicine", "dose",
+    "drill", "scaler", "scaling", "cleaning", "extraction", "surgery",
+    "root canal", "implant", "crown", "filling", "whitening", "braces",
+    "treatment", "procedure",
+)
+_CLINICAL_REFERRAL_LINES = {
+    "en": ("I'm not able to advise whether that is safe in your situation — "
+           "that depends on your full medical history and only the doctor can "
+           "judge it. Please raise it with the doctor (and your specialist if "
+           "you have one). I can book you a consultation so it's checked "
+           "properly before anything is done."),
+    "ta": ("\u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bcd \u0ba8\u0bbf\u0bb2\u0bc8\u0bae\u0bc8\u0baf\u0bbf\u0bb2\u0bcd \u0b85\u0ba4\u0bc1 \u0baa\u0bbe\u0ba4\u0bc1\u0b95\u0bbe\u0baa\u0bbe\u0ba9\u0ba4\u0bbe \u0b8e\u0ba9\u0bcd\u0bb1\u0bc1 \u0b9a\u0bca\u0bb2\u0bcd\u0bb2 "
+           "\u0b8e\u0ba9\u0b95\u0bcd\u0b95\u0bc1 \u0b85\u0ba4\u0bbf\u0b95\u0bbe\u0bb0\u0bae\u0bcd \u0b87\u0bb2\u0bcd\u0bb2\u0bc8 \u2014 \u0b85\u0ba4\u0bc1 \u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bcd \u0bae\u0bc1\u0bb4\u0bc1 \u0bae\u0bb0\u0bc1\u0ba4\u0bcd\u0ba4\u0bc1\u0bb5 \u0bb5\u0bb0\u0bb2\u0bbe\u0bb1\u0bcd\u0bb1\u0bc8\u0baa\u0bcd "
+           "\u0baa\u0bca\u0bb1\u0bc1\u0ba4\u0bcd\u0ba4\u0ba4\u0bc1, \u0ba9\u0bbf\u0baa\u0bc1\u0ba3\u0bb0\u0bcd \u0bae\u0bb0\u0bc1\u0ba4\u0bcd\u0ba4\u0bb0\u0bcd \u0bae\u0b9f\u0bcd\u0b9f\u0bc1\u0bae\u0bc7 \u0bae\u0bc1\u0b9f\u0bbf\u0bb5\u0bc1 \u0b9a\u0bc6\u0baf\u0bcd\u0baf \u0bae\u0bc1\u0b9f\u0bbf\u0baf\u0bc1\u0bae\u0bcd. "
+           "\u0ba4\u0baf\u0bb5\u0bc1\u0b9a\u0bc6\u0baf\u0bcd\u0ba4\u0bc1 \u0b87\u0ba4\u0bc8 \u0bae\u0bb0\u0bc1\u0ba4\u0bcd\u0ba4\u0bb0\u0bbf\u0b9f\u0bae\u0bcd \u0b95\u0bc7\u0b9f\u0bcd\u0b9f\u0bc1\u0b9a\u0bcd \u0b9a\u0bcb\u0bb2\u0bcd\u0bb2\u0bc1\u0b99\u0bcd\u0b95\u0bb3\u0bcd. \u0bb5\u0bc7\u0ba3\u0bcd\u0b9f\u0bc1\u0bae\u0bc6\u0ba9\u0bcd\u0bb1\u0bbe\u0bb2\u0bcd "
+           "consultation appointment book \u0baa\u0ba3\u0bcd\u0ba3\u0bbf\u0ba4\u0bcd \u0ba4\u0bb0\u0bc1\u0b95\u0bbf\u0bb1\u0bc7\u0ba9\u0bcd."),
+    "hi": ("\u092e\u0948\u0902 \u092f\u0939 \u0928\u0939\u0940\u0902 \u092c\u0924\u093e \u0938\u0915\u0924\u093e \u0915\u093f \u0906\u092a\u0915\u0940 \u0938\u094d\u0925\u093f\u0924\u093f \u092e\u0947\u0902 \u092f\u0939 \u0938\u0941\u0930\u0915\u094d\u0937\u093f\u0924 \u0939\u0948 \u092f\u093e \u0928\u0939\u0940\u0902 \u2014 "
+           "\u092f\u0939 \u0921\u0949\u0915\u094d\u091f\u0930 \u0939\u0940 \u0924\u092f \u0915\u0930 \u0938\u0915\u0924\u0947 \u0939\u0948\u0902\u0964 \u0915\u0943\u092a\u092f\u093e \u0921\u0949\u0915\u094d\u091f\u0930 \u0938\u0947 \u092a\u0942\u091b\u0947\u0902\u0964"),
+}
+
+
+def _guard_clinical_safety_verdict(reply: str, brain: Dict,
+                                   user_text: str) -> Tuple[str, bool]:
+    """Refuse a safety verdict about a procedure for a patient who disclosed a
+    medical condition. Healthcare tenants only — a gym saying 'this workout is
+    safe' is not practising medicine."""
+    if not reply or not _brain_is_health(brain):
+        return reply, False
+    u, r = (user_text or "").lower(), reply.lower()
+    if not any(t in u for t in _PATIENT_CONDITION_TERMS):
+        return reply, False
+    if not any(t in r for t in _SAFETY_VERDICT_TERMS):
+        return reply, False
+    if not any(t in r for t in _PROCEDURE_TERMS):
+        return reply, False
+    log.error("\U0001f6d1 R14-C2 clinical-safety guard: reply judged a procedure "
+              "safe/unsafe for a disclosed condition \u2014 refused, not cached, "
+              "not stored.")
+    analytics.inc("guard.clinical_safety_block")
+    lang = detect_language(user_text)
+    return _CLINICAL_REFERRAL_LINES.get(lang, _CLINICAL_REFERRAL_LINES["en"]), True
+
+
 def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
                       user_uid: str, channel: str) -> Tuple[str, str, bool]:
     """
@@ -6055,9 +6154,19 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
                                      plan_tier=str(brain.get("plan_tier") or ""))  # v15g2 FIX L1
 
     # v16.1 GEN-6 FIX R7-C1: check the model's output before anyone sees it.
+    # v16.8 FIX R14-M1: every guard REPLACES the reply, and ESCALATE_TOKEN is
+    # only looked for further down — so a model reply that both escalated AND
+    # tripped a guard lost its escalation silently, and no human was ever
+    # paged. The most dangerous replies are exactly the ones most likely to do
+    # both. Remember the token first and restore it after.
+    _wanted_escalation = ESCALATE_TOKEN in reply
     reply, _identity_blocked = _guard_clinic_identity(reply, brain, user_text)
     reply, _action_blocked = _guard_unbacked_action_claim(reply, user_text)  # R8-C2
-    _identity_blocked = _identity_blocked or _action_blocked
+    reply, _safety_blocked = _guard_clinical_safety_verdict(reply, brain,
+                                                            user_text)  # R14-C2
+    _identity_blocked = _identity_blocked or _action_blocked or _safety_blocked
+    if _identity_blocked and _wanted_escalation and ESCALATE_TOKEN not in reply:
+        reply = ESCALATE_TOKEN + " " + reply
 
     escalated = ESCALATE_TOKEN in reply
     if escalated:
