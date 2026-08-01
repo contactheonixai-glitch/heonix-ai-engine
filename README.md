@@ -1,4 +1,4 @@
-# 🪐 HEONIX ULTRA ENGINE (Project JARVIS / Gen-6)
+# 🪐 HEONIX ULTRA ENGINE ( Gen-6)
 **The Ultimate Multi-Tenant Autonomous AI Middleware & Enterprise OS**
 
 ![Version](https://img.shields.io/badge/version-16.1_Gen6-blue.svg?style=for-the-badge)
