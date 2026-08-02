@@ -786,6 +786,7 @@ import os
 import queue
 import random
 import re
+import secrets                      # v16.9 R15-H2
 import signal
 import sqlite3
 import sys
@@ -925,6 +926,14 @@ def _env_bool(name: str, default: bool) -> bool:
     return bool(default)
 
 
+# v16.9 FIX R15-H2: resolved once, before Config exists, because BOTH the
+# WhatsApp and Instagram verify-token fields live inside the class body and
+# neither can reference `cfg` yet. Unset ⇒ one random per-boot token, so a
+# misconfigured webhook fails the handshake loudly instead of trusting the
+# constant that used to be published in this file.
+_WA_VERIFY_DEFAULT = os.getenv("WHATSAPP_VERIFY_TOKEN") or secrets.token_urlsafe(24)
+
+
 class Config:
     # ── Database ──
     DATABASE_MODE: str          = os.getenv("DATABASE_MODE", "postgres")
@@ -960,7 +969,12 @@ class Config:
     # ── WhatsApp Cloud API ──
     WHATSAPP_TOKEN: str         = os.getenv("WHATSAPP_TOKEN", "")
     WHATSAPP_PHONE_ID: str      = os.getenv("WHATSAPP_PHONE_ID", "")
-    WHATSAPP_VERIFY_TOKEN: str  = os.getenv("WHATSAPP_VERIFY_TOKEN", "heonix_verify")
+    # v16.9 FIX R15-H2: this defaulted to the literal "heonix_verify" — a
+    # "secret" sitting in a file that lives in a public repo, so anyone who
+    # read it could complete Meta's webhook handshake against this engine.
+    # Unset now means a random per-boot value: webhook verification fails
+    # loudly until the real token is configured, which is the safe direction.
+    WHATSAPP_VERIFY_TOKEN: str  = _WA_VERIFY_DEFAULT      # v16.9 R15-H2
     WHATSAPP_APP_SECRET: str    = os.getenv("WHATSAPP_APP_SECRET", "")
     # v15g4 FIX C8: v21.0 (Oct-2024) is inside Meta's ~2-year deprecation
     # window. v23.0 keeps a fresh default; ALWAYS verify the live version in
@@ -991,7 +1005,12 @@ class Config:
                            .encode()).hexdigest()
             if os.getenv("ENCRYPTION_KEY") else uuid.uuid4().hex))
     JWT_SECRET_KEY: str         = (os.getenv("JWT_SECRET_KEY", "")
-        or (hashlib.sha256(("heonix|jwt|" + os.getenv("ENCRYPTION_KEY", ""))
+        or (hashlib.sha256((# v16.9 FIX R15-H1: JWT_SECRET_KEY was derived from ENCRYPTION_KEY, so one
+        # leaked value gave an attacker PII decryption AND admin-token forgery
+        # AND Flask session forgery from the same string. Domain separation
+        # means a leak of one no longer implies the others; setting an explicit
+        # JWT_SECRET_KEY env var (recommended) severs the link entirely.
+        "heonix|jwt|v2|domain-separated|" + os.getenv("ENCRYPTION_KEY", ""))
                            .encode()).hexdigest()
             if os.getenv("ENCRYPTION_KEY") else uuid.uuid4().hex))
     JWT_EXPIRY_HOURS: int       = _env_int("JWT_EXPIRY_HOURS", "24")
@@ -1146,7 +1165,7 @@ class Config:
     # ── v14 Gen-5 ── (audit fixes — 50 findings closed; see header)
     # FIX 35: a separate Instagram webhook verify token (falls back to the WA one).
     INSTAGRAM_VERIFY_TOKEN: str    = (os.getenv("INSTAGRAM_VERIFY_TOKEN", "")
-                                      or os.getenv("WHATSAPP_VERIFY_TOKEN", "heonix_verify"))
+                                      or _WA_VERIFY_DEFAULT)   # R15-H2
     # FIX 23: optional token to gate /metrics so counts aren't public recon.
     METRICS_TOKEN: str             = os.getenv("METRICS_TOKEN", "")
     # FIX 10: gate the "route any unknown number to the only clinic" guess.
@@ -5046,6 +5065,45 @@ _EMERGENCY_KW_UNIVERSAL = [
     "thatkolai", "vibathu",
     "விபத்து", "தற்கொலை", "மூச்சு வாங்க", "மூச்சு முட்ட",
     "इमरजेंसी", "साँस नहीं", "आत्महत्या", "दुर्घटना",
+    # ── v16.9 FIX R15-C4 (PATIENT SAFETY) ────────────────────────────────
+    # Found while verifying R15-C1: with the AI down, "vaayil ratham nikkave
+    # illa, mayakkam varudhu" produced NOTHING from the deterministic layer.
+    # Bare "bleeding" and "mayakkam" live in BROAD_EXTRA and are deliberately
+    # excluded for healthcare (v16g2 M15 — "konjam mayakkam-a irukku" is
+    # routine clinic talk), and that call is right. The gap is that no
+    # COMPOUND form was covered, and a compound is unambiguous: nobody says
+    # "bleeding won't stop" about something routine. These are the dental
+    # presentations that are genuinely time-critical — uncontrolled bleeding,
+    # and airway compromise from facial swelling (Ludwig's angina).
+    # v17.0 FIX R16-C3a: "not responding" was here and matched "doctor is not
+    # responding to my calls" — the single most common complaint a clinic gets
+    # — paging the owner and muting the bot for 15 minutes. "unconscious" and
+    # "unresponsive" carry the real meaning without the collision.
+    "bleeding won't stop", "bleeding wont stop", "bleeding will not stop",
+    "bleeding is not stopping", "bleeding not stopping", "non stop bleeding",
+    "continuous bleeding", "heavy bleeding", "blood won't stop",
+    "blood wont stop", "unconscious", "unresponsive",
+    "can't swallow", "cant swallow", "cannot swallow", "trouble swallowing",
+    # v17.0 FIX R16-C3b: plain facial swelling is the most common post-
+    # extraction message a dental clinic receives and is usually expected
+    # recovery — every one of those was becoming an emergency plus a 15-minute
+    # mute. Airway compromise is the actual emergency, so only the swallowing
+    # and throat/tongue forms remain.
+    "difficulty swallowing", "throat swelling", "tongue swelling",
+    "swelling and breathing", "swollen and can't breathe",
+    # romanised Tamil
+    "ratham nikkala", "ratham nikkave illa", "ratham niykkave illa",
+    "ratham nikkuthu illa", "ratham niruthala", "rathum nikkala",
+    "vizhungave mudiyala", "vizhunga mudiyala",
+    "mayakkam varudhu ratham", "nikkave illa ratham",
+    "ரத்தம் நிற்கல்",
+    # Tamil script. Colloquial spelling drops or keeps the final pulli
+    # freely, and patients type both — so both are covered (R15-C4b).
+    "ரத்தம் நிக்கல்",
+    "ரத்தம் நிற்கல", "ரத்தம் நிற்கவில்லை", "ரத்தம் நிக்கல",
+    "ரத்தம் நிற்கவே இல்லை", "விழுங்க முடியல",
+    # Hindi
+    "खून नहीं रुक", "खून बंद नहीं", "निगल नहीं",
 ]
 _EMERGENCY_KW_BROAD_EXTRA = [
     # pain/blood/urgency words — active for NON-healthcare verticals only
@@ -5866,9 +5924,33 @@ _GENERIC_BIZ_WORDS = {
     "garage", "builders", "construction", "constructions", "properties",
     "realtors", "realty", "travels", "tours", "packers", "movers",
     "interiors", "enterprises", "agencies", "services",
-    # connectives
-    "the", "and", "for",
+    # connectives, possessives and deixis. v16.9 FIX R15-C2a: without these,
+    # "Our Dental Clinic is open 9 AM to 6 PM" was REFUSED — "Our" scored as a
+    # brand token, so the guard blocked the clinic describing itself.
+    "the", "and", "for", "our", "ours", "we", "us", "my", "mine", "your",
+    "yours", "their", "theirs", "his", "her", "its", "this", "that", "these",
+    "those", "at", "in", "on", "to", "of", "a", "an",
+    # Service words. These describe what a business DOES, so they can never be
+    # the distinctive part of a name. R15-C2b: "please call Emergency Services
+    # immediately" was refused and replaced with "I don't have that detail
+    # confirmed" — the guard silencing an emergency instruction is the worst
+    # failure it has, and "emergency" belongs here to stop that.
+    "emergency", "emergencies", "cleaning", "customer", "professional",
+    "quality", "treatment", "treatments", "consultation", "appointment",
+    # Tamil / Hindi equivalents of the same function words (R15-C2c)
+    "\u0b8e\u0b99\u0bcd\u0b95\u0bb3\u0bcd", "\u0ba8\u0bae\u0ba4\u0bc1", "\u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bcd", "\u0b87\u0ba8\u0bcd\u0ba4", "\u0b85\u0ba8\u0bcd\u0ba4",
+    "\u0939\u092e\u093e\u0930\u093e", "\u0906\u092a\u0915\u093e", "\u092f\u0939", "\u0935\u0939",
 }
+
+# v16.9 FIX R15-C2c: the guard exists because of "Smile Care Dental" — and it
+# could not see that name written in Tamil script, which is how most patients
+# here actually write. _BIZ_NAME_RE requires [A-Z] and _distinctive_tokens
+# matches [A-Za-z] only, so "ஸ்மைல் கேர் டென்டல்" sailed through untouched.
+_TA_HI_BIZ_TAIL = (
+    "\u0b9f\u0bc6\u0ba9\u0bcd\u0b9f\u0bb2\u0bcd", "\u0b95\u0bbf\u0bb3\u0bbf\u0ba9\u0bbf\u0b95\u0bcd", "\u0bae\u0bb0\u0bc1\u0ba4\u0bcd\u0ba4\u0bc1\u0bb5\u0bae\u0ba9\u0bc8", "\u0b86\u0bb8\u0bcd\u0baa\u0ba4\u0bcd\u0ba4\u0bbf\u0bb0\u0bbf",
+    "\u0bb9\u0bbe\u0bb8\u0bcd\u0baa\u0bbf\u0b9f\u0bcd\u0b9f\u0bb2\u0bcd", "\u0b95\u0bcd\u0bb3\u0bbf\u0ba9\u0bbf\u0b95\u0bcd",
+    "\u0921\u0947\u0902\u091f\u0932", "\u0915\u094d\u0932\u093f\u0928\u093f\u0915", "\u0905\u0938\u094d\u092a\u0924\u093e\u0932",
+)
 # v16.4 FIX R10-C3: this list decided WHICH business names the guard can even
 # see, and it only knew healthcare words — live-tested 26-Jul, a restaurant
 # persona naming a rival restaurant passed straight through while the
@@ -5899,6 +5981,12 @@ _BIZ_TAIL = (
 # At least one Capitalised word must precede the tail, so a generic mention
 # ("please contact the clinic", "go to a hospital") never trips the guard.
 _BIZ_NAME_RE = re.compile(r"\b((?:[A-Z][\w&'\u2019.-]*\s+){1,3}(?:" + _BIZ_TAIL + r"))\b")
+# v17.0 FIX R16-C6: the case-sensitive pattern stays (it is the precise one
+# and runs first); this companion catches the same shape written in any
+# case. re.escape is not applied to _BIZ_TAIL on purpose — it is a hand-
+# written alternation of literals, and escaping it would break the group.
+_BIZ_NAME_RE_CI = re.compile(
+    r"\b((?:[\w&'\u2019.-]+\s+){1,3}(?:" + _BIZ_TAIL + r"))\b", re.IGNORECASE)
 
 _UNVERIFIED_LINES = {
     "en": ("I don't have that detail confirmed on my side — let me check with "
@@ -5908,6 +5996,65 @@ _UNVERIFIED_LINES = {
     "hi": ("\u092e\u0947\u0930\u0947 \u092a\u093e\u0938 \u092f\u0939 \u091c\u093e\u0928\u0915\u093e\u0930\u0940 \u092a\u0941\u0937\u094d\u091f \u0928\u0939\u0940\u0902 \u0939\u0948 \u2014 \u092e\u0948\u0902 \u0915\u094d\u0932\u093f\u0928\u093f\u0915 \u0938\u0947 \u092a\u0942\u091b\u0915\u0930 \u092c\u0924\u093e\u0924\u093e \u0939\u0942\u0901\u0964 "
            "\u0906\u092a \u0938\u0940\u0927\u0947 \u0915\u094d\u0932\u093f\u0928\u093f\u0915 \u0938\u0947 \u092d\u0940 \u0938\u0902\u092a\u0930\u094d\u0915 \u0915\u0930 \u0938\u0915\u0924\u0947 \u0939\u0948\u0902\u0964"),
 }
+
+
+# v17.0 FIX R16-C4: R15 dumped grammar words and service words into ONE set,
+# and that conflation cut both ways. Words like "general", "specialist", "new"
+# and "best" ARE legitimately part of business names ("General Hospital"), so
+# treating them as never-a-brand let a fabricated referral through — verified:
+# "Specialist Dental Clinic la poi paarunga" passed clean. Grammar is a
+# different thing from vocabulary: these are stripped from a CANDIDATE because
+# they are syntax, but they never make the candidate harmless on their own.
+_FUNCTION_WORDS = {
+    "our", "ours", "we", "us", "my", "mine", "your", "yours", "their",
+    "theirs", "his", "her", "its", "this", "that", "these", "those",
+    "the", "a", "an", "and", "or", "for", "at", "in", "on", "to", "of",
+    "from", "with", "by", "is", "are", "was", "were", "be", "been",
+    "please", "contact", "call", "visit", "book", "booking", "go", "goto",
+    "you", "can", "may", "will", "would", "should", "offer", "offers",
+    "offering", "provide", "provides", "available", "welcome", "here",
+    "near", "nearby", "above", "below", "also", "just", "only",
+    "\u0b8e\u0b99\u0bcd\u0b95\u0bb3\u0bcd", "\u0ba8\u0bae\u0ba4\u0bc1", "\u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bcd", "\u0b87\u0ba8\u0bcd\u0ba4", "\u0b85\u0ba8\u0bcd\u0ba4",
+    "\u0939\u092e\u093e\u0930\u093e", "\u0906\u092a\u0915\u093e", "\u092f\u0939", "\u0935\u0939",
+}
+
+# v17.0 FIX R16-C5. R15-C2c gave the guard Tamil eyes and immediately blinded
+# it to the clinic's own name: `own` is built from the Latin customer_name, so
+# for "Vakkai Dental Clinic" the script token set is EMPTY and a perfectly
+# correct Tamil reply — "வாக்கை கேர் டென்டல் இன்று திறந்திருக்கும்" — was refused. Every
+# Tamil patient asking "clinic open-a?" got "I don't have that detail
+# confirmed". Comparing CONSONANT SKELETONS bridges the scripts: Tamil vowel
+# spelling varies wildly between writers, consonants barely do, so
+# வாக்கை -> "vkk" and "Vakkai" -> "vkk" match, while ஸ்மைல் -> "sml" does not.
+_TA_CONSONANT = {
+    "\u0b95": "k", "\u0b99": "n", "\u0b9a": "s", "\u0b9e": "n", "\u0b9f": "t", "\u0ba3": "n",
+    "\u0ba4": "t", "\u0ba8": "n", "\u0baa": "p", "\u0bae": "m", "\u0baf": "y", "\u0bb0": "r",
+    "\u0bb2": "l", "\u0bb5": "v", "\u0bb4": "l", "\u0bb3": "l", "\u0bb1": "r", "\u0ba9": "n",
+    "\u0bb8": "s", "\u0bb7": "s", "\u0b9c": "j", "\u0bb9": "h", "\u0b95\u0bcd\u0bb7": "ks",
+}
+
+
+def _consonant_skeleton(text: str) -> str:
+    """Consonants only, script-folded. Vowels are where transliteration
+    disagrees; consonants are where identity lives."""
+    out = []
+    for ch in (text or "").lower():
+        if ch in _TA_CONSONANT:
+            out.append(_TA_CONSONANT[ch])
+        elif "a" <= ch <= "z" and ch not in "aeiou":
+            out.append(ch)
+    # collapse doubles so "vakkai"/"வாக்கை" agree on "vk"
+    sk = "".join(out)
+    return re.sub(r"(.)\1+", r"\1", sk)
+
+
+def _script_tokens(name: str) -> set:
+    """Brand words in Tamil or Devanagari. Same idea as _distinctive_tokens but
+    for scripts that have no case, so the [A-Z] anchor cannot be used."""
+    toks = re.findall(r"[\u0b80-\u0bff\u0900-\u097f]+", name or "")
+    return {t for t in toks
+            if t not in _GENERIC_BIZ_WORDS and t not in _TA_HI_BIZ_TAIL
+            and len(t) > 2}
 
 
 def _distinctive_tokens(name: str) -> set:
@@ -5930,9 +6077,36 @@ def _guard_clinic_identity(reply: str, brain: Dict, user_text: str) -> Tuple[str
     # nothing — which is exactly what happened in the 22-Jul identity test.
     # With no brand word of its own, any candidate that HAS one is, by
     # definition, some other business.
-    for cand in _BIZ_NAME_RE.findall(reply):
-        cand_tok = _distinctive_tokens(cand)
-        if (not (cand_tok & own)) if own else bool(cand_tok):
+    # v16.9 FIX R15-C2b: also scan lowercase — "smile care dental at rs puram"
+    # passed cleanly because the regex demanded a capital letter, and a model
+    # that drops capitalisation is not a model that stopped fabricating.
+    # v17.0 FIX R16-C6: R15 only title-cased a reply with NO capital anywhere,
+    # so a single "Hi!" restored the hole — verified: "Hi! smile care dental is
+    # at rs puram" passed clean. Case is not a security boundary; match without
+    # it, and let the function-word filter below stop the ordinary sentences
+    # that a case-insensitive regex inevitably also matches.
+    _cands = [mm.group(1) for mm in _BIZ_NAME_RE_CI.finditer(reply)]
+    # Tamil/Hindi candidates: any script word run ending in a script biz word.
+    for _tail in _TA_HI_BIZ_TAIL:
+        for _m in re.finditer(r"((?:[\u0b80-\u0bff\u0900-\u097f]+[\s-]+){1,3}" + _tail + r")", reply):
+            _cands.append(_m.group(1))
+    _own_script = _script_tokens(brain.get("customer_name") or "")
+    for cand in _cands:
+        cand_tok = {t for t in (_distinctive_tokens(cand) | _script_tokens(cand))
+                    if t not in _FUNCTION_WORDS}
+        # v16.9 FIX R15-C2a: a candidate with NO brand word of its own is
+        # ordinary language ("our dental clinic", "please contact the clinic"),
+        # never an impostor. Blocking it was the false-positive bug.
+        if not cand_tok:
+            continue
+        _mine = own | _own_script
+        # R16-C5: cross-script comparison via consonant skeletons, so a correct
+        # Tamil rendering of our own Latin name is recognised as ours.
+        _my_sk = {_consonant_skeleton(t) for t in _mine if _consonant_skeleton(t)}
+        _cd_sk = {_consonant_skeleton(t) for t in cand_tok if _consonant_skeleton(t)}
+        if _my_sk and (_cd_sk & _my_sk):
+            continue
+        if (not (cand_tok & _mine)) if _mine else bool(cand_tok):
             log.error(f"\U0001f6d1 R7-C1 identity guard: model named "
                       f"{cand!r} for clinic {brain.get('customer_name')!r} "
                       f"\u2014 reply refused, not cached, not stored.")
@@ -6033,15 +6207,34 @@ def _guard_unbacked_action_claim(reply: str, user_text: str) -> Tuple[str, bool]
 #
 # Both directions are refused. "Unsafe / avoid it" is not the cautious side:
 # talking a patient out of needed treatment is its own harm.
+# How far back a disclosed condition stays relevant. Generous on purpose: the
+# cost of remembering too long is a referral the patient did not need; the cost
+# of forgetting is a safety verdict for a pregnant or anticoagulated patient.
+# v17.0 FIX R16-M1: this was named "TURNS" but history holds MESSAGES, so 20
+# meant roughly 10 exchanges — and the slice was a no-op whenever history was
+# already capped below it. Named for what it counts, and set above the history
+# cap so the whole retained conversation is always scanned.
+_SAFETY_HISTORY_MESSAGES = 60
 _PATIENT_CONDITION_TERMS = (
     "pregnan", "\u0b95\u0bb0\u0bcd\u0baa\u0bcd\u0baa", "garbh", "conceive", "trimester", "breastfeed",
     "pacemaker", "stent", "bypass", "heart condition", "cardiac", "cardiolog",
     "blood thinner", "warfarin", "aspirin", "anticoagul",
     "diabet", "sugar level", "\u0b9a\u0bb0\u0bcd\u0b95\u0bcd\u0b95\u0bb0\u0bc8",
-    "bp ", "blood pressure", "hypertens", "thyroid",
+    # v17.0 FIX R16-M2: bare "bp " matched "my bp is fine" and turned a
+    # reassurance into a disclosed condition. Qualified forms only.
+    "high bp", "low bp", "bp problem", "bp tablet", "bp medicine",
+    "blood pressure", "hypertens", "thyroid",
     "asthma", "epilep", "seizure", "kidney", "dialysis", "liver", "hepatit",
     "cancer", "chemo", "radiation therapy", "tumour", "tumor",
-    "hiv", "immune", "transplant", "implant", "prosthe",
+    "hiv", "immune", "transplant", "prosthe",
+    # v17.0 FIX R16-C2: bare "implant" sat in BOTH this list and
+    # _PROCEDURE_TERMS. Once R16-C1 made history actually readable, one
+    # "how much for a dental implant?" would mark the whole conversation as a
+    # disclosed medical condition, and every later routine answer would be
+    # refused — breaking the highest-value dental enquiry there is. A MEDICAL
+    # implant is qualified; a dental implant is a procedure and stays there.
+    "cochlear implant", "knee implant", "hip implant", "metal implant",
+    "joint replacement", "artificial valve", "heart implant",
     "allerg", "penicillin", "anaesthes", "anesthes",
     "on medication", "medicine eduthu", "tablet eduthu", "maruthu",
 )
@@ -6077,14 +6270,37 @@ _CLINICAL_REFERRAL_LINES = {
 }
 
 
-def _guard_clinical_safety_verdict(reply: str, brain: Dict,
-                                   user_text: str) -> Tuple[str, bool]:
+def _guard_clinical_safety_verdict(reply: str, brain: Dict, user_text: str,
+                                   history: Optional[List[Dict]] = None
+                                   ) -> Tuple[str, bool]:
     """Refuse a safety verdict about a procedure for a patient who disclosed a
     medical condition. Healthcare tenants only — a gym saying 'this workout is
     safe' is not practising medicine."""
     if not reply or not _brain_is_health(brain):
         return reply, False
-    u, r = (user_text or "").lower(), reply.lower()
+    # v16.9 FIX R15-C3: the guard read ONLY the current message, so the most
+    # natural way to ask defeated it — disclose the pregnancy in turn 2, ask
+    # "x-ray ok va?" in turn 4, and by then no condition word is in user_text.
+    # That is the exact R14 failure, still reachable, just one turn later. A
+    # condition a patient disclosed does not stop being true because they moved
+    # on, so the whole conversation is scanned.
+    u = (user_text or "").lower()
+    if history:
+        # v17.0 FIX R16-C1: R15-C3 read _h["content"] — but get_session_history
+        # emits the Gemini shape {"role":..., "parts":[text]}. Every lookup
+        # returned None, so the "cross-turn" guard scanned an empty string and
+        # the R14 hole stayed exactly as open as before. The code ran; it never
+        # matched. Both shapes are read now, because the WhatsApp path and the
+        # API path do not agree on one.
+        for _h in history[-_SAFETY_HISTORY_MESSAGES:]:
+            if (_h.get("role") or "") not in ("user", "human"):
+                continue
+            _txt = _h.get("content")
+            if _txt is None:
+                _parts = _h.get("parts") or []
+                _txt = _parts[0] if _parts else ""
+            u += " " + str(_txt or "").lower()
+    r = reply.lower()
     if not any(t in u for t in _PATIENT_CONDITION_TERMS):
         return reply, False
     if not any(t in r for t in _SAFETY_VERDICT_TERMS):
@@ -6162,8 +6378,8 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
     _wanted_escalation = ESCALATE_TOKEN in reply
     reply, _identity_blocked = _guard_clinic_identity(reply, brain, user_text)
     reply, _action_blocked = _guard_unbacked_action_claim(reply, user_text)  # R8-C2
-    reply, _safety_blocked = _guard_clinical_safety_verdict(reply, brain,
-                                                            user_text)  # R14-C2
+    reply, _safety_blocked = _guard_clinical_safety_verdict(
+        reply, brain, user_text, history)                 # R14-C2 / R15-C3
     _identity_blocked = _identity_blocked or _action_blocked or _safety_blocked
     if _identity_blocked and _wanted_escalation and ESCALATE_TOKEN not in reply:
         reply = ESCALATE_TOKEN + " " + reply
@@ -10868,6 +11084,86 @@ def chat():
             "escalated":  False,
             "session_id": session_id,
             "persisted":  _ok,
+            "request_id": g.get("request_id"),
+        }), 200
+
+    # ── v16.9 FIX R15-C1 (PATIENT SAFETY) ───────────────────────────────────
+    # Audited 31-Jul: govern_message ran on the WhatsApp and Instagram webhooks
+    # and NOWHERE else. /chat — the endpoint every demo and every prospect
+    # actually touches — skipped the entire pre-AI gate: no emergency 108/112
+    # layer, no canned replies, no human-handoff mute. Two consequences, both
+    # bad. A patient in crisis on this path got whatever the model felt like
+    # saying, or a bare 503 when Gemini was down; and the safety layer that is
+    # the product's whole differentiator was invisible in the one place it gets
+    # judged. It is pure Python and runs before any model call, so it also
+    # answers when the AI is unavailable.
+    # The ghost-mute and dedupe state inside govern_message are keyed on this
+    # uid. On WhatsApp that is one patient; here it must be one CONVERSATION,
+    # not one clinic — keying it on customer_id alone would let a single demo
+    # visitor's emergency silence the demo for every other visitor for 15
+    # minutes. Falls back to the request id so a brand-new session still gets
+    # its own bucket.
+    # v17.0 FIX R16-C7: R15 fell back to the REQUEST id when session_id was
+    # empty — and it is empty until the AI succeeds and the client echoes it
+    # back. A key that changes every message is not a key: the emergency mute
+    # and the human-handoff mute were both dead on the demo path, exactly
+    # where R15-C1 had just put them. The caller's stable identity is the
+    # session when there is one, else the remote address.
+    _gov_uid = ("api:" + req.customer_id + ":"
+                + (session_id or get_remote_address() or "anon"))
+    _gov = govern_message(
+        req.message, _gov_uid,
+        bot_name=(brain.get("bot_name") or ""),
+        owner_phone=(brain.get("owner_phone") or ""),
+        healthcare=_brain_is_health(brain))
+    # Alerts are deliberately NOT dispatched here: /chat is the public demo and
+    # v16g2 FIX M9 established that a demo must never page a real clinic owner.
+    # The emergency REPLY still reaches the patient — that is the part that
+    # matters to whoever is typing.
+    if _gov["alerts"]:
+        analytics.inc("chat.gov_alert_suppressed")
+    # v17.0 FIX R16-C8: R15 set the mute AND suppressed the alert, so a demo
+    # patient who asked for a human got one canned line and then permanent
+    # silence with nobody notified — strictly worse than R14, which at least
+    # kept talking. On the demo there is no owner to page, so the mute must
+    # not be honoured either: say the line, then carry on answering.
+    if _gov["muted"] and not _gov["reply"]:
+        analytics.inc("chat.gov_mute_ignored_demo")
+    elif _gov["muted"]:
+        return jsonify({
+            "reply":      "",
+            "muted":      True,
+            "provider":   "system",
+            "escalated":  True,
+            "session_id": session_id,
+            "request_id": g.get("request_id"),
+        }), 200
+    if _gov["reply"]:
+        analytics.inc("chat.gov_reply")
+        # v17.0 FIX R16-C9: R15 returned the governed reply and wrote nothing.
+        # An emergency message left ZERO record it ever arrived — no transcript
+        # for the clinic, nothing to review, nothing to prove. The crisis turn
+        # is the one turn you most need on disk.
+        try:
+            session_id = session_id or create_session(req.customer_id,
+                                                      channel="api")
+            save_messages_batch(session_id, [
+                ("user",  req.message,    "api",    0),
+                ("model", _gov["reply"],  "system", 0),
+            ])
+            increment_chat_count(req.customer_id)
+            _gov_persisted = True
+        except Exception as exc:
+            _gov_persisted = False
+            log.warning(f"\u26a0\ufe0f  /chat governed turn not persisted: {exc}")
+        return jsonify({
+            "reply":      _gov["reply"],
+            "provider":   "system",
+            # R16-M3: R15 reported escalated=true while suppressing the alert.
+            # On the demo nobody is paged, so the field said something untrue.
+            "escalated":  False,
+            "session_id": session_id,
+            "persisted":  _gov_persisted,
             "request_id": g.get("request_id"),
         }), 200
 
