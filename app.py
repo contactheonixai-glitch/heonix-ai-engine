@@ -980,6 +980,11 @@ class Config:
     # window. v23.0 keeps a fresh default; ALWAYS verify the live version in
     # the Meta changelog and pin it via env before launch.
     GRAPH_API_VERSION: str      = os.getenv("GRAPH_API_VERSION", "v23.0")   # v10 / v15g4 FIX C8
+    # v19.0 R19-C1: booking on the /chat (api) channel. Default ON — the whole
+    # point of the fix is that the demo runs the real state machine. Set to
+    # false ONLY if you expose /chat publicly against a LIVE clinic brain, in
+    # which case visitors can consume real slots (see the note on /chat).
+    BOOKING_ON_API: bool        = _env_bool("BOOKING_ON_API", True)
 
     # ── Instagram Messaging API (v10) ──
     INSTAGRAM_TOKEN: str        = os.getenv("INSTAGRAM_TOKEN", "")
@@ -1241,10 +1246,10 @@ cfg = Config()
 # said GEN-4, /health said GEN-3, the shutdown log said GEN-3, the startup
 # banner said GEN-5). After a hotfix night, /health is the one thing that
 # must be trusted to say which build is live. One constant; all derive.
-ENGINE_VERSION = "v16.1"
+ENGINE_VERSION = "v23.0"   # R23
 ENGINE_GEN     = "GEN-6"
 ENGINE_BANNER  = (f"HEONIX ULTRA ENGINE {ENGINE_VERSION} {ENGINE_GEN} "
-                  f"(Usernames/BSUID · 178 audit fixes)")
+                  f"(Usernames/BSUID · 181 audit fixes)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2491,6 +2496,8 @@ def _migrate_v14g4() -> None:
     except Exception as exc:
         log.warning(f"⚠️  v14g4: bookings migration issue: {exc}")
 
+    _migrate_booking_overlap_constraint()   # v20.0 R20-C1
+
     try:
         with _db_pool.get() as conn:
             if not _column_exists(conn, "crm_contacts", "followed_up_at"):
@@ -2499,6 +2506,87 @@ def _migrate_v14g4() -> None:
         log.info("🗄️  v14g4 migration: crm_contacts.followed_up_at ensured.")
     except Exception as exc:
         log.warning(f"⚠️  v14g4: followed_up_at migration issue: {exc}")
+
+
+
+# ── v20.0 · FIX R20-C1 (REVENUE-CRITICAL, Postgres only) ─────────────────────
+# booking_create guards overlap with SELECT-then-INSERT inside one transaction.
+# That is check-then-act: under READ COMMITTED two workers both run the SELECT,
+# both see nothing, and both INSERT. uq_book_slot cannot catch it because it
+# indexes slot_start EQUALITY — 14:00-14:30 and 14:20-14:50 have different
+# starts. SQLite has been hiding this by serialising writes; Postgres will not.
+#
+# Reproduced on PostgreSQL 16.14 with two real connections interleaved exactly
+# as two gunicorn workers would be:
+#   without this constraint : A committed | B committed  -> 2 rows, double-booked
+#   with this constraint    : A committed | B rejected 23P01 -> 1 row
+#
+# Why the constraint is built this way. slot_start/slot_end are TEXT (ISO-8601),
+# and the obvious DDL is rejected by Postgres:
+#     tstzrange(slot_start::timestamptz, ...) -> ERROR: functions in index
+#     expression must be marked IMMUTABLE
+# because text->timestamptz depends on the TimeZone setting. It only depends on
+# it when the string carries NO offset. The engine always writes an explicit
+# +00:00 (datetime.now(timezone.utc).isoformat()), so the parse really is
+# timezone-independent for this data — but "really is" has to be enforced, not
+# assumed. The CHECK lands FIRST and rejects any row without a UTC offset;
+# only then is the wrapper honestly marked IMMUTABLE. Do not reorder these.
+#
+# Deliberately NOT touching the column types. ALTER ... TYPE timestamptz would
+# make psycopg2 hand back datetime objects where every caller
+# (_fmt_local_dt(b["slot_start"]), the reminder sweep, the ICS export) expects
+# an ISO string, and would diverge the two engines' schemas. The application
+# guard in booking_create stays as the first line of defence and still returns
+# the friendly "that time just went" — this is the durable backstop underneath
+# it, for the case where two requests land in the same millisecond.
+# NOTE the {0,1} instead of the obvious `?`. _execute translates ? -> %s with a
+# blind string replace, so a literal '?' anywhere in the SQL corrupts it — and
+# v16g5 FIX R5-M7's placeholder guard caught exactly that when this migration
+# was first run, refusing the DDL instead of sending nonsense to Postgres. The
+# guard worked; the regex is what had to change.
+_BK_ISO_UTC_RE = (r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+){0,1}"
+                  r"(\+00:00|Z)$")
+
+
+def _pg_has_constraint(conn, table: str, name: str) -> bool:
+    cur = _execute(conn,
+        "SELECT 1 FROM pg_constraint c JOIN pg_class t ON t.oid = c.conrelid "
+        "WHERE t.relname = ? AND c.conname = ? LIMIT 1", (table, name))
+    return cur.fetchone() is not None
+
+
+def _migrate_booking_overlap_constraint() -> None:
+    """Idempotent, Postgres-only, and non-fatal. SQLite has no EXCLUDE and does
+    not need one — it serialises writers. If the constraint cannot be added
+    because live data already contains an overlap, say so LOUDLY and carry on:
+    refusing to boot would take a working clinic offline over a historical row."""
+    if not isinstance(_db_pool, PostgreSQLPool):
+        return
+    try:
+        with _db_pool.get() as conn:
+            _execute(conn, "CREATE EXTENSION IF NOT EXISTS btree_gist")
+            if not _pg_has_constraint(conn, "bookings", "bk_slot_iso_utc"):
+                _execute(conn,
+                    "ALTER TABLE bookings ADD CONSTRAINT bk_slot_iso_utc CHECK ("
+                    f"slot_start ~ '{_BK_ISO_UTC_RE}' AND "
+                    f"slot_end   ~ '{_BK_ISO_UTC_RE}')")
+            _execute(conn,
+                "CREATE OR REPLACE FUNCTION heonix_iso_utc(txt text) "
+                "RETURNS timestamptz LANGUAGE sql IMMUTABLE STRICT "
+                "PARALLEL SAFE AS $fn$ SELECT txt::timestamptz $fn$")
+            if not _pg_has_constraint(conn, "bookings", "bk_no_overlap"):
+                _execute(conn,
+                    "ALTER TABLE bookings ADD CONSTRAINT bk_no_overlap "
+                    "EXCLUDE USING gist (customer_id WITH =, "
+                    "tstzrange(heonix_iso_utc(slot_start), "
+                    "heonix_iso_utc(slot_end)) WITH &&) "
+                    "WHERE (status = 'booked')")
+        log.info("🗄️  v20 R20-C1: booking overlap EXCLUDE constraint ensured.")
+    except Exception as exc:
+        log.critical(
+            "🛑 R20-C1: could not install the booking overlap constraint — "
+            "double-booking is possible under concurrency until this is fixed. "
+            f"Cause: {exc}")
 
 
 def _migrate_v14g5() -> None:
@@ -5089,12 +5177,28 @@ _EMERGENCY_KW_UNIVERSAL = [
     # recovery — every one of those was becoming an emergency plus a 15-minute
     # mute. Airway compromise is the actual emergency, so only the swallowing
     # and throat/tongue forms remain.
-    "difficulty swallowing", "throat swelling", "tongue swelling",
-    "swelling and breathing", "swollen and can't breathe",
+    # v17.0 R17-C4. Two lessons. (a) "swollen and can't breathe" was a DEAD
+    # entry — the real sentence "my face is swollen and I can't breathe" has
+    # words in between, so it could never be the reason anything fired.
+    # (b) Every entry needs its morphological twin: "throat swelling" fired
+    # while "swollen throat" did not. Airway compromise is the emergency, so
+    # both word orders are listed, and facial swelling counts only when
+    # breathing or swallowing trouble is mentioned too.
+    "difficulty swallowing", "throat swelling", "swollen throat",
+    "tongue swelling", "swollen tongue", "tongue is swollen",
+    "neck swelling", "swollen neck", "swelling under jaw",
+    "face fully swollen", "whole face swollen",
+    "hard to breathe", "breathing difficult", "difficulty breathing",
+    "breathless", "cannot talk", "can't talk",
     # romanised Tamil
     "ratham nikkala", "ratham nikkave illa", "ratham niykkave illa",
     "ratham nikkuthu illa", "ratham niruthala", "rathum nikkala",
     "vizhungave mudiyala", "vizhunga mudiyala",
+    # R17-C4b: R16-C3b removed the Tamil facial-swelling terms and put nothing
+    # back, so Tamil coverage of this presentation fell to zero. Restored in
+    # the qualified form only — swelling WITH breathing or swallowing trouble.
+    "veengi moochu", "moochu vaangala", "moochu vaanga kastam",
+    "mugam veengi", "kazhuthu veengi",
     "mayakkam varudhu ratham", "nikkave illa ratham",
     "ரத்தம் நிற்கல்",
     # Tamil script. Colloquial spelling drops or keeps the final pulli
@@ -5102,6 +5206,8 @@ _EMERGENCY_KW_UNIVERSAL = [
     "ரத்தம் நிக்கல்",
     "ரத்தம் நிற்கல", "ரத்தம் நிற்கவில்லை", "ரத்தம் நிக்கல",
     "ரத்தம் நிற்கவே இல்லை", "விழுங்க முடியல",
+    # R17-C4c: Tamil airway-compromise forms, absent since R16-C3b.
+    "மூச்சு வாங்க", "முகம் வீங்கி மூச்சு", "கழுத்து வீங்கி", "நாக்கு வீங்கி",
     # Hindi
     "खून नहीं रुक", "खून बंद नहीं", "निगल नहीं",
 ]
@@ -5116,6 +5222,51 @@ _EMERGENCY_KW_BROAD_EXTRA = [
     "mayakkam", "behosh", "மயக்கம்",
     "அவசரம்", "ரொம்ப வலி", "தாங்க முடியல", "ரத்தம்", "बहुत दर्द", "खून",
 ]
+# ── v18.0 · FIX R18-C2 (PATIENT SAFETY — coverage parity) ────────────────────
+# Measured gaps on R17, every one reproduced by execution before being added:
+#
+#  1. AIRWAY, Tamil. "மூச்சு விட முடியல" / "முடியவில்லை" — the most literal
+#     Tamil for "can't breathe" — was absent in BOTH scripts and in roman.
+#     English carried "can't breathe" AND "cannot breathe"; Tamil carried only
+#     "மூச்சு வாங்க" (panting) and "மூச்சு முட்ட". R18-C1 fixes the inflection
+#     problem; it cannot invent a stem that was never listed.
+#  2. CARDIAC, Tamil + Hindi. "chest pain" fired in English and had no
+#     equivalent in either other language. In a dental chair, chest pain is a
+#     cardiac event until proven otherwise.
+#  3. ANAPHYLAXIS. Nothing in any language. Local anaesthetic and post-op
+#     antibiotics are the two commonest triggers in a dental clinic.
+#     DELIBERATELY NOT ADDED: bare "allergic reaction" and bare "allergic".
+#     "I'm allergic to penicillin, is that ok?" is a routine pre-op
+#     DISCLOSURE, and firing on it would page the doctor and mute the bot for
+#     15 minutes — the exact harm R16-C3 was raised to remove. Only forms
+#     carrying acuity or a severity marker are listed.
+#  4. BLEEDING, word order. "heavy bleeding" was listed, "bleeding heavily"
+#     was not — the same one-directional listing R17-C5a fixed for BP terms
+#     and left everywhere else. Ditto "niruthave illa", where the twin form
+#     "nikkave illa" HAD been added.
+_EMERGENCY_KW_R18 = [
+    # 1 — airway, Tamil script + roman
+    "மூச்சு விட முடிய", "மூச்சு விடமுடிய", "மூச்சு திணற", "மூச்சு கஷ்ட",
+    # Latin keeps EXACT token matching by design (see R18-C1), so romanized
+    # Tamil cannot rely on the prefix rule — its surface forms are listed.
+    "moochu vida mudiyala", "moochu vida mudiyalai", "moochu vida mudiyale",
+    "mucchu vida mudiyala", "moochu vidamudiyala", "moochu thinaral",
+    "moochu thinarudhu", "mucchu thinaral",
+    # 2 — cardiac, Tamil + Hindi
+    "நெஞ்சு வலி", "நெஞ்சு வலிக்க", "மார்பு வலி", "seene mein dard",
+    "nenju vali", "सीने में दर्द",
+    # 3 — anaphylaxis (acuity-bearing forms only — see note above)
+    "anaphylaxis", "anaphylactic", "severe allergic", "severe allergy",
+    "throat closing",
+    "throat is closing", "lips swelling", "wheezing badly",
+    "ஒவ்வாமை ரொம்ப", "गंभीर एलर्जी",
+    # 4 — bleeding, the missing word orders
+    "bleeding heavily", "bleeding a lot", "blood is not stopping",
+    "blood not stopping", "ratham niruthave illa", "niruthave illa ratham",
+    "ரத்தம் நிறுத்தவே இல்லை",
+]
+_EMERGENCY_KW_UNIVERSAL = _EMERGENCY_KW_UNIVERSAL + _EMERGENCY_KW_R18
+
 # backward-compat alias (full list) for any external import/tests
 _EMERGENCY_KW = _EMERGENCY_KW_UNIVERSAL + _EMERGENCY_KW_BROAD_EXTRA
 _HUMAN_KW = [
@@ -5186,6 +5337,60 @@ def _kw_toks(keyword: str) -> tuple:
     return tuple(_norm_text(keyword).split())
 
 
+# ── v18.0 · FIX R18-C1 (PATIENT SAFETY — agglutinative languages) ────────────
+# _kw_hit compared WHOLE TOKENS for exact equality. That is right for English
+# and wrong for Tamil and Hindi, which glue their suffixes straight onto the
+# stem. Measured on R17: "மூச்சு வாங்குது" did NOT match the keyword
+# "மூச்சு வாங்க" that was sitting in the emergency list, and "ரத்தம் நிக்கலை"
+# did not match "ரத்தம் நிக்கல்" — while the uninflected dictionary forms both
+# fired. Every Tamil emergency term in the list therefore only worked for the
+# one spelling somebody happened to type into the constant, and the launch
+# market writes Tamil.
+#
+# The fix is scoped as narrowly as it can be and still be useful:
+#   • Latin script keeps EXACT equality. English is not agglutinative, and
+#     prefix matching there would make "can" match "cannot" — the negation
+#     inversion this matcher exists to prevent.
+#   • An Indic keyword token may match a text token that STARTS WITH it, but
+#     only when the stem is >= _AGGLU_MIN_STEM codepoints and the text token
+#     grows it by at most _AGGLU_MAX_SUFFIX. Both bounds matter: the first
+#     stops short words ("வலி", pain) matching unrelated longer ones
+#     ("வலிமை", strength); the second stops a stem matching an arbitrarily
+#     long compound.
+#   • Negation handling is untouched — it runs on the matched span exactly as
+#     before, so a negated Tamil hit is still skipped.
+_AGGLU_MIN_STEM   = 4     # codepoints, excluding combining marks
+_AGGLU_MAX_SUFFIX = 8     # how far a suffix may extend the stem
+# R18-C1b: 5 was measured too tight — Tamil negative-verb endings alone run
+# to 6-7 codepoints (முடிய -> முடியவில்லை). Raised to 8 and re-verified
+# against the full silence suite, which stayed at zero false pages.
+
+
+def _is_indic_tok(t: str) -> bool:
+    return any("\u0900" <= c <= "\u0d7f" for c in t)
+
+
+def _toks_match(text_toks, kw_toks) -> bool:
+    """True when this window of text tokens satisfies the keyword tokens.
+    Latin: exact. Indic: exact, or a bounded agglutinative prefix."""
+    if tuple(text_toks) == kw_toks:
+        return True
+    if len(text_toks) != len(kw_toks):
+        return False
+    for tt, kt in zip(text_toks, kw_toks):
+        if tt == kt:
+            continue
+        if not (_is_indic_tok(kt) and _is_indic_tok(tt)):
+            return False
+        if len(kt) < _AGGLU_MIN_STEM:
+            return False
+        if not tt.startswith(kt):
+            return False
+        if len(tt) - len(kt) > _AGGLU_MAX_SUFFIX:
+            return False
+    return True
+
+
 def _kw_hit(norm_text: str, keyword: str,
             pre_w: int = 1, post_w: int = 3) -> bool:
     """v11 #9: whole-word match for `keyword` inside already-normalised text,
@@ -5209,7 +5414,7 @@ def _kw_hit(norm_text: str, keyword: str,
     toks    = norm_text.split()
     n       = len(kw_toks)
     for i in range(len(toks) - n + 1):
-        if tuple(toks[i:i + n]) == kw_toks:   # tuple() — kw_toks is a cached tuple
+        if _toks_match(toks[i:i + n], kw_toks):   # v18 R18-C1
             if any(t in _NEGATORS
                    for t in toks[max(0, i - max(1, pre_w)):i]):
                 continue           # pre-negated occurrence → keep scanning
@@ -5897,6 +6102,15 @@ def _cache_hour_seed(base: str) -> str:
 _GENERIC_BIZ_WORDS = {
     # healthcare
     "dental", "dentistry", "clinic", "clinics", "hospital", "hospitals",
+    # v19.0 R19-P1: R18-C4b added Dentist / Dentists / Orthodontics /
+    # Endodontics / Periodontics / "Smile Studio" as recognised tails in
+    # _BIZ_NAME_RE but never mirrored them here, so the sync test between the
+    # two lists no longer told the truth and "Sabka Dentist" kept "dentist" as
+    # a DISTINCTIVE token. Deliberately NOT adding "smile": the tail is the
+    # two-word phrase "Smile Studio", and making "smile" generic would empty
+    # the token set of "Smile Care Dental" and reopen the 21-Jul fabrication.
+    "dentist", "dentists", "orthodontics", "orthodontic",
+    "endodontics", "periodontics", "studio",
     "polyclinic", "medical", "medicals", "centre", "center", "care",
     "health", "healthcare", "diagnostics", "nursing", "home", "speciality",
     "specialty", "multispeciality", "multispecialty",
@@ -5958,7 +6172,13 @@ _TA_HI_BIZ_TAIL = (
 # vocabulary here, or its guard is decoration.
 _BIZ_TAIL = (
     # healthcare
-    r"Dental|Dentistry|Clinic|Clinics|Hospital|Hospitals|Polyclinic|"
+    r"Dental|Dentistry|Dentists|Dentist|Orthodontics|Orthodontic|"
+    # v18.0 FIX R18-C4b: "Dentist" was not a recognised tail, so
+    # "Greetings from Sabka Dentist" produced NO candidate and the guard
+    # had nothing to compare — an impostor name in the single commonest
+    # Indian dental-chain naming style walked straight through.
+    r"Endodontics|Periodontics|Smile Studio|Clinic|Clinics|Hospital|"
+    r"Hospitals|Polyclinic|"
     r"Diagnostics|Labs|Scans|Physiotherapy|Ayurveda|Homeopathy|"
     r"Nursing\s+Home|Medical\s+Cent(?:re|er)|Health\s+Cent(?:re|er)|"
     r"Care\s+Cent(?:re|er)|Fertility\s+Cent(?:re|er)|"
@@ -5981,12 +6201,11 @@ _BIZ_TAIL = (
 # At least one Capitalised word must precede the tail, so a generic mention
 # ("please contact the clinic", "go to a hospital") never trips the guard.
 _BIZ_NAME_RE = re.compile(r"\b((?:[A-Z][\w&'\u2019.-]*\s+){1,3}(?:" + _BIZ_TAIL + r"))\b")
-# v17.0 FIX R16-C6: the case-sensitive pattern stays (it is the precise one
-# and runs first); this companion catches the same shape written in any
-# case. re.escape is not applied to _BIZ_TAIL on purpose — it is a hand-
-# written alternation of literals, and escaping it would break the group.
-_BIZ_NAME_RE_CI = re.compile(
-    r"\b((?:[\w&'\u2019.-]+\s+){1,3}(?:" + _BIZ_TAIL + r"))\b", re.IGNORECASE)
+# v17.0 R17-C3: the case-INSENSITIVE companion added in R16 is gone. It was
+# the direct cause of 8/8 ordinary sentences being refused, and R16's own
+# comment claimed the case-sensitive pattern 'runs first' when in fact it
+# had no callers at all. Dead code with a confident comment is how R15-C3
+# survived a whole round — one pattern, one caller, no narration.
 
 _UNVERIFIED_LINES = {
     "en": ("I don't have that detail confirmed on my side — let me check with "
@@ -6030,7 +6249,17 @@ _TA_CONSONANT = {
     "\u0b95": "k", "\u0b99": "n", "\u0b9a": "s", "\u0b9e": "n", "\u0b9f": "t", "\u0ba3": "n",
     "\u0ba4": "t", "\u0ba8": "n", "\u0baa": "p", "\u0bae": "m", "\u0baf": "y", "\u0bb0": "r",
     "\u0bb2": "l", "\u0bb5": "v", "\u0bb4": "l", "\u0bb3": "l", "\u0bb1": "r", "\u0ba9": "n",
-    "\u0bb8": "s", "\u0bb7": "s", "\u0b9c": "j", "\u0bb9": "h", "\u0b95\u0bcd\u0bb7": "ks",
+    "\u0bb8": "s", "\u0bb7": "s", "\u0b9c": "j", "\u0bb9": "h",
+    # v17.0 R17-C2b: "\u0b95\u0bcd\u0bb7" was unreachable — the loop iterates single
+    # characters, so a three-codepoint key could never match. Dropped.
+    # Devanagari, absent in R16: the Tamil bridge was built and Hindi was left
+    # blind, so "\u0935\u0915\u094d\u0915\u093e\u0908 \u0921\u0947\u0902\u091f\u0932 \u0915\u094d\u0932\u093f\u0928\u093f\u0915" was refused for clinic "Vakkai".
+    "\u0915": "k", "\u0916": "k", "\u0917": "g", "\u0918": "g", "\u091a": "c", "\u091b": "c",
+    "\u091c": "j", "\u091d": "j", "\u091f": "t", "\u0920": "t", "\u0921": "d", "\u0922": "d",
+    "\u0923": "n", "\u0924": "t", "\u0925": "t", "\u0926": "d", "\u0927": "d", "\u0928": "n",
+    "\u092a": "p", "\u092b": "p", "\u092c": "b", "\u092d": "b", "\u092e": "m", "\u092f": "y",
+    "\u0930": "r", "\u0932": "l", "\u0935": "v", "\u0936": "s", "\u0937": "s", "\u0938": "s",
+    "\u0939": "h",
 }
 
 
@@ -6046,6 +6275,138 @@ def _consonant_skeleton(text: str) -> str:
     # collapse doubles so "vakkai"/"வாக்கை" agree on "vk"
     sk = "".join(out)
     return re.sub(r"(.)\1+", r"\1", sk)
+
+
+# ── v21.0 · FIX R21-C1 (IDENTITY GUARD — cross-script bridge, own short name) ─
+# R17-C2 set _MIN_SKELETON = 3 because two consonants collide at ~75% on real
+# Indian brand words, and R16 had let "Try Vikki Dental Clinic" pass for clinic
+# "Vakkai" (both reduce to "vk"). That measurement was taken from the
+# IMPOSTOR's side only. Nobody measured what the same threshold does when the
+# CLINIC'S OWN name reduces to two consonants — and the guard computes
+#   my_sk = {sk for sk in ... if len(sk) >= _MIN_SKELETON}
+# then gates the whole cross-script branch on `if my_sk and ...`. For a clinic
+# whose every brand token is short, my_sk is EMPTY, the branch is skipped, and
+# the guard refuses the clinic's own name written in Tamil or Devanagari —
+# every single time. Not a narrower match: a total bypass of the bridge, which
+# is the failure mode R18-C4 named for marker sets and which lives here too.
+#
+# Measured on R20 over 22 real Indian dental brand names: the bridge is dead
+# for 12 of them (55%) — Vaakai, Vakkai, Sara, Nova, Sri, Deva, Apollo, Anu,
+# Ravi, Mano, Jeeva, Aruna. Reproduction, clinic "Vaakai Dental Clinic":
+#   _guard_clinic_identity("வாக்கை டென்டல் கிளினிக்கிற்கு வரவேற்கிறோம்.", brain, "hi")
+#   → ("இந்த தகவலை என்னால் உறுதிப்படுத்த முடியவில்லை…", True)
+# The assistant refuses to greet a patient using its own clinic's name, in the
+# script most of this launch market actually writes. R15-C2c and R16-C5 were
+# both raised for exactly this harm; R17 reintroduced it through a threshold
+# instead of a wordlist, which is why two rounds of tests did not catch it.
+#
+# Widening the measurement from 22 names to 40 showed the damage is not
+# confined to short names. The skeleton also breaks on every romanisation that
+# spells a single Indic letter as a Latin digraph or a different voicing:
+# "Roshni" → rshn but ரோஷ்னி → rsn (sh is one letter, ஷ); "Prathima" → prthm
+# but ப்ரதிமா → prtm; "Ganga" → gng but கங்கா → knk (Tamil has no g). Over 40
+# real brand words matched against their own honest Indic rendering, R20's
+# bridge succeeds 8 times. It is not a coarse signal; it is a broken one.
+#
+# The fix is NOT to lower _MIN_SKELETON — that hands "Vikki" back its pass.
+# A two-consonant skeleton is untrustworthy because it throws away the vowels,
+# and for short Indic names the vowels are precisely where the identity sits
+# (vaakai/vikki, sara/sooria, deva/diva). So add a SECOND route that keeps a
+# coarse vowel class alongside the consonants and folds the voicing/aspiration
+# distinctions Tamil script does not make. R17's comparison is untouched and
+# still runs first; a candidate clears by matching on either. Coverage over
+# the same 40 names goes 8 → 36, and over all 1560 cross-brand pairs the only
+# two acceptances the new route adds are Vaakai↔Vakkai, which are one clinic
+# spelling its own name two ways.
+#
+# Vowel classes are deliberately coarse — length is folded (aa/a, ii/ee/i,
+# uu/oo/u) because transliteration disagrees about it, while quality is kept
+# because transliteration agrees about it. Diphthongs get non-letter marks so
+# they can never collide with the Latin consonants y and w. Voiced/voiceless
+# pairs are folded (g→k, d→t, b→p, j→c, s→c) because Tamil script does not
+# distinguish them at all — தேவா is written the same whether the clinic
+# romanises itself "Deva" or "Theva" — and the retained vowels pay for the
+# extra folding.
+_XS_VOWEL_SIGN = {          # dependent vowel signs (matras)
+    "\u0bbe": "a", "\u0bbf": "i", "\u0bc0": "i", "\u0bc1": "u", "\u0bc2": "u",
+    "\u0bc6": "e", "\u0bc7": "e", "\u0bc8": "2", "\u0bca": "o", "\u0bcb": "o",
+    "\u0bcc": "3",
+    "\u093e": "a", "\u093f": "i", "\u0940": "i", "\u0941": "u", "\u0942": "u",
+    "\u0943": "i", "\u0947": "e", "\u0948": "2", "\u094b": "o", "\u094c": "3",
+}
+_XS_VOWEL_IND = {           # independent vowel letters
+    "\u0b85": "a", "\u0b86": "a", "\u0b87": "i", "\u0b88": "i", "\u0b89": "u",
+    "\u0b8a": "u", "\u0b8e": "e", "\u0b8f": "e", "\u0b90": "2", "\u0b92": "o",
+    "\u0b93": "o", "\u0b94": "3",
+    "\u0905": "a", "\u0906": "a", "\u0907": "i", "\u0908": "i", "\u0909": "u",
+    "\u090a": "u", "\u090f": "e", "\u0910": "2", "\u0913": "o", "\u0914": "3",
+}
+_XS_VIRAMA = {"\u0bcd", "\u094d"}      # pulli / halant — kills the inherent vowel
+_XS_FOLD   = {"g": "k", "d": "t", "b": "p", "j": "c", "z": "c", "s": "c",
+              "f": "p", "w": "v", "q": "k"}
+_MIN_VKEY  = 3              # same "carries identity" bar as _MIN_SKELETON
+
+
+def _xs_latin_vowel(run: str) -> str:
+    """Coarse class for a run of Latin vowels. Diphthongs first — 'ai' is what
+    separates Vaakai from Vikki and must not be folded into 'a'."""
+    if "ai" in run or "ay" in run:
+        return "2"
+    if "au" in run or "aw" in run:
+        return "3"
+    if run[:2] in ("ee", "ii"):
+        return "i"
+    if run[:2] in ("oo", "uu"):
+        return "u"
+    return run[0]
+
+
+def _xscript_vkey(text: str) -> str:
+    """Consonants AND coarse vowels, script-folded — the higher-precision
+    sibling of _consonant_skeleton, used only where the skeleton is too short
+    to be trusted (R21-C1). Indic input is read as an abugida: a consonant
+    letter carries an inherent 'a' unless a virama kills it or a matra
+    overrides it."""
+    out: List[str] = []
+    s = (text or "").lower()
+    i, n = 0, len(s)
+    while i < n:
+        ch = s[i]
+        if ch in _TA_CONSONANT:
+            out.append(_XS_FOLD.get(_TA_CONSONANT[ch], _TA_CONSONANT[ch]))
+            j = i + 1
+            if j < n and s[j] in _XS_VIRAMA:
+                i = j + 1                     # dead consonant — no vowel at all
+                continue
+            if j < n and s[j] in _XS_VOWEL_SIGN:
+                out.append(_XS_VOWEL_SIGN[s[j]])
+                i = j + 1
+                continue
+            out.append("a")                   # inherent vowel
+            i += 1
+            continue
+        if ch in _XS_VOWEL_IND:
+            out.append(_XS_VOWEL_IND[ch])
+            i += 1
+            continue
+        if "a" <= ch <= "z":
+            if ch in "aeiou":
+                run = ""
+                while i < n and s[i] in "aeiou":
+                    run += s[i]
+                    i += 1
+                out.append(_xs_latin_vowel(run))
+                continue
+            # aspirate digraphs: Tamil has no separate kh/th/ph letters, so a
+            # romanisation that spells them out must fold to the same key.
+            if ch == "h" and out and out[-1] in "kctp":
+                i += 1
+                continue
+            out.append(_XS_FOLD.get(ch, ch))
+            i += 1
+            continue
+        i += 1                                 # punctuation, ZWNJ, digits
+    return re.sub(r"(.)\1+", r"\1", "".join(out))
 
 
 def _script_tokens(name: str) -> set:
@@ -6065,56 +6426,157 @@ def _distinctive_tokens(name: str) -> set:
     return {t for t in toks if t not in _GENERIC_BIZ_WORDS and len(t) > 2}
 
 
+# v17.0 R17-C1. A name only matters when the sentence is making a claim about
+# who this assistant is, or where this business is. Everything else — service
+# lists, treatment names, branch mentions, referrals — is ordinary talk.
+_SELF_ID_MARKERS = (
+    # v18.0 FIX R18-C4: the marker set decides whether the guard looks at the
+    # reply AT ALL, so a missing marker is a silent bypass of the entire
+    # guard — not a narrower match. Verified on R17: "You have reached Bright
+    # Smile Dental Care", "Thanks for calling Apollo White Dental" and
+    # "Greetings from Sabka Dentist" were all waved through, while the same
+    # impostor name behind "I am" / "Welcome to" was refused. These are the
+    # standard opening lines of every business auto-reply, which makes them
+    # the phrasings a model is MOST likely to reach for.
+    "you have reached", "you've reached", "youve reached",
+    "thanks for calling", "thank you for calling", "thanks for contacting",
+    "thank you for contacting", "you are chatting with", "you're chatting with",
+    "you are speaking with", "you're speaking with", "speaking with",
+    "on behalf of", "greetings from", "reached out to",
+    "நீங்கள் தொடர்பு", "தொடர்பு கொண்டது", "சார்பாக",
+    "आपने संपर्क", "की ओर से",
+    "i am ", "i'm ", "this is ", "we are ", "we're ", "my name is",
+    "assistant for", "assistant of", "assistant at", "welcome to",
+    "is located", "are located", "located at", "located in",
+    "our address", "the address is", "address is",
+    " is at ", " is in ", " are at ",
+    "naan ", "engal ", "namadhu ", "oda assistant", "-oda ", "amaindh",
+    "irukku", "irukk", "-la iru", "-il iru", "kitta iru",
+    "\u0ba8\u0bbe\u0ba9\u0bcd ", "\u0b8e\u0b99\u0bcd\u0b95\u0bb3\u0bcd ", "\u0ba8\u0bae\u0ba4\u0bc1 ", "\u0b89\u0ba4\u0bb5\u0bbf\u0baf\u0bbe\u0bb3", "\u0bae\u0bc1\u0b95\u0bb5\u0bb0\u0bbf",
+    "\u0b87\u0bb0\u0bc1\u0b95\u0bcd\u0b95", "\u0bb5\u0bb0\u0bb5\u0bc7\u0bb1\u0bcd",
+    "\u092e\u0948\u0902 ", "\u0939\u092e\u093e\u0930\u093e ", "\u0938\u094d\u0925\u093f\u0924 ", "\u092a\u0924\u093e ",
+)
+
+# v17.0 R17-C2. Measured collision rate on real Indian clinic brand words was
+# ~75% at 2 consonants (Sri/Sree/Saru -> "sr"; Vakkai/Vikki -> "vk"), which is
+# why R16 let "Try Vikki Dental Clinic" pass for clinic "Vakkai". Three
+# consonants is the shortest length that carries identity.
+_MIN_SKELETON = 3
+
+
+def _is_cross_script(a: str, b: str) -> bool:
+    """True when the two strings are written in different alphabets — the only
+    situation where a consonant skeleton is the right tool."""
+    ind = lambda t: any("\u0900" <= c <= "\u0d7f" for c in (t or ""))
+    lat = lambda t: any("a" <= c.lower() <= "z" for c in (t or ""))
+    return (ind(a) and lat(b) and not ind(b)) or (ind(b) and lat(a) and not ind(a))
+
+
 def _guard_clinic_identity(reply: str, brain: Dict, user_text: str) -> Tuple[str, bool]:
-    """Refuse any reply that names a business other than this clinic.
-    Returns (reply, blocked). A blocked turn is never cached and never stored
-    to RAG — a fabricated answer must not become a remembered one."""
+    """Refuse a reply that claims THIS assistant belongs to a different business.
+
+    v17.0 REWRITE (R17-C1). This guard has been patched six times — R7, R8-M2,
+    R10-C3, R15-C2, R16-C4/5/6 — and every round traded false positives for
+    false negatives, because it was scanning the WHOLE reply for anything that
+    looked like a business name and then arguing about stopword lists. R16
+    reached the point of refusing 8 of 8 ordinary clinic sentences: "We offer
+    teeth cleaning services", "You can visit our Kalapatti branch clinic". A
+    guard that blocks half of normal traffic does more damage than the
+    hallucination it prevents.
+
+    The fix is scope, not vocabulary. What actually went wrong on 21-Jul was a
+    SELF-IDENTIFICATION claim — "Smile Care Dental is located at RS Puram" from
+    an assistant that belongs to a different clinic. So a candidate name is
+    only examined when it sits next to a marker that makes it a claim about
+    who WE are or where WE are. Describing services, listing treatments and
+    naming a branch are none of those things and are now out of scope.
+
+    This deliberately catches LESS than R16 did. It catches the failure it was
+    built for, and it does not break ordinary conversation — which, on the
+    evidence of six rounds, is the harder half.
+    """
     if not reply:
         return reply, False
+
+    low = reply.lower()
+    if not any(mk in low for mk in _SELF_ID_MARKERS):
+        return reply, False                      # not an identity claim at all
+
     own = _distinctive_tokens(brain.get("customer_name") or "")
-    # v16.2 FIX R8-M2: a clinic literally named "dental clinic" reduces to an
-    # EMPTY distinctive set, so the whole guard returned early and protected
-    # nothing — which is exactly what happened in the 22-Jul identity test.
-    # With no brand word of its own, any candidate that HAS one is, by
-    # definition, some other business.
-    # v16.9 FIX R15-C2b: also scan lowercase — "smile care dental at rs puram"
-    # passed cleanly because the regex demanded a capital letter, and a model
-    # that drops capitalisation is not a model that stopped fabricating.
-    # v17.0 FIX R16-C6: R15 only title-cased a reply with NO capital anywhere,
-    # so a single "Hi!" restored the hole — verified: "Hi! smile care dental is
-    # at rs puram" passed clean. Case is not a security boundary; match without
-    # it, and let the function-word filter below stop the ordinary sentences
-    # that a case-insensitive regex inevitably also matches.
-    _cands = [mm.group(1) for mm in _BIZ_NAME_RE_CI.finditer(reply)]
-    # Tamil/Hindi candidates: any script word run ending in a script biz word.
-    for _tail in _TA_HI_BIZ_TAIL:
-        for _m in re.finditer(r"((?:[\u0b80-\u0bff\u0900-\u097f]+[\s-]+){1,3}" + _tail + r")", reply):
-            _cands.append(_m.group(1))
-    _own_script = _script_tokens(brain.get("customer_name") or "")
-    for cand in _cands:
+    own_script = _script_tokens(brain.get("customer_name") or "")
+    mine = own | own_script
+    # Precomputed once, not per candidate (R16-M4 was O(candidates x own)).
+    my_sk = {sk for sk in (_consonant_skeleton(t) for t in mine)
+             if len(sk) >= _MIN_SKELETON}
+    # v21.0 FIX R21-C1: the vowel-aware key, precomputed the same way.
+    my_vk = {vk for vk in (_xscript_vkey(t) for t in mine)
+             if len(vk) >= _MIN_VKEY}
+
+    cands = [mm.group(1) for mm in _BIZ_NAME_RE.finditer(reply)]
+    # A model that drops capitalisation has not stopped fabricating, so an
+    # all-lowercase reply is title-cased and rescanned. Ordinary sentences
+    # carry capitals, so this cannot reintroduce the R16 false positives.
+    # R17-C1b: title-cased rescan runs unconditionally. R15/R16 gated it on the
+    # whole reply being lowercase, which a single "Hi!" defeated — but that gate
+    # only existed to stop ordinary sentences becoming candidates, and the
+    # marker check above already does that far better.
+    cands += [mm.group(1) for mm in _BIZ_NAME_RE.finditer(reply.title())]
+    for tail in _TA_HI_BIZ_TAIL:
+        cands += [mm.group(1) for mm in re.finditer(
+            r"((?:[\u0b80-\u0bff\u0900-\u097f]+[\s\u200c-]+){1,3}" + re.escape(tail) + r")",
+            reply)]
+
+    for cand in cands:
         cand_tok = {t for t in (_distinctive_tokens(cand) | _script_tokens(cand))
                     if t not in _FUNCTION_WORDS}
-        # v16.9 FIX R15-C2a: a candidate with NO brand word of its own is
-        # ordinary language ("our dental clinic", "please contact the clinic"),
-        # never an impostor. Blocking it was the false-positive bug.
         if not cand_tok:
-            continue
-        _mine = own | _own_script
-        # R16-C5: cross-script comparison via consonant skeletons, so a correct
-        # Tamil rendering of our own Latin name is recognised as ours.
-        _my_sk = {_consonant_skeleton(t) for t in _mine if _consonant_skeleton(t)}
-        _cd_sk = {_consonant_skeleton(t) for t in cand_tok if _consonant_skeleton(t)}
-        if _my_sk and (_cd_sk & _my_sk):
-            continue
-        if (not (cand_tok & _mine)) if _mine else bool(cand_tok):
-            log.error(f"\U0001f6d1 R7-C1 identity guard: model named "
-                      f"{cand!r} for clinic {brain.get('customer_name')!r} "
-                      f"\u2014 reply refused, not cached, not stored.")
-            analytics.inc("guard.identity_block")
-            lang = detect_language(user_text)
-            return _UNVERIFIED_LINES.get(lang, _UNVERIFIED_LINES["en"]), True
+            continue                              # generic phrase, no claim
+        if mine and (cand_tok & mine):
+            continue                              # it is us, spelled the same
+        # Cross-script only: a consonant skeleton is a coarse signal ("Vakkai"
+        # and "Vikki" both reduce to "vk"), so it may confirm a match across
+        # alphabets but must never be trusted to clear a same-script name.
+        if _is_cross_script(cand, brain.get("customer_name") or ""):
+            if my_sk:
+                cand_sk = {sk for sk in (_consonant_skeleton(t) for t in cand_tok)
+                           if len(sk) >= _MIN_SKELETON}
+                if cand_sk & my_sk:
+                    continue
+            # v21.0 FIX R21-C1: everything above is R17, unchanged and tried
+            # first. This is a SECOND route, not a replacement — a candidate
+            # clears only by matching the clinic on one of them, so the change
+            # is monotone: it can turn a refusal into a pass, never the
+            # reverse (asserted over the whole corpus in the R21 suite).
+            #
+            # Measured on R20 over 40 real Indian clinic brand words, each
+            # against its own honest Tamil/Devanagari rendering:
+            #   consonant skeleton alone  ..  8/40 self-match   (bridge dead
+            #                                 for 80% of clinics)
+            #   vowel-aware key alone     .. 33/40
+            #   either                    .. 36/40
+            # and over all 1560 cross-brand pairs (clinic X vs impostor Y):
+            #   skeleton false-accepts .. 0/1560
+            #   either   false-accepts .. 2/1560, both of them Vaakai↔Vakkai
+            #                             — the SAME name spelled two ways,
+            #                             which is the answer we want anyway.
+            # So the union is ~4.5x the coverage at no measured cost in
+            # impostor acceptance. The four still missed (Bright, Clove,
+            # Meenakshi, Chandra) fail on Latin orthography, not on script —
+            # silent-e, gh, kṣ, and the epenthetic vowel Tamil inserts into
+            # "ndr". Deliberately not chased: each needs English pronunciation
+            # rules, and chasing them is how a contained round stops being one.
+            if my_vk:
+                cand_vk = {vk for vk in (_xscript_vkey(t) for t in cand_tok)
+                           if len(vk) >= _MIN_VKEY}
+                if cand_vk & my_vk:
+                    continue
+        log.error(f"\U0001f6d1 R7-C1 identity guard: reply claimed identity "
+                  f"{cand!r} for business {brain.get('customer_name')!r} "
+                  f"\u2014 refused, not cached, not stored.")
+        analytics.inc("guard.identity_block")
+        lang = detect_language(user_text)
+        return _UNVERIFIED_LINES.get(lang, _UNVERIFIED_LINES["en"]), True
     return reply, False
-
 
 
 # ── v16.2 · FIX R8-C2 (CRITICAL) ─────────────────────────────────────────────
@@ -6170,6 +6632,38 @@ _OPTOUT_HOWTO_LINES = {
 }
 
 
+# ── v18.0 · FIX R18-C3 (unbacked action claims) ──────────────────────────────
+# RESCHEDULE was absent from _ACTION_CLAIM_PATTERNS entirely — in every
+# language — even though reschedule is a first-class action in the booking
+# state machine (handle_booking, intent "reschedule", owner event
+# "rescheduled", template "booked_rescheduled"). So the one guard whose whole
+# job is "the model must not claim an action that did not run" was blind to a
+# third of the actions that exist. Verified on R17: "I have rescheduled your
+# appointment to 4 PM" passed straight through.
+# Also closed here, all reproduced: "i've unsubscribed"/"i've removed you"
+# (the contracted twins of forms that WERE listed), Tamil and Hindi CONFIRM
+# (both had cancel and book but not confirm, while English had confirm), and
+# romanized "confirm pannitten" (cancel/book pannitten were listed).
+_ACTION_CLAIM_PATTERNS_R18 = (
+    # reschedule / move — en
+    "has been reschedul", "have been reschedul", "i have reschedul",
+    "i've reschedul", "is reschedul", "are reschedul",
+    "i have moved your", "i've moved your", "i have changed your appointment",
+    "i've changed your appointment", "has been moved to",
+    # reschedule — ta / hi / roman
+    "மாற்றப்பட்ட", "மாற்றி விட்ட", "மாற்றிவிட்ட",
+    "बदल दिय", "बदल दी", "reschedule pannitten", "reschedule panniten",
+    "time maathitten", "maathitten",
+    # contracted twins of forms already listed
+    "i've unsubscribed", "i've removed you", "i have removed your name",
+    # confirm — ta / hi / roman (en already had "is confirmed")
+    "உறுதி செய்யப்பட்ட", "உறுதிசெய்யப்பட்ட", "confirm செய்யப்பட்ட",
+    "कन्फर्म हो गय", "कन्फर्म कर दिय", "पुष्टि हो गय",
+    "confirm pannitten", "confirm panniten", "confirm aagiduchu",
+)
+_ACTION_CLAIM_PATTERNS = tuple(_ACTION_CLAIM_PATTERNS) + _ACTION_CLAIM_PATTERNS_R18
+
+
 def _guard_unbacked_action_claim(reply: str, user_text: str) -> Tuple[str, bool]:
     """Refuse any reply that claims a booking/cancellation/opt-out was done."""
     if not reply:
@@ -6214,7 +6708,10 @@ def _guard_unbacked_action_claim(reply: str, user_text: str) -> Tuple[str, bool]
 # meant roughly 10 exchanges — and the slice was a no-op whenever history was
 # already capped below it. Named for what it counts, and set above the history
 # cap so the whole retained conversation is always scanned.
-_SAFETY_HISTORY_MESSAGES = 60
+# v17.0 R17-M1a: 60 sat above CHAT_HISTORY_LIMIT (20), so the slice was inert
+# and the real window was whatever the caller loaded. Matched to the actual
+# limit so the number states the truth rather than an aspiration.
+_SAFETY_HISTORY_MESSAGES = 20
 _PATIENT_CONDITION_TERMS = (
     "pregnan", "\u0b95\u0bb0\u0bcd\u0baa\u0bcd\u0baa", "garbh", "conceive", "trimester", "breastfeed",
     "pacemaker", "stent", "bypass", "heart condition", "cardiac", "cardiolog",
@@ -6222,11 +6719,21 @@ _PATIENT_CONDITION_TERMS = (
     "diabet", "sugar level", "\u0b9a\u0bb0\u0bcd\u0b95\u0bcd\u0b95\u0bb0\u0bc8",
     # v17.0 FIX R16-M2: bare "bp " matched "my bp is fine" and turned a
     # reassurance into a disclosed condition. Qualified forms only.
+    # v17.0 R17-C5a: R16-M2 fixed the "my bp is fine" false positive by listing
+    # adjective-FIRST forms only, so it missed "my bp is high", "enakku bp
+    # irukku", "bp 160" — the phrasings people here actually use. Both orders
+    # now, still without the bare "bp " that started this.
     "high bp", "low bp", "bp problem", "bp tablet", "bp medicine",
+    "bp is high", "bp high", "bp irukku", "bp iruku", "bp patient",
+    "bp 1", "bp 2", "sugar and bp", "bp and sugar", "bp check",
     "blood pressure", "hypertens", "thyroid",
     "asthma", "epilep", "seizure", "kidney", "dialysis", "liver", "hepatit",
     "cancer", "chemo", "radiation therapy", "tumour", "tumor",
-    "hiv", "immune", "transplant", "prosthe",
+    # v17.0 R17-C5b: "prosthe" matched "prosthesis/prosthetic", ordinary DENTAL
+    # vocabulary (dentures, crowns) — the same collision as "implant", one word
+    # over. Qualified forms only.
+    "hiv", "immune", "transplant", "joint prosthesis", "prosthetic joint",
+    "prosthetic valve",
     # v17.0 FIX R16-C2: bare "implant" sat in BOTH this list and
     # _PROCEDURE_TERMS. Once R16-C1 made history actually readable, one
     # "how much for a dental implant?" would mark the whole conversation as a
@@ -6238,6 +6745,95 @@ _PATIENT_CONDITION_TERMS = (
     "allerg", "penicillin", "anaesthes", "anesthes",
     "on medication", "medicine eduthu", "tablet eduthu", "maruthu",
 )
+# ── v22.0 · FIX R22-C1 (PATIENT SAFETY — the guard's three gates are AND-ed,
+#    and two of the three had no Indic vocabulary at all) ──────────────────────
+# _guard_clinical_safety_verdict refuses a reply only when THREE lists all hit:
+# the patient disclosed a condition, the reply reaches a safety verdict, and the
+# reply names a procedure. Three ANDs mean three independent chances at a TOTAL
+# bypass — the R21 defect class, one layer up. Nobody had measured this guard
+# from the non-English side.
+#
+# Measured on R21 over 672 realistic cases (7 conditions x 6 procedures x 4
+# verdict phrasings x 4 languages), each an R14-shaped failure — a disclosed
+# condition, a named procedure, a safety verdict:
+#
+#     language        refused      gate that opened
+#     English         168/168      —
+#     Thanglish       108/168      verdict 42, condition 24
+#     Tamil script      0/168      procedure 168, condition 120, verdict 42
+#     Hindi             0/168      condition 168, verdict 168, procedure 168
+#
+# _PROCEDURE_TERMS was 100% Latin, so every reply written in Tamil or Devanagari
+# failed gate 3 whatever else it said. _SAFETY_VERDICT_TERMS carried three Tamil
+# entries and NO Devanagari. _PATIENT_CONDITION_TERMS carried two Tamil words and
+# no Devanagari beyond the romanised "garbh".
+#
+# This matters more than the raw numbers because of R8-M1: the system prompt PINS
+# the reply to the patient's own language ("THIS TURN: the user's message is in
+# Tamil. Reply in that same language."). So the guard was structurally at its
+# weakest in exactly the conversations it exists for. End to end on /chat, model
+# stubbed to the reply a real patient would receive:
+#     EN "A dental x-ray is safe for you"          -> refused, referral line sent
+#     TA "பல் எக்ஸ்-ரே உங்களுக்கு பாதுகாப்பானது"        -> DELIVERED VERBATIM
+#     HI "डेंटल एक्स-रे आपके लिए सुरक्षित है"            -> DELIVERED VERBATIM
+# R14 exists because HELIO twice gave a clinical verdict — lead-apron guidance to
+# a pregnant patient, "drills are safe / antibiotics usually not required" to a
+# pacemaker patient. In Tamil and Hindi that control was never switched on.
+#
+# NOT MONOTONE, and said out loud (R21 could prove direction; this cannot).
+# Adding terms can only turn passes into refusals, so the entire risk is false
+# positives — and a false positive here mutes a useful answer and pushes a
+# patient toward a consultation they did not need. The burden of proof is
+# therefore on the control side, measured below at the fix.
+#
+# What is deliberately NOT here:
+#  - No bare "safe" equivalent. English lists "is safe"/"safe to", never "safe",
+#    so "there is safe parking behind the building" survives. The Tamil and Hindi
+#    entries are the inflected predicate forms only, for the same reason.
+#  - No bare "வலி"/"दर्द" (pain) or "பிரச்சனை"/"समस्या" (problem) in the condition
+#    list. Every dental patient has pain and a problem; that is the presenting
+#    complaint, not a disclosed medical condition, and it would mark every
+#    conversation for the rest of its life (the R16-C2 harm).
+#  - No bare "ஒவ்வாமை"/"एलर्जी" without qualification beyond what English already
+#    carries — "allerg" is already listed and already accepts the pre-op
+#    disclosure trade-off that R18-C2 documented for the emergency list.
+_PATIENT_CONDITION_TERMS_R22 = (
+    # ── pregnancy / feeding — Devanagari, plus the Tamil forms beyond கர்ப்ப
+    "\u0917\u0930\u094d\u092d", "\u092a\u094d\u0930\u0947\u0917\u094d\u0928\u0947\u0902\u091f", "\u0917\u0930\u094d\u092d\u0935\u0924\u0940",
+    "\u0938\u094d\u0924\u0928\u092a\u093e\u0928", "\u0918\u094d\u0930\u0928\u0940",
+    "\u0b95\u0bb0\u0bc1\u0bb5\u0bc1\u0bb1\u0bcd", "\u0baa\u0bbe\u0bb2\u0bcd \u0b95\u0bca\u0b9f\u0bc1",
+    # ── cardiac / implanted device
+    "\u092a\u0947\u0938\u092e\u0947\u0915\u0930", "\u0938\u094d\u091f\u0947\u0902\u091f", "\u0926\u093f\u0932 \u0915\u0940 \u092c\u0940\u092e\u093e\u0930",
+    "\u0939\u0943\u0926\u092f \u0930\u094b\u0917", "\u092c\u093e\u092f\u092a\u093e\u0938",
+    "\u0baa\u0bc7\u0bb8\u0bcd\u0bae\u0bc7\u0b95\u0bcd\u0b95\u0bb0\u0bcd", "\u0b9a\u0bcd\u0b9f\u0bc6\u0ba3\u0bcd\u0b9f\u0bcd", "\u0b87\u0ba4\u0baf \u0ba8\u0bcb\u0baf\u0bcd",
+    "\u0b87\u0ba4\u0baf\u0bae\u0bcd \u0b85\u0bb1\u0bc1\u0bb5\u0bc8",
+    # ── anticoagulants
+    "\u0916\u0942\u0928 \u092a\u0924\u0932\u093e", "\u0935\u093e\u0930\u092b\u093c\u093e\u0930\u093f\u0928",
+    "\u0bb0\u0ba4\u0bcd\u0ba4\u0bae\u0bcd \u0b89\u0bb1\u0bc8\u0baf\u0bbe\u0bae\u0bb2\u0bcd",
+    # ── diabetes — note "\u0b9a\u0bc1\u0b95\u0bb0\u0bcd"/"\u0936\u0941\u0917\u0930" are what patients actually type;
+    #    the dictionary words \u0b9a\u0bb0\u0bcd\u0b95\u0bcd\u0b95\u0bb0\u0bc8/\u092e\u0927\u0941\u092e\u0947\u0939 are what only textbooks use.
+    "\u0936\u0941\u0917\u0930", "\u092e\u0927\u0941\u092e\u0947\u0939", "\u0921\u093e\u092f\u092c\u093f\u091f\u0940\u091c",
+    "\u0b9a\u0bc1\u0b95\u0bb0\u0bcd", "\u0ba8\u0bc0\u0bb0\u0bbf\u0bb4\u0bbf\u0bb5\u0bc1",
+    # ── blood pressure — qualified both orders, mirroring R17-C5a, never bare
+    "\u0939\u093e\u0908 \u092c\u0940\u092a\u0940", "\u092c\u0940\u092a\u0940 \u0939\u093e\u0908", "\u092c\u0940\u092a\u0940 \u0915\u0940 \u0926\u0935\u093e",
+    "\u092c\u0940\u092a\u0940 \u0939\u0948", "\u0930\u0915\u094d\u0924\u091a\u093e\u092a", "\u092c\u094d\u0932\u0921 \u092a\u094d\u0930\u0947\u0936\u0930",
+    "\u0b89\u0baf\u0bb0\u0bcd \u0bb0\u0ba4\u0bcd\u0ba4", "\u0bb0\u0ba4\u0bcd\u0ba4 \u0b85\u0bb4\u0bc1\u0ba4\u0bcd\u0ba4", "\u0baa\u0bbf\u0baa\u0bbf \u0b87\u0bb0\u0bc1",
+    # ── endocrine / respiratory / neuro
+    "\u0925\u093e\u092f\u0930\u093e\u0907\u0921", "\u0926\u092e\u093e", "\u0905\u0938\u094d\u0925\u092e\u093e", "\u092e\u093f\u0930\u094d\u0917\u0940", "\u0926\u094c\u0930\u093e \u092a\u0921\u093c",
+    "\u0ba4\u0bc8\u0bb0\u0bbe\u0baf\u0bcd\u0b9f\u0bc1", "\u0b86\u0bb8\u0bcd\u0ba4\u0bc1\u0bae\u0bbe", "\u0bb5\u0bb2\u0bbf\u0baa\u0bcd\u0baa\u0bc1 \u0ba8\u0bcb\u0baf\u0bcd",
+    # ── organ / oncology / immune
+    "\u0915\u093f\u0921\u0928\u0940", "\u0921\u093e\u092f\u0932\u093f\u0938\u093f\u0938", "\u0932\u093f\u0935\u0930", "\u0915\u0948\u0902\u0938\u0930", "\u0915\u0940\u092e\u094b",
+    "\u0b9a\u0bbf\u0bb1\u0bc1\u0ba8\u0bc0\u0bb0\u0b95", "\u0b95\u0bc0\u0bae\u0bcb", "\u0baa\u0bc1\u0bb1\u0bcd\u0bb1\u0bc1\u0ba8\u0bcb\u0baf\u0bcd", "\u0b95\u0bb2\u0bcd\u0bb2\u0bc0\u0bb0\u0bb2\u0bcd",
+    # ── allergy / anaesthetic history (the twins of "allerg"/"anaesthes")
+    "\u090f\u0932\u0930\u094d\u091c\u0940", "\u0910\u0932\u0930\u094d\u091c\u0940", "\u092a\u0947\u0928\u093f\u0938\u093f\u0932\u093f\u0928",
+    "\u0b92\u0bb5\u0bcd\u0bb5\u0bbe\u0bae\u0bc8", "\u0baa\u0bc6\u0ba9\u0bbf\u0b9a\u0bbf\u0bb2\u0bbf\u0ba9\u0bcd",
+    # Romanised Tamil, same R18-C1 reason. "sugar level" was listed; "sugar
+    # irukku" — how a patient here actually discloses diabetes — was not, and it
+    # was the only Thanglish condition of seven that failed the gate. Qualified
+    # with the verb, never bare "sugar", which would catch "sugar free".
+    "sugar irukku", "sugar iruku", "sugar patient", "sugar problem",
+)
+_PATIENT_CONDITION_TERMS = _PATIENT_CONDITION_TERMS + _PATIENT_CONDITION_TERMS_R22
 _SAFETY_VERDICT_TERMS = (
     "is safe", "are safe", "safe to", "safe-ah", "safe-dhan", "safe dhan",
     "generally safe", "completely safe", "perfectly safe", "romba safe",
@@ -6246,6 +6842,35 @@ _SAFETY_VERDICT_TERMS = (
     "is required", "you will need", "recommended for you", "contraindicat",
     "\u0baa\u0bbe\u0ba4\u0bc1\u0b95\u0bbe\u0baa\u0bcd", "\u0b86\u0baa\u0ba4\u0bcd\u0ba4\u0bc1", "\u0ba4\u0bb5\u0bbf\u0bb0\u0bcd\u0b95\u0bcd\u0b95",
 )
+# v22.0 FIX R22-C1 — gate 2 carried three Tamil stems and ZERO Devanagari, so a
+# Hindi reply could not reach a verdict this guard was able to see. The Tamil
+# side also missed the two commonest ways a verdict is actually phrased here:
+# "\u0ba4\u0bc7\u0bb5\u0bc8\u0baf\u0bbf\u0bb2\u0bcd\u0bb2\u0bc8" (not required — the pacemaker/antibiotic sentence R14 was
+# raised for, verbatim) and "\u0baa\u0bbf\u0bb0\u0b9a\u0bcd\u0b9a\u0ba9\u0bc8 \u0b87\u0bb2\u0bcd\u0bb2\u0bc8" (no problem).
+# Following the English list's discipline exactly: no bare "\u0938\u0941\u0930\u0915\u094d\u0937\u093f\u0924"/"\u0baa\u0bbe\u0ba4\u0bc1\u0b95\u0bbe\u0baa\u0bcd"
+# as a standalone word would be added that did not already exist — the entries
+# below are predicate forms ("... \u0938\u0941\u0930\u0915\u094d\u0937\u093f\u0924 \u0939\u0948" = "is safe"), so "\u092a\u093e\u0930\u094d\u0915\u093f\u0902\u0917
+# \u0938\u0941\u0930\u0915\u094d\u0937\u093f\u0924 \u0939\u0948" is the one case knowingly accepted, and it needs a disclosed
+# condition AND a procedure term in the same reply to matter.
+_SAFETY_VERDICT_TERMS_R22 = (
+    # Tamil — the missing phrasings
+    "\u0ba4\u0bc7\u0bb5\u0bc8\u0baf\u0bbf\u0bb2\u0bcd\u0bb2", "\u0ba4\u0bc7\u0bb5\u0bc8 \u0b87\u0bb2\u0bcd\u0bb2", "\u0baa\u0bbf\u0bb0\u0b9a\u0bcd\u0b9a\u0ba9\u0bc8 \u0b87\u0bb2\u0bcd\u0bb2",
+    "\u0baa\u0bbf\u0bb0\u0b9a\u0bcd\u0b9a\u0ba9\u0bc8 \u0b95\u0bbf\u0b9f\u0bc8\u0baf\u0bbe", "\u0baa\u0bb0\u0bb5\u0bbe\u0baf\u0bbf\u0bb2\u0bcd\u0bb2", "\u0b86\u0baa\u0ba4\u0bcd\u0ba4\u0bc1 \u0b87\u0bb2\u0bcd\u0bb2",
+    "\u0b9a\u0bc6\u0baf\u0bcd\u0baf\u0bb2\u0bbe\u0bae\u0bcd", "\u0b9a\u0bc6\u0baf\u0bcd\u0baf \u0b95\u0bc2\u0b9f\u0bbe\u0ba4\u0bc1", "\u0ba4\u0bc7\u0bb5\u0bc8\u0baa\u0bcd\u0baa\u0b9f",
+    # Hindi — none of this existed
+    "\u0938\u0941\u0930\u0915\u094d\u0937\u093f\u0924 \u0939\u0948", "\u0938\u0941\u0930\u0915\u094d\u0937\u093f\u0924 \u0930\u0939\u0947\u0917", "\u092a\u0942\u0930\u0940 \u0924\u0930\u0939 \u0938\u0941\u0930\u0915\u094d\u0937\u093f\u0924",
+    "\u0938\u0941\u0930\u0915\u094d\u0937\u093f\u0924 \u0928\u0939\u0940\u0902", "\u0916\u0924\u0930\u093e \u0928\u0939\u0940\u0902", "\u0915\u094b\u0908 \u0926\u093f\u0915\u094d\u0915\u0924 \u0928\u0939\u0940\u0902",
+    "\u091c\u093c\u0930\u0942\u0930\u0924 \u0928\u0939\u0940\u0902", "\u091c\u0930\u0942\u0930\u0924 \u0928\u0939\u0940\u0902", "\u0906\u0935\u0936\u094d\u092f\u0915\u0924\u093e \u0928\u0939\u0940\u0902",
+    "\u092c\u091a\u0928\u093e \u091a\u093e\u0939\u093f\u090f", "\u0928\u0939\u0940\u0902 \u0915\u0930\u0935\u093e\u0928\u093e \u091a\u093e\u0939\u093f\u090f", "\u0915\u0930\u0935\u093e \u0938\u0915\u0924\u0947 \u0939\u0948\u0902",
+    "\u0932\u0947\u0928\u093e \u0938\u0941\u0930\u0915\u094d\u0937\u093f\u0924", "\u0906\u092a\u0915\u0947 \u0932\u093f\u090f \u0938\u0941\u0930\u0915\u094d\u0937\u093f\u0924", "\u0915\u094b\u0908 \u0916\u0924\u0930\u093e \u0928\u0939\u0940\u0902",
+    # Romanised Tamil. R18-C1 keeps Latin on EXACT token matching by design, so
+    # every surface form has to be spelled out — and the measurement showed the
+    # imperative "avoid pannunga" (the way an actual Thanglish reply tells you to
+    # skip something) had no listed twin, while "should avoid"/"must avoid" did.
+    # 42 of the 60 Thanglish misses were this single unlisted phrasing.
+    "avoid pannunga", "avoid pannunum", "vena nu solren", "vendam",
+)
+_SAFETY_VERDICT_TERMS = _SAFETY_VERDICT_TERMS + _SAFETY_VERDICT_TERMS_R22
 _PROCEDURE_TERMS = (
     "x-ray", "xray", "scan", "ct ", "mri", "radiograph",
     "anaesthe", "anesthe", "sedation", "injection",
@@ -6254,6 +6879,34 @@ _PROCEDURE_TERMS = (
     "root canal", "implant", "crown", "filling", "whitening", "braces",
     "treatment", "procedure",
 )
+# v22.0 FIX R22-C1 — gate 3 was 100% Latin, so it failed on 168 of 168 Tamil
+# cases and 168 of 168 Hindi ones no matter what the other two gates said. Most
+# dental procedure names in both languages are transliterations of the English,
+# which is why the Latin list looked like it might carry them and does not:
+# "\u0b8e\u0b95\u0bcd\u0bb8\u0bcd-\u0bb0\u0bc7" and "x-ray" share no characters. Native words are listed
+# alongside the transliterations because patients and models use both.
+# "\u0bae\u0bb0\u0bc1\u0ba8\u0bcd\u0ba4\u0bc1"/"\u0926\u0935\u093e" (medicine) and "\u0b9a\u0bbf\u0b95\u0bbf\u0b9a\u0bcd\u0b9a\u0bc8"/"\u0907\u0932\u093e\u091c" (treatment) are broad,
+# and are included only because English already carries their exact twins
+# ("medicine", "treatment"); the AND with the other two gates is what keeps them
+# safe, and the control measurement at the fix is what proves it.
+_PROCEDURE_TERMS_R22 = (
+    # Tamil — transliterated
+    "\u0b8e\u0b95\u0bcd\u0bb8\u0bcd-\u0bb0\u0bc7", "\u0b8e\u0b95\u0bcd\u0bb8\u0bcd \u0bb0\u0bc7", "\u0bb8\u0bcd\u0b95\u0bc7\u0bb2\u0bbf\u0b99\u0bcd", "\u0bb0\u0bc2\u0b9f\u0bcd \u0b95\u0bbe\u0bb2\u0bcd",
+    "\u0b86\u0ba3\u0bcd\u0b9f\u0bbf\u0baa\u0baf\u0bbe\u0b9f\u0bbf\u0b95\u0bcd", "\u0b85\u0ba9\u0bb8\u0bcd\u0ba4\u0bc0\u0bb7\u0bbf\u0baf\u0bbe", "\u0b87\u0bae\u0bcd\u0baa\u0bcd\u0bb3\u0bbe\u0ba3\u0bcd\u0b9f\u0bcd",
+    "\u0b95\u0bbf\u0bb0\u0bb5\u0bc1\u0ba9\u0bcd", "\u0baa\u0bcd\u0bb3\u0bc2\u0bb0\u0bc8\u0b9f\u0bcd", "\u0b9a\u0bcd\u0b95\u0bc7\u0ba9\u0bcd",
+    # Tamil — native
+    "\u0baa\u0bb2\u0bcd \u0baa\u0bbf\u0b9f\u0bc1\u0b99\u0bcd", "\u0baa\u0bbf\u0b9f\u0bc1\u0b99\u0bcd\u0b95", "\u0b9a\u0bbf\u0b95\u0bbf\u0b9a\u0bcd\u0b9a\u0bc8", "\u0b85\u0bb1\u0bc1\u0bb5\u0bc8 \u0b9a\u0bbf\u0b95\u0bbf",
+    "\u0bae\u0baf\u0b95\u0bcd\u0b95 \u0bae\u0bb0\u0bc1\u0ba8\u0bcd\u0ba4\u0bc1", "\u0bae\u0bb0\u0bc1\u0ba8\u0bcd\u0ba4\u0bc1", "\u0b8a\u0b9a\u0bbf", "\u0bae\u0bbe\u0ba4\u0bcd\u0ba4\u0bbf\u0bb0\u0bc8",
+    "\u0baa\u0bb2\u0bcd \u0b9a\u0bc1\u0ba4\u0bcd\u0ba4", "\u0bb5\u0bc6\u0bb3\u0bcd\u0bb3\u0bc8\u0baf\u0bbe\u0b95\u0bcd\u0b95",
+    # Hindi — transliterated
+    "\u090f\u0915\u094d\u0938-\u0930\u0947", "\u090f\u0915\u094d\u0938 \u0930\u0947", "\u0938\u094d\u0915\u0947\u0932\u093f\u0902\u0917", "\u0930\u0942\u091f \u0915\u0948\u0928\u093e\u0932",
+    "\u090f\u0902\u091f\u0940\u092c\u093e\u092f\u094b\u091f\u093f\u0915", "\u090f\u0928\u0947\u0938\u094d\u0925\u0940\u0938\u093f\u092f\u093e", "\u0907\u092e\u094d\u092a\u094d\u0932\u093e\u0902\u091f",
+    "\u0915\u094d\u0930\u093e\u0909\u0928", "\u092b\u093f\u0932\u093f\u0902\u0917", "\u0938\u094d\u0915\u0948\u0928", "\u0907\u0902\u091c\u0947\u0915\u094d\u0936\u0928",
+    # Hindi — native
+    "\u0926\u093e\u0901\u0924 \u0928\u093f\u0915\u093e\u0932", "\u0926\u093e\u0902\u0924 \u0928\u093f\u0915\u093e\u0932", "\u0938\u092b\u093e\u0908", "\u0907\u0932\u093e\u091c", "\u0938\u0930\u094d\u091c\u0930\u0940",
+    "\u0926\u0935\u093e", "\u0917\u094b\u0932\u0940", "\u0938\u0941\u0908 \u0932\u0917",
+)
+_PROCEDURE_TERMS = _PROCEDURE_TERMS + _PROCEDURE_TERMS_R22
 _CLINICAL_REFERRAL_LINES = {
     "en": ("I'm not able to advise whether that is safe in your situation — "
            "that depends on your full medical history and only the doctor can "
@@ -6293,12 +6946,15 @@ def _guard_clinical_safety_verdict(reply: str, brain: Dict, user_text: str,
         # matched. Both shapes are read now, because the WhatsApp path and the
         # API path do not agree on one.
         for _h in history[-_SAFETY_HISTORY_MESSAGES:]:
-            if (_h.get("role") or "") not in ("user", "human"):
+            # R17-M1b: "human" was never written by anything here — handling a
+            # shape that does not exist is what hid R15-C3 for a whole round.
+            if (_h.get("role") or "") != "user":
                 continue
             _txt = _h.get("content")
             if _txt is None:
-                _parts = _h.get("parts") or []
-                _txt = _parts[0] if _parts else ""
+                # R17-M1c: join every part, not just [0] — multi-part content
+                # was silently truncated to its first fragment.
+                _txt = " ".join(str(x) for x in (_h.get("parts") or []))
             u += " " + str(_txt or "").lower()
     r = reply.lower()
     if not any(t in u for t in _PATIENT_CONDITION_TERMS):
@@ -6565,6 +7221,11 @@ def is_opted_out_checked(customer_id: str, subject: str) -> Tuple[bool, bool]:
         return True, False               # fail closed, and SAY it's a guess
 
 
+# v17.0 R17-N1: DEAD as of R6 — the reminder scheduler was changed to a batch
+# pre-filter and stopped calling this, and nothing replaced it. Left in place
+# rather than deleted: it is correct, it is the obvious helper for a future
+# per-subject check, and deleting working untested code mid-audit is how you
+# introduce the next bug. Flagged so it is a decision, not an oversight.
 def is_opted_out(customer_id: str, subject: str) -> bool:
     """True = never initiate an outbound to this subject again. Fails CLOSED
     on a cache miss + DB error: silence is the safe direction for consent.
@@ -6600,7 +7261,14 @@ def _is_unique_violation(exc: Exception) -> bool:
     if POSTGRES_AVAILABLE:
         try:
             if isinstance(exc, psycopg2.Error):
-                return getattr(exc, "pgcode", None) == "23505"
+                # v20.0 R20-C2: 23P01 is exclusion_violation — what the new
+                # bk_no_overlap constraint raises. Without it here, the
+                # durable guard added in R20-C1 would surface as
+                # booking.error and the patient would be told something went
+                # wrong instead of "that time just went, here are the others".
+                # A correct backstop that produces a wrong message is a
+                # regression, not a fix.
+                return getattr(exc, "pgcode", None) in ("23505", "23P01")
         except Exception:
             pass
     if isinstance(exc, sqlite3.IntegrityError):
@@ -8134,6 +8802,108 @@ _RESCHED_WORDS = ("reschedule", "change appointment", "change time", "postpone",
 _STATUS_WORDS = ("my appointment", "my booking", "when is my", "appointment status",
                  "booking status")
 
+# ── v23.0 · FIX R23-C1 (BOOKING STATE MACHINE — a Tamil or Hindi patient could
+#    not cancel, reschedule, or check an appointment) ──────────────────────────
+# The Rule 3 census made this visible in about a minute: of 24 safety lists,
+# _CANCEL_WORDS was 100% Latin (6 entries), and _RESCHED_WORDS and _STATUS_WORDS
+# were too. These are the triggers detect_booking_intent dispatches on, so a
+# patient writing the script most of this launch market writes fell straight
+# through to the AI, which has no booking tools and cannot release a slot.
+#
+# Measured on R22 by execution over a realistic population, not by counting:
+#
+#     intent        en      tg      ta      hi      overall
+#     cancel       5/5     5/5     0/5     0/5     10/20  (50%)
+#     reschedule   2/3     2/3     0/3     0/3      4/12  (33%)
+#     status       2/2     1/2     0/2     0/2      3/8   (38%)
+#
+# This is the same defect class as R18 (emergency keywords), R21 (the identity
+# guard's cross-script bridge) and R22 (the clinical-safety control) — the fourth
+# consecutive round — but it is the first time it has landed in the BOOKING state
+# machine rather than in a guard, and that changes the harm. A dead guard fails
+# open and something unsafe reaches the patient. A dead trigger fails CLOSED and
+# leaves zombie state: the patient asks to cancel, the engine does not
+# understand, the row stays 'booked', and the clinic's chair is held by someone
+# who tried to give it back. Nobody is told. Nothing logs. The slot is simply
+# gone until _migrate/cleanup marks it 'completed' after slot_end has passed.
+#
+# The English and Thanglish misses came out of the same measurement and are the
+# ordinary asymmetry trap: "change time" was listed but "change the time" was
+# not, and "time maathu" was listed but "time maathunga" — the polite imperative,
+# which is how anyone actually says it — was not.
+#
+# Order matters and is preserved: detect_booking_intent tests reschedule BEFORE
+# cancel, so "நேரம் மாற்ற" must not also read as a cancel. Verified by execution.
+#
+# DELIBERATELY NOT ADDED:
+#  - bare "வேண்டாம்" / "नहीं चाहिए". They are the ordinary words for "no thanks"
+#    and they are how a patient answers NO inside the cancel-confirmation window
+#    (_CANCEL_NO_RAW). Listing them as a cancel TRIGGER would let a patient
+#    declining a slot cancel a different appointment. Only the compound
+#    "அப்பாயின்ட்மென்ட் வேண்டாம்" form is listed.
+#  - bare "அப்பாயின்ட்மென்ட்" / "अपॉइंटमेंट" in the status list. _STATUS_WORDS is
+#    matched with post_w=0 and would then swallow "எனக்கு அப்பாயின்ட்மென்ட்
+#    வேண்டும்" — which is a BOOKING request, the opposite intent. Compounds only.
+#  - bare "ரத்த". "ரத்து" (cancel) and "ரத்தம்" (blood) share four codepoints, and
+#    R18-C1 gives Indic tokens bounded prefix matching. Checked by execution:
+#    0 collisions between every candidate cancel keyword and five Tamil/Hindi
+#    bleeding-emergency phrases, and those phrases still fire the emergency layer.
+_CANCEL_WORDS_R23 = (
+    # English / Thanglish mirrors the measurement exposed
+    "cancel it", "cancel my appointment", "want to cancel", "cancel panniduven",
+    "appointment venda", "booking venda",
+    # Tamil script
+    "ரத்து செய்",          # ரத்து செய் — annul
+    "ரத்து பண்ண",          # ரத்து பண்ண
+    "கேன்சல்",                        # கேன்சல்
+    "புக்கிங் ரத்து",   # புக்கிங் ரத்து
+    "அப்பாயின்ட்மென்ட் ரத்து",
+    "அப்பாயின்ட்மென்ட் வேண்டாம்",
+    # Devanagari
+    "कैंसिल",                              # कैंसिल
+    "केंसिल", "रद्द", "निरस्त",
+    "अपॉइंटमेंट नहीं चाहिए",
+    "बुकिंग कैंसिल",
+)
+_CANCEL_WORDS = _CANCEL_WORDS + _CANCEL_WORDS_R23
+
+_RESCHED_WORDS_R23 = (
+    "change the time", "change my appointment", "move my appointment",
+    "another time", "different time", "time maathunga", "time maathanum",
+    "vera time venum", "reschedule pannunga",
+    # Tamil script
+    "நேரம் மாற்ற",     # நேரம் மாற்ற
+    "மாற்றணும்",            # மாற்றணும்
+    "வேறு நேரம்",           # வேறு நேரம்
+    "ரீ-ஷெட்யூல்",
+    "நேரம் மாற்றணும்",
+    # Devanagari
+    "समय बदल",                             # समय बदल
+    # R18-C1 gives Indic tokens prefix matching only from a 4-codepoint stem,
+    # and "बदल" is three — so it can never reach "बदलना", which is the form
+    # anyone actually writes. Caught by the measurement, not by reading. The
+    # surface forms are spelled out, exactly as R18-C1 requires for Latin.
+    "समय बदलना", "टाइम बदलना", "समय बदलें", "समय बदलवा", "अपॉइंटमेंट बदलना",
+    "टाइम बदल", "री-शेड्यूल",
+    "दूसरा टाइम", "दूसरा समय",
+)
+_RESCHED_WORDS = _RESCHED_WORDS + _RESCHED_WORDS_R23
+
+_STATUS_WORDS_R23 = (
+    "en appointment eppo", "booking status enna", "appointment eppo",
+    # Tamil script — compounds only, never the bare noun (see note above)
+    "அப்பாயின்ட்மென்ட் எப்போது",
+    "புக்கிங் நிலை",
+    "எனது அப்பாயின்ட்மென்ட்",
+    "என் புக்கிங்",
+    # Devanagari — compounds only
+    "अपॉइंटमेंट कब",
+    "बुकिंग की स्थिति",
+    "मेरा अपॉइंटमेंट",
+    "मेरी बुकिंग",
+)
+_STATUS_WORDS = _STATUS_WORDS + _STATUS_WORDS_R23
+
 # v15g2 FIX C2b: explicit YES vocabulary for the cancel-confirmation step
 # (en / ta / hi + the tapped button id). Anything NOT in this set keeps the
 # appointment — the only safe default for a destructive action.
@@ -8273,7 +9043,8 @@ def _booking_status_text(b: Optional[Dict], lang: str = "en") -> str:
 def handle_booking(brain: Dict, from_phone: str, user_text: str,
                    out_pid: str, out_tok: str, customer_id: str,
                    session_id: str, subject_name: str = "",
-                   channel: str = "whatsapp") -> bool:   # v16.5 R11-H1
+                   channel: str = "whatsapp",
+                   sink: Optional[List[str]] = None) -> bool:   # v19.0 R19-C1
     """Deterministic booking state machine. Returns True if it handled the
     message (caller should then stop). Returns False to let the normal AI run.
     v14g5 FIX 12: a RESCHEDULE no longer cancels the existing appointment up-front;
@@ -8569,16 +9340,21 @@ def handle_booking(brain: Dict, from_phone: str, user_text: str,
     if action is None:
         return False
     _booking_dispatch(action, from_phone, out_pid, out_tok, customer_id,
-                      session_id, user_text, lang=lang)   # v16g4 FIX M8
+                      session_id, user_text, lang=lang,
+                      channel=channel, sink=sink)   # v19.0 R19-C1
     # v16.5 R11-H1: patient first, owner second — the confirmation the patient
     # is waiting on never queues behind a notification.
     if _owner_event:
         notify_owner_booking(brain, _owner_event, subject_name, from_phone,
                              _owner_slot, channel=channel)
-    if booked_ok:
+    if booked_ok and channel != "api":
         # v16 U3: booking secured → if this patient is username-only (BSUID)
         # and we hold no real number, ask exactly once. Reminders need it;
         # the ask rides AFTER the ✅ confirmation so the flow feels natural.
+        # v19.0 R19-C1c: never on the api channel — _maybe_request_phone sends
+        # a WhatsApp interactive message to a chat id that does not exist, and
+        # would burn the 7-day nag guard for an identity that will never be
+        # seen again.
         _maybe_request_phone(customer_id, from_phone, out_pid, out_tok,
                              lang=lang)   # v16g4 FIX M8
     return True
@@ -8660,7 +9436,8 @@ def notify_owner_booking(brain: Dict, event: str, subject_name: str,
 
 def _booking_dispatch(action: Tuple, from_phone: str, out_pid: str, out_tok: str,
                       customer_id: str, session_id: str, user_text: str,
-                      lang: str = "en") -> None:
+                      lang: str = "en", channel: str = "whatsapp",
+                      sink: Optional[List[str]] = None) -> None:   # v19.0 R19-C1
     """Record the turn, THEN send — v15g2 FIX L4: this path was send-then-persist,
     contradicting the v14g5 FIX 50 persist-then-send standard, so a crash between
     the network send and the save dropped the turn from history. Handles three
@@ -8688,8 +9465,12 @@ def _booking_dispatch(action: Tuple, from_phone: str, out_pid: str, out_tok: str
         _, msg = action
         log_text = msg
     try:
+        # v19.0 R19-C1b: this hard-coded "whatsapp" as the inbound channel.
+        # Once /chat reaches this path, every demo turn would have been filed
+        # as a WhatsApp message — corrupting the one table the clinic reads to
+        # see where its patients actually come from.
         save_messages_batch(session_id, [
-            ("user",  user_text, "whatsapp", 0),
+            ("user",  user_text, ("api" if channel == "api" else "whatsapp"), 0),
             ("model", log_text,  "booking",  0)])
         increment_chat_count(customer_id)
         analytics.inc("booking.handled")
@@ -8698,6 +9479,20 @@ def _booking_dispatch(action: Tuple, from_phone: str, out_pid: str, out_tok: str
         # trail existing — a swallowed save must at least be visible.
         analytics.inc("booking.persist_failed")
         log.warning(f"⚠️  booking turn persist failed (session={session_id}): {_pe}")
+    # ── v19.0 · FIX R19-C1 (REVENUE-CRITICAL) ───────────────────────────────
+    # The api channel has no WhatsApp session to send into, so the reply is
+    # CAPTURED and handed back to the caller instead. log_text is exactly what
+    # a WhatsApp user whose interactive send failed would have received — the
+    # numbered slot list, or the confirmation body plus the typed YES/NO line
+    # — so the demo shows the real flow, not a re-implementation of it that
+    # can drift. Everything above this point (persist, cache, offer/cancel
+    # state) has already run identically for both channels; only the transport
+    # differs.
+    if channel == "api":
+        if sink is not None:
+            sink.append(log_text)
+        analytics.inc("booking.api_captured")
+        return
     if action[0] == "list":
         _, body, rows, _payload = action
         sent = wa_send_list_now(from_phone, body, _t("btn_pick_time", lang),
@@ -11072,7 +11867,12 @@ def chat():
     # demoing a consent feature that does not exist. Same keywords, same
     # l10n keys, same durable write as the real line.
     if _norm_text(req.message) in _OPT_OUT_KEYWORDS:
-        _ok   = opt_out_subject(req.customer_id, f"api:{req.customer_id}")
+        # v17.0 R17-C8: this suppressed the demo for EVERY visitor at the
+        # clinic — one person typing STOP silenced it for all of them, sitting
+        # directly below a per-visitor _gov_uid that got this right.
+        _ok   = opt_out_subject(req.customer_id,
+                                f"api:{req.customer_id}:"
+                                + (session_id or get_remote_address() or "anon"))
         _lang = detect_language(req.message)
         analytics.inc("chat.optout" if _ok else "chat.optout_failed")
         if not _ok:
@@ -11129,15 +11929,15 @@ def chat():
     # not be honoured either: say the line, then carry on answering.
     if _gov["muted"] and not _gov["reply"]:
         analytics.inc("chat.gov_mute_ignored_demo")
-    elif _gov["muted"]:
-        return jsonify({
-            "reply":      "",
-            "muted":      True,
-            "provider":   "system",
-            "escalated":  True,
-            "session_id": session_id,
-            "request_id": g.get("request_id"),
-        }), 200
+    # v17.0 R17-C6: R16 had an `elif _gov["muted"]` arm here that could never
+    # run — govern_message only sets muted=True in the branch that returns
+    # reply=None, so the first condition always won. It also left R16-C7's
+    # carefully-scoped uid with no consumer at all: C7 built a stable key and
+    # C8 then ignored the mute unconditionally, so the two cancelled out.
+    # Resolution: on the demo the mute is genuinely the wrong behaviour (there
+    # is no owner to page and nobody is coming), so it is ignored on purpose —
+    # once, explicitly, with the counter above — and the uid still earns its
+    # keep because govern_message's per-caller dedupe reads it.
     if _gov["reply"]:
         analytics.inc("chat.gov_reply")
         # v17.0 FIX R16-C9: R15 returned the governed reply and wrote nothing.
@@ -11154,6 +11954,9 @@ def chat():
             increment_chat_count(req.customer_id)
             _gov_persisted = True
         except Exception as exc:
+            # R17-C7: if create_session succeeded but the batch threw, the new
+            # session id was still returned alongside persisted:false — the
+            # client then kept writing into a session with no first turn.
             _gov_persisted = False
             log.warning(f"\u26a0\ufe0f  /chat governed turn not persisted: {exc}")
         return jsonify({
@@ -11166,6 +11969,76 @@ def chat():
             "persisted":  _gov_persisted,
             "request_id": g.get("request_id"),
         }), 200
+
+    # ── v19.0 · FIX R19-C1 (REVENUE-CRITICAL) ───────────────────────────────
+    # Audited 4-Aug: handle_booking was reachable ONLY from the WhatsApp
+    # webhook. /chat — the endpoint every demo and every prospect actually
+    # touches — sent "appointment venum" straight to the model, which answered
+    # with a friendly sentence and booked nothing. So the deterministic slot
+    # machine that is the entire reason a clinic would pay for this was
+    # invisible in the one place it gets judged, and the demo showed a
+    # chatbot rather than a receptionist. Same position in the pipeline as the
+    # webhook: after opt-out, after govern_message, before the AI.
+    #
+    # Identity: bookings key on from_phone, and there is no phone here. The
+    # engine has been identity-neutral since v16 (BSUID patients), so an
+    # "api:" identity flows through unchanged. It must be STABLE per visitor
+    # and UNIQUE across visitors — the same requirement R16-C7 established
+    # for _gov_uid, and for the same reason: keyed on customer_id alone, one
+    # visitor's slot offer would be handed to the next visitor, and
+    # MAX_ACTIVE_BOOKINGS_PER_PHONE would be a shared clinic-wide cap instead
+    # of a per-visitor one. Reuse the governance identity verbatim.
+    #
+    # The session must exist BEFORE this runs: _booking_dispatch persists
+    # first and sends second (the v14g5 FIX 50 standard), and a None
+    # session_id would throw inside the try and silently lose the audit trail
+    # of a real booking.
+    if cfg.ENABLE_BOOKING and cfg.BOOKING_ON_API:
+        _bk_sink: List[str] = []
+        _bk_session = session_id
+        try:
+            if not _bk_session:
+                _bk_session = create_session(req.customer_id, channel="api")
+            # v19.0 R19-C1d: this first used _gov_uid, and a live run caught
+            # it inside one turn. _gov_uid falls back to the REMOTE ADDRESS
+            # when session_id is empty — which it is on the very first
+            # message — and switches to the session id from turn two onward.
+            # The slot offer was therefore cached under one identity and
+            # looked up under another: the patient got a slot list, typed
+            # "1", and the pick fell through to the AI. Exactly the R16-C7
+            # failure, one layer down. The session is created immediately
+            # above and echoed back to the client, so it is stable from the
+            # first turn — key on that and nothing else.
+            _bk_identity = f"api:{req.customer_id}:{_bk_session}"
+            _bk_handled = handle_booking(
+                brain, _bk_identity, req.message, "", "", req.customer_id,
+                _bk_session, subject_name="", channel="api", sink=_bk_sink)
+        except Exception as _bke:
+            # A booking failure must never take down the turn — fall through
+            # to the AI, which at least keeps the conversation alive.
+            analytics.inc("chat.booking_error")
+            log.error(f"❌ /chat booking failed (cust={req.customer_id}): {_bke}")
+            _bk_handled = False
+        if _bk_handled and _bk_sink:
+            analytics.inc("chat.booking_handled")
+            return jsonify({
+                "reply":      "\n\n".join(_bk_sink),
+                "provider":   "booking",
+                "escalated":  False,
+                "session_id": _bk_session,
+                "persisted":  True,
+                "request_id": g.get("request_id"),
+            }), 200
+        if _bk_handled and not _bk_sink:
+            # Handled but produced no text: impossible today (handle_booking
+            # returns True only after dispatching an action) — but if a future
+            # branch ever does, returning an empty reply is worse than letting
+            # the AI answer. Say so loudly rather than shipping silence.
+            analytics.inc("chat.booking_empty")
+            log.error("❌ R19-C1: handle_booking returned True with no captured "
+                      "reply on /chat — falling through to the AI.")
+        session_id = _bk_session
+        _new_session = False
 
     t0 = time.monotonic()
     try:
@@ -12151,7 +13024,24 @@ def startup() -> None:
     # ── Startup Summary ──
     log.info("=" * 76)
     log.info(f"  🌐  Port:            {cfg.PORT}")
-    log.info(f"  🗄️   DB Mode:         {cfg.DATABASE_MODE}")
+    # v18.0 FIX R18-H1: this printed cfg.DATABASE_MODE, which is the INTENT
+    # ("postgres" by default), not the pool that actually got built. With
+    # DATABASE_URL unset or psycopg2 missing, the engine silently fell back to
+    # SQLite and still announced "postgres" at boot. On Render that is the
+    # difference between durable data and a database wiped on every redeploy,
+    # reported as success. Print what was actually constructed, and say so
+    # loudly when it disagrees with what was asked for.
+    _actual = "postgres" if type(_db_pool).__name__ == "PostgreSQLPool" else "sqlite"
+    log.info(f"  🗄️   DB Mode:         {_actual}"
+             + ("" if _actual == cfg.DATABASE_MODE
+                else f"  ⚠️  (DATABASE_MODE={cfg.DATABASE_MODE} requested)"))
+    if _actual != cfg.DATABASE_MODE:
+        log.critical(
+            f"🛑 R18-H1: DATABASE_MODE={cfg.DATABASE_MODE} was requested but the "
+            f"engine is running on {_actual}. "
+            + ("DATABASE_URL is empty. " if not cfg.DATABASE_URL else "")
+            + ("psycopg2 is not installed. " if not POSTGRES_AVAILABLE else "")
+            + "On an ephemeral host, SQLite data is LOST on every redeploy.")
     log.info(f"  📚  Read Replica:    "
              f"{'YES ✅' if isinstance(_db_pool, PostgreSQLPool) and _db_pool._read else 'NO'}")
     log.info(f"  🧠  Redis Cache:     "
@@ -12274,9 +13164,9 @@ def startup() -> None:
                     "— if you run more than 1 worker, set WEB_CONCURRENCY to "
                     "the same number so rate-limit and DB-pool math stay true.")
     log.info("=" * 76)
-    log.info(f"  🦅  {ENGINE_VERSION} {ENGINE_GEN} — 47/47 round-6 findings "
-             f"closed · sealed owner PII · delivery-status feedback · "
-             f"commit-path overlap guard")
+    log.info(f"  🦅  {ENGINE_VERSION} {ENGINE_GEN} — R23 · a Tamil or Hindi "
+             f"patient can now cancel, reschedule and check an appointment "
+             f"(booking intent triggers were 100% Latin: 0/5 ta, 0/5 hi)")
     log.info("=" * 76)
     _startup_ready.set()   # v16g4 FIX L4: boot genuinely complete
 
