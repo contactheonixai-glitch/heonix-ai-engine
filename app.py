@@ -1246,10 +1246,10 @@ cfg = Config()
 # said GEN-4, /health said GEN-3, the shutdown log said GEN-3, the startup
 # banner said GEN-5). After a hotfix night, /health is the one thing that
 # must be trusted to say which build is live. One constant; all derive.
-ENGINE_VERSION = "v23.0"   # R23
+ENGINE_VERSION = "v30.0"   # R30
 ENGINE_GEN     = "GEN-6"
 ENGINE_BANNER  = (f"HEONIX ULTRA ENGINE {ENGINE_VERSION} {ENGINE_GEN} "
-                  f"(Usernames/BSUID · 181 audit fixes)")
+                  f"(Usernames/BSUID · 182 audit fixes)")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1272,7 +1272,20 @@ class _JSONFormatter(logging.Formatter):
 def _build_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG if cfg.DEBUG else logging.INFO)
-    handler = logging.StreamHandler()   # v11 fix #12: stdout ONLY.
+    # v27.0 · FIX R27-C1. The comment below said "stdout ONLY" and the block
+    # under it says Render captures stdout "so that is the single source of
+    # truth" — but logging.StreamHandler() with no argument defaults to
+    # STDERR. Measured on a plain boot of v26: stdout 0 lines, stderr 2.
+    # Render captures both, so nothing was lost there; anywhere that ships
+    # stdout only — a `gunicorn … | logshipper` pipe, a container runtime
+    # that splits the streams, a structured-log ingest configured for stdout —
+    # received NOTHING. That is the entire 🛑 detection surface: R18-H1's
+    # database-mode warning, R20-C1's missing constraint, R26-C1's zombie
+    # booking. Detectors built over nine rounds, all writing to a stream the
+    # code says it does not use. Same class as R18-H1 itself: a stated intent
+    # that was never implemented, believed for sixteen versions because the
+    # comment read true.
+    handler = logging.StreamHandler(sys.stdout)   # v11 fix #12 · v27 R27-C1
     fmt = _JSONFormatter() if cfg.LOG_FORMAT == "json" else logging.Formatter(
         "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
@@ -2514,7 +2527,14 @@ def _migrate_v14g4() -> None:
 # That is check-then-act: under READ COMMITTED two workers both run the SELECT,
 # both see nothing, and both INSERT. uq_book_slot cannot catch it because it
 # indexes slot_start EQUALITY — 14:00-14:30 and 14:20-14:50 have different
-# starts. SQLite has been hiding this by serialising writes; Postgres will not.
+# starts. SQLite was BELIEVED to be hiding this by serialising writes. v30
+# R30-M1 measured that and it is only half true. Six independent processes
+# racing mutually-overlapping slots through booking_create give exactly one
+# row on BOTH backends — but that is the guard above winning, not the
+# database. With the guard bypassed by a direct INSERT (an admin tool, a
+# migration, a future code path that forgets it) PostgreSQL raises 23P01 and
+# holds at one row, while SQLite writes BOTH overlapping rows. SQLite has no
+# backstop at all; it only ever had the guard.
 #
 # Reproduced on PostgreSQL 16.14 with two real connections interleaved exactly
 # as two gunicorn workers would be:
@@ -2561,6 +2581,23 @@ def _migrate_booking_overlap_constraint() -> None:
     because live data already contains an overlap, say so LOUDLY and carry on:
     refusing to boot would take a working clinic offline over a historical row."""
     if not isinstance(_db_pool, PostgreSQLPool):
+        # v30.0 · FIX R30-M1. This early-return was SILENT, and silence is the
+        # failure mode this engine is worst at detecting. On SQLite there is no
+        # bk_no_overlap and no bk_slot_iso_utc — the only thing preventing a
+        # double-booked chair is booking_create's in-transaction check-then-
+        # insert, which a direct write does not go through. Postgres is the
+        # production backend, so this is normally dev-only; it stops being
+        # dev-only the moment a Postgres URL is wrong or the free tier is
+        # reclaimed and the pool falls back — the R18-H1 scenario that made the
+        # banner report the pool actually built rather than the mode requested.
+        log.warning(
+            "\u26a0\ufe0f  SQLite mode: booking overlap has NO durable "
+            "constraint. bk_no_overlap (EXCLUDE ... WITH &&) and "
+            "bk_slot_iso_utc are PostgreSQL-only, so partial overlaps are "
+            "prevented solely by booking_create's in-transaction guard, and "
+            "any write that bypasses it can double-book. Measured on v29 with "
+            "the guard bypassed: Postgres 23P01 (1 row), SQLite 2 overlapping "
+            "rows. Use Postgres in production (v20 R20-C1).")
         return
     try:
         with _db_pool.get() as conn:
@@ -5279,6 +5316,84 @@ _HUMAN_KW = [
     "எம்.டி கிட்ட", "நேரடியா பேசணும்",
     "डॉक्टर से बात", "मैनेजर से बात", "किसी इंसान से बात", "इंसान से बात",
 ]
+# ── v25.0 · FIX R25-C1 (PATIENT SAFETY — human handoff, romanised Tamil) ─────
+# MEASURED on R24, driven through govern_message with healthcare=True, one
+# A.uid() per case (never a slice of the message — R21's harness trap):
+#
+#     register            reached a human
+#     English                 10/10
+#     Tamil script             5/5
+#     Hindi                    4/4
+#     romanised Tamil          0/15
+#
+# _HUMAN_KW was the ONLY patient-inbound trigger list in the engine with ZERO
+# Thanglish entries. Every other one carries it: _EMERGENCY_KW 68, _BOOK_WORDS
+# 11, _OPT_OUT_KEYWORDS 10, _RESCHED_WORDS 9, _CANCEL_WORDS 4, _VIP_KW 2.
+# The Tamil-script entry above is literally "டாக்டர் கிட்ட பேசணும்" — the same
+# sentence, in the other script. The twin was written and the romanisation was
+# forgotten: the R18/R21/R22/R23/R24 asymmetry, in a sixth list.
+#
+# Rule 2 — isolated before believing it. The matcher is fine:
+#     _kw_hit(_norm_text("doctor kitta pesanum"), "kitta pesanum") -> True
+# The keyword simply was not in the list. The list, not the matcher.
+#
+# What the patient experiences on R24: "doctor kitta pesanum" produces
+# alerts=0, muted=False, reply=None. No 🙋 TAKE OVER alert to the owner, no
+# ghost-mute, no canned handoff line. The patient keeps talking to a bot and
+# the clinic is never told anyone asked for a person. It fails CLOSED, so
+# nothing logs and no detector fires — invisible to Rule 6.
+#
+# It matters most where it is least visible: govern_message is the PRE-AI
+# gate, so when Gemini is down — the live condition on this deployment, where
+# the free-tier cap 503s the demo — this list is the ONLY route to a human.
+# The measurement above ran with zero AI providers configured, and English,
+# Tamil and Hindi patients still reached one. Thanglish patients did not.
+#
+# SHAPE OF EVERY ENTRY: a human TARGET plus a SPEAK verb, never a bare verb.
+# "pesanum" alone would fire on "naan tamil la pesanum" (I want to speak IN
+# TAMIL) and page a doctor for a language preference. The discriminating token
+# is the connector "kitta/kitte/kooda" (to/with a PERSON), which is not
+# grammatical without a person on its left. Latin is EXACT by design (R18-C1),
+# so every romanised variant is spelled out; there is no stemming to fall
+# back on, and A.dead_indic_stems does not apply to a Latin list.
+#
+# MEASURED AFTER: tg 15/15, one proving sentence PER ENTRY (Rule 9 — zero dead
+# entries), and 0 false fires across 37 controls built as the harm shape:
+# ordinary clinic Thanglish that mentions doctor / pesa / kitta ("doctor kitta
+# appointment venum", "english la pesa mudiyuma", "bus stand kitta clinic
+# irukka" — for a PLACE, kitta means "near"), the R23/R24 booking intents, and
+# four spellings of refusal.
+#
+# DELIBERATELY NOT ADDED:
+#  - bare "kitta pesa". It covers "kitta pesa mudiyuma" for free, and it was
+#    measured firing on "enakku doctor kitta pesa venam" (I do NOT want to
+#    speak to the doctor) — because _NEGATORS_POST carries "vendam"/"venda"
+#    and not the "venam" spelling. Spelling out the positive modal instead
+#    removes the dependency on a negator list this round is not touching.
+#    The _NEGATORS_POST gap is real and is reported, not patched.
+#  - bare "pesanum" / "pesa" / "kitta" / "manushan". Each is ordinary Tamil.
+#  - bare "doctor". Half of all clinic traffic names the doctor.
+_HUMAN_KW_R25 = (
+    # connector + speak-verb — needs a person noun on its left to be
+    # grammatical at all, which is what keeps it off language-preference
+    # sentences, where there is no connector.
+    "kitta pesanum", "kitte pesanum", "kita pesanum", "kitta pesanam",
+    "kitta pesa mudiyuma", "kitte pesa mudiyuma", "kitta pesa mudiyum",
+    "kooda pesanum", "kuda pesanum", "kitta konjam pesanum",
+    "kitta pesa vendum", "kitta line kudunga",
+    "kitta connect pannunga", "kitta connect panunga",
+    # explicit human target + connector (the verb is implied by the noun)
+    "manushan kitta", "manusha kitta", "manidhan kitta", "aal kitta",
+    "aalu kitta", "yaaravathu kitta", "yaarayavathu kitta", "yaarachum kitta",
+    "staff kitta", "reception kitta",
+    # "speak to me directly" idioms — no connector, so listed in full
+    "direct a pesanum", "directa pesanum", "neradiya pesanum",
+    "nerdiya pesanum",
+    # "put the doctor on / call the doctor". _norm_text turns the hyphen in
+    # "doctor-a" into a space, hence the two-token forms.
+    "doctor a kupdunga", "doctor kupdunga", "doctor a koopidunga",
+)
+_HUMAN_KW = _HUMAN_KW + list(_HUMAN_KW_R25)
 _VIP_KW = [
     "crore", "crores", "lakh", "lakhs", "budget", "premium", "luxury",
     "penthouse", "villa", "bulk order", "wholesale", "enterprise plan",
@@ -8794,6 +8909,82 @@ _BOOK_WORDS_WEAK   = ("schedule", "available", "availability", "timing",
                       "milna", "samay", "dikhana")
 _BOOK_CONTEXT      = ("appointment", "book", "slot", "visit", "doctor", "dr",
                       "clinic", "tomorrow", "today", "when", "free", "time")
+
+# ── v24.0 · FIX R24-C1 (BOOKING — a Tamil or Hindi patient could not BOOK) ────
+# R23 restored cancel, reschedule and status for Indic patients and never asked
+# the prior question. The Rule 8 runtime census asked it: _BOOK_WORDS is 23
+# entries, 22 English and 1 Thanglish — zero Tamil, zero Devanagari. So the
+# product's PRIMARY function was unavailable in both of its launch market's
+# scripts, and had been through twenty-three audit rounds.
+#
+# Measured by execution over 28 realistic booking requests, 7 per language:
+#
+#     en  6/7        tg  5/7        ta  0/7        hi  0/7      overall 11/28 (39%)
+#
+# Driven to the outcome (Rule 10), not to the gate:
+#     [EN] provider='booking'  slots offered: True
+#     [TA] provider=None       slots offered: False   -> "AI unavailable"
+#     [HI] provider=None       slots offered: False   -> "AI unavailable"
+# The message falls through to an AI that has no booking tools, so a patient
+# asking for an appointment in Tamil receives a conversational reply and no slot
+# list, forever. Fails CLOSED (Rule 9): nothing logs, no detector fires, and the
+# clinic simply never hears from that patient again.
+#
+# Rule 2 — isolated before believing it. _kw_hit works correctly on Indic input
+# (verified against a Tamil cancel keyword on the same text), and
+# _BOOK_WORDS contains no Indic entry at all. The list, not the matcher.
+#
+# Two structural notes that shaped the fix:
+#  - detect_booking_intent tests reschedule -> cancel -> status -> book, so book
+#    is LAST and these entries cannot hijack the three intents R23 repaired.
+#    Asserted as a fence.
+#  - the WEAK path is a conjunctive guard (Rule 5): _BOOK_WORDS_WEAK AND
+#    _BOOK_CONTEXT. Both were 100% Latin, so it was doubly dead in Indic —
+#    two ANDs, two bypasses. Both halves are extended here or the weak path
+#    stays dead no matter what is added to one of them.
+#
+# DELIBERATELY NOT ADDED:
+#  - bare "நேரம்" / "समय" (time) to the STRONG list. "உங்கள் நேரம் என்ன?" and
+#    "आपका समय क्या है?" are "what are your opening hours" — a question every
+#    clinic gets daily — and booking them would answer an FAQ with a slot list.
+#    They appear in _BOOK_CONTEXT only, where a WEAK word must also hit.
+#  - bare "அப்பாயின்ட்மென்ட்" / "अपॉइंटमेंट" to STRONG. English carries bare
+#    "appointment" and gets away with it because status and cancel are tested
+#    first and both now have Indic entries — but relying on branch order for a
+#    bare noun is how R15's C2a hijacks happened. Compounds only.
+#  - bare "பார்க்க" / "मिलना" (to see / to meet). They are ordinary verbs;
+#    "உங்க கிளினிக்கை பார்க்க வேண்டும்" is someone asking for directions. They
+#    are WEAK entries, requiring a _BOOK_CONTEXT hit alongside.
+_BOOK_WORDS_STRONG_R24 = (
+    # English / Thanglish surface forms the measurement exposed
+    "need to see the doctor", "see the doctor", "appointment kidaikuma",
+    "time venum", "slot venuma", "appointment venuma",
+    # Tamil script — compounds only
+    "அப்பாயின்ட்மென்ட் வேண்டும்", "அப்பாயின்ட்மென்ட் வேணும்",
+    "அப்பாயின்ட்மென்ட் புக்", "அப்பாயின்ட்மென்ட் கிடைக்கும்",
+    "புக் பண்ணணும்", "புக் பண்ண", "நேரம் ஒதுக்க", "நேரம் புக்",
+    # Devanagari — compounds only. R18-C1 gives Indic prefix matching only from
+    # a 4-codepoint stem, so short verb stems are spelled out as surface forms
+    # (the R23 lesson: "बदल" is three and can never reach "बदलना").
+    "अपॉइंटमेंट चाहिए", "अपॉइंटमेंट बुक", "अपॉइंटमेंट लेना", "अपॉइंटमेंट दे",
+    "अपॉइंटमेंट मिलेगा", "समय दे दीजिए", "स्लॉट है", "बुक करना है",
+)
+_BOOK_WORDS_STRONG = _BOOK_WORDS_STRONG + _BOOK_WORDS_STRONG_R24
+
+_BOOK_WORDS_WEAK_R24 = (
+    "paakanum", "paaka", "time irukka", "irukka", "kidaikuma",
+    "பார்க்க", "பார்க்கணும்", "இருக்கா", "ஒதுக்க", "வேணும்",
+    "मिलना", "मिलेगा", "दिखाना", "लेना है", "मिल सकता",
+)
+_BOOK_WORDS_WEAK = _BOOK_WORDS_WEAK + _BOOK_WORDS_WEAK_R24
+
+_BOOK_CONTEXT_R24 = (
+    "டாக்டர்", "டாக்டரை", "மருத்துவர்", "மருத்துவரை", "அப்பாயின்ட்மென்ட்",
+    "கிளினிக்", "நாளை", "நாளைக்கு", "இன்று", "இன்னைக்கு", "நேரம்", "பல்",
+    "डॉक्टर", "अपॉइंटमेंट", "क्लिनिक", "कल", "आज", "समय", "दाँत", "दांत",
+)
+_BOOK_CONTEXT = _BOOK_CONTEXT + _BOOK_CONTEXT_R24
+
 _BOOK_WORDS = _BOOK_WORDS_STRONG + _BOOK_WORDS_WEAK   # back-compat alias
 _CANCEL_WORDS = ("cancel", "cancel appointment", "cancel booking", "cancel pannu",
                  "venda", "radd")
@@ -8950,13 +9141,65 @@ _OPT_OUT_RAW = (
     "\u0bb5\u0bc7\u0ba3\u0bcd\u0b9f\u0bbe\u0bae\u0bcd \u0b87\u0ba9\u0bbf\u0bae\u0bc7 message \u0b85\u0ba9\u0bc1\u0baa\u0bcd\u0baa\u0bbe\u0ba4\u0bc0\u0b99\u0bcd\u0b95",
     "\u0b9a\u0bc6\u0baf\u0ba4\u0bbf \u0b85\u0ba9\u0bc1\u0baa\u0bcd\u0baa\u0bbe\u0ba4\u0bc0\u0b99\u0bcd\u0b95",
     "\u0b9a\u0bc6\u0baf\u0ba4\u0bbf \u0bb5\u0bc7\u0ba3\u0bcd\u0b9f\u0bbe\u0bae\u0bcd",
+    # v28.0 · FIX R28-C1. R8-H1 above rewrote this list from keyword-shaped to
+    # sentence-shaped because "real people write whole sentences" — and did it
+    # for English, Tamil script and romanised Tamil only. Devanagari kept the
+    # bare keyword forms it had before ("बंद करो", "रोको"), and matching is
+    # EXACT whole-message by design (#201), so a bare keyword can never be
+    # reached by a sentence. Measured on v27 over 7 real Hindi opt-out
+    # sentences: en 5/7, ta 7/7, tg 7/7, **hi 0/7**. Driven end-to-end on
+    # /chat: the English sentence returns 200 with provider="system" and one
+    # opt_outs row; the identical Hindi sentence records NOTHING and falls
+    # through to the model — exactly the 22-Jul failure R8-H1 was written to
+    # stop, still live for one register. Sentence forms only; no bare "बंद"
+    # (a patient asking "बंद क्यों है" is asking whether the clinic is shut)
+    # and no bare "नहीं चाहिए" (that is how a patient declines a slot).
     "message anuppadheenga", "message anupadhinga", "msg anuppadheenga",
     "innime message anuppadheenga", "message anupathinga",
     "stop sending messages", "stop messaging me", "do not message me",
     "dont message me", "no more messages", "remove me from list",
     "remove my number",
 )
-_OPT_OUT_KEYWORDS = {_norm_text(x) for x in _OPT_OUT_RAW}
+
+_OPT_OUT_RAW_R28 = (
+    "\u092e\u0941\u091d\u0947 \u092e\u0948\u0938\u0947\u091c \u092e\u0924 \u092d\u0947\u091c\u094b",
+    "\u092e\u0941\u091d\u0947 \u092e\u0948\u0938\u0947\u091c \u092e\u0924 \u092d\u0947\u091c\u093f\u090f",
+    "\u092e\u0948\u0938\u0947\u091c \u092e\u0924 \u092d\u0947\u091c\u094b",
+    "\u092e\u0948\u0938\u0947\u091c \u092d\u0947\u091c\u0928\u093e \u092c\u0902\u0926 \u0915\u0930\u094b",
+    "\u092e\u0948\u0938\u0947\u091c \u092d\u0947\u091c\u0928\u093e \u092c\u0902\u0926 \u0915\u0930\u0947\u0902",
+    "\u092e\u0941\u091d\u0947 \u0914\u0930 \u092e\u0948\u0938\u0947\u091c \u0928\u0939\u0940\u0902 \u091a\u093e\u0939\u093f\u090f",
+    "\u092e\u0941\u091d\u0947 \u092e\u0948\u0938\u0947\u091c \u0928\u0939\u0940\u0902 \u091a\u093e\u0939\u093f\u090f",
+    "\u0905\u092c \u092e\u0948\u0938\u0947\u091c \u092e\u0924 \u092d\u0947\u091c\u093f\u090f",
+    "\u0905\u092c \u092e\u0948\u0938\u0947\u091c \u092e\u0924 \u092d\u0947\u091c\u094b",
+    "\u092e\u0947\u0930\u093e \u0928\u0902\u092c\u0930 \u0939\u091f\u093e \u0926\u094b",
+    "\u092e\u0947\u0930\u093e \u0928\u0902\u092c\u0930 \u0939\u091f\u093e\u0907\u090f",
+    "\u092e\u0941\u091d\u0947 \u0932\u093f\u0938\u094d\u091f \u0938\u0947 \u0939\u091f\u093e \u0926\u094b",
+    "\u0938\u0902\u0926\u0947\u0936 \u092c\u0902\u0926 \u0915\u0930\u094b",
+    "\u0938\u0902\u0926\u0947\u0936 \u092e\u0924 \u092d\u0947\u091c\u094b",
+    "\u092e\u0948\u0938\u0947\u091c \u092c\u0902\u0926 \u0915\u0930\u094b",
+    "\u0915\u094b\u0908 \u092e\u0948\u0938\u0947\u091c \u092e\u0924 \u092d\u0947\u091c\u094b",
+)
+_OPT_OUT_KEYWORDS = {_norm_text(x) for x in _OPT_OUT_RAW + _OPT_OUT_RAW_R28}
+
+# v29.0 · FIX R29-C1. The WhatsApp handler suppresses the ENTIRE opt-out list
+# while a slot offer (900s) or a cancel confirmation is open. /chat and the
+# Instagram webhook suppress nothing — three implementations of one consent
+# operation, and the strictest one is on the only channel real patients use.
+# Measured: WA with no window records a row; WA with bk_offer open records
+# NOTHING, for "stop sending messages" AND for a bare "unsubscribe"; /chat
+# records a row for the same text. Suppression is defensible only for forms
+# that could plausibly mean "stop THIS flow" — a bare stop-word answering a
+# slot list. It is not defensible for "unsubscribe", "opt out", "remove my
+# number" or any sentence form: those cannot mean anything except consent
+# withdrawal, and DPDP does not pause for a booking window.
+_OPT_OUT_AMBIGUOUS_IN_WINDOW = {_norm_text(x) for x in (
+    "stop", "\u0ba8\u0bbf\u0bb1\u0bc1\u0ba4\u0bcd\u0ba4\u0bc1",
+    "\u0ba8\u0bbf\u0bb1\u0bc1\u0ba4\u0bcd\u0ba4\u0bc1\u0b99\u0bcd\u0b95",
+    "\u0ba8\u0bbf\u0bb1\u0bc1\u0ba4\u0bcd\u0ba4\u0bc1\u0b99\u0bcd\u0b95\u0bb3\u0bcd",
+    "niruthu", "niruthunga", "stop pannu", "stop pannunga",
+    "\u0930\u094b\u0915\u094b", "\u092c\u0902\u0926 \u0915\u0930\u094b",
+    "band karo", "bandh karo",
+)}
 
 
 def detect_booking_intent(text: str) -> Optional[str]:
@@ -9493,21 +9736,75 @@ def _booking_dispatch(action: Tuple, from_phone: str, out_pid: str, out_tok: str
             sink.append(log_text)
         analytics.inc("booking.api_captured")
         return
+    # ── v26.0 · FIX R26-C1 (ZOMBIE BOOKING — persist committed, patient never told)
+    # Rule 12, eight rounds on the ledger, driven for the first time here.
+    #
+    # The house convention is persist-first-send-second, which is right. But the
+    # send below was UNGUARDED, and everything above it has already committed.
+    # Measured on the WhatsApp path with the transport raising ConnectionError
+    # immediately after the commit:
+    #
+    #   booking row committed ........ yes
+    #   slot removed from availability yes
+    #   patient told .................. NO
+    #   handle_booking returned ....... None (the exception escaped)
+    #   outbox entry .................. none
+    #   retry ......................... none
+    #
+    # And there is no retry to be had. The webhook returns 200 to Meta the
+    # instant it queues (`ALWAYS 200 immediately — Meta must never time out or
+    # retry-storm`), so Meta never redelivers; the wamid dedupe claim is only
+    # released when the BACKLOG is full, not when the worker throws; and the
+    # worker's own handler logs a generic `❌ ordered task error` with a stack
+    # trace, which tells nobody that a chair is now held by a patient who does
+    # not know they booked it. The clinic loses the slot AND the patient.
+    #
+    # The cure was already in the building. `outbox_publish("whatsapp.send", …)`
+    # is the transactional outbox — persisted first, drained by a background
+    # worker, at-least-once — and reminders and owner alerts have used it since
+    # v14. Booking confirmations, the one message a patient is actually waiting
+    # for, went out on a bare synchronous call. The patient messaged us this
+    # turn, so they are inside WhatsApp's 24-hour service window by definition
+    # and free text delivers.
+    #
+    # Swallowing is deliberate and narrow: the booking DID happen, so
+    # handle_booking must still return True or the AI answers on top of a real
+    # confirmation. The exception is converted into a durable retry plus a
+    # SPECIFIC log line — the failure this guards is silence, so the cure is
+    # noise that names what is actually wrong.
+    def _send_or_queue(fn, *args, **kwargs) -> None:
+        try:
+            if fn(*args, **kwargs):
+                return
+            send_whatsapp_sync(from_phone, log_text, out_pid, out_tok, customer_id)
+            return
+        except Exception as exc:
+            queued = outbox_publish("whatsapp.send", {
+                "to": from_phone, "customer_id": customer_id,
+                "message": log_text})
+            analytics.inc("booking.send_failed_queued" if queued
+                          else "booking.send_failed_lost")
+            log.critical(
+                f"🛑 R26-C1 ZOMBIE BOOKING: the row is COMMITTED and the slot is "
+                f"consumed, but the confirmation did not reach the patient "
+                f"(cust={customer_id}, action={action[0]}). "
+                + ("Re-queued on the outbox for retry. " if queued else
+                   "OUTBOX PUBLISH ALSO FAILED — this patient will not be told "
+                   "by any automatic path. ")
+                + f"Cause: {type(exc).__name__}: {exc}")
+
     if action[0] == "list":
         _, body, rows, _payload = action
-        sent = wa_send_list_now(from_phone, body, _t("btn_pick_time", lang),
-                                rows, out_pid, out_tok, customer_id,
-                                header=_t("hdr_book", lang))   # v16g4 FIX M8
-        if not sent:
-            send_whatsapp_sync(from_phone, log_text, out_pid, out_tok, customer_id)
+        _send_or_queue(wa_send_list_now, from_phone, body,
+                       _t("btn_pick_time", lang), rows, out_pid, out_tok,
+                       customer_id, header=_t("hdr_book", lang))   # v16g4 FIX M8
     elif action[0] == "confirm":
         _, body, buttons = action
-        sent = wa_send_buttons_now(from_phone, body, buttons,
-                                   out_pid, out_tok, customer_id)
-        if not sent:
-            send_whatsapp_sync(from_phone, log_text, out_pid, out_tok, customer_id)
+        _send_or_queue(wa_send_buttons_now, from_phone, body, buttons,
+                       out_pid, out_tok, customer_id)
     else:
-        send_whatsapp_sync(from_phone, log_text, out_pid, out_tok, customer_id)
+        _send_or_queue(lambda *a, **k: send_whatsapp_sync(*a, **k) or True,
+                       from_phone, log_text, out_pid, out_tok, customer_id)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -11328,10 +11625,19 @@ def _process_wa_message(from_phone: str, msg: dict, phone_number_id: str = "",
         # (2) template quick-replies ("Stop promotions") arrive as msg_type
         # 'button' or 'interactive', and a tap on the unsubscribe button did
         # NOTHING — user_text already carries the tapped text by this point.
+        _oo_norm = _norm_text(user_text)
+        # v29.0 FIX R29-C1: the window now suppresses only the AMBIGUOUS forms,
+        # and only when booking is actually enabled — the sibling _bk_pending
+        # 45 lines below already gates on cfg.ENABLE_BOOKING, so a stale cache
+        # key on a booking-disabled tenant was silently eating opt-outs here
+        # while meaning nothing there. Strictly MONOTONE: this can only ever
+        # record more opt-outs than v28, never fewer.
+        _bk_window = bool(cfg.ENABLE_BOOKING and (
+            brain_cache.get(f"bk_cancel:{customer_id}:{from_phone}")
+            or brain_cache.get(f"bk_offer:{customer_id}:{from_phone}")))
         if (msg_type in ("text", "button", "interactive")
-                and _norm_text(user_text) in _OPT_OUT_KEYWORDS
-                and not (brain_cache.get(f"bk_cancel:{customer_id}:{from_phone}")
-                         or brain_cache.get(f"bk_offer:{customer_id}:{from_phone}"))):
+                and _oo_norm in _OPT_OUT_KEYWORDS
+                and not (_bk_window and _oo_norm in _OPT_OUT_AMBIGUOUS_IN_WINDOW)):
             # v16g5 FIX R5-H4: the durable suppression FIRST — this is what
             # actually stops reminders and follow-ups. The CRM consent flip
             # stays as a secondary signal for the ops views.
@@ -12892,6 +13198,140 @@ _startup_lock = threading.Lock()
 _startup_ready = threading.Event()   # v16g4 FIX L4
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 🛑 v25.0 · FIX R25-S1 — THE INBOUND-COVERAGE INVARIANT
+#    (fix the CLASS, not the sixth instance)
+# ─────────────────────────────────────────────────────────────────────────────
+# Six consecutive rounds found ONE defect: an inbound keyword list written by
+# somebody thinking in English, so a whole register of patients cannot reach a
+# feature AT ALL.
+#   R18 emergency keywords · R21 identity bridge · R22 clinical control ·
+#   R23 cancel/reschedule/status · R24 BOOK — the primary function, dead in
+#   ta/hi through 23 rounds · R25 human handoff, dead in romanised Tamil.
+# Six instances means the CLASS is the defect, and patching a seventh buys
+# exactly one more round. This assertion runs at every boot, on every deploy,
+# and NAMES the feature and the register — the same move R18-H1 made when it
+# stopped trusting the configured value and printed the one actually built.
+#
+# THREE DESIGN CHOICES, each from something that measurably went wrong:
+#
+# 1. The check is BEHAVIOURAL, not a word count. It drives a real patient
+#    sentence through the real production matcher. A script-counting census
+#    has to GUESS which register a Latin string belongs to, and it guesses
+#    badly: the audit toolkit's own heuristic misfiles 15 of R25-C1's 31
+#    genuine romanised-Tamil entries as English. A list can also read healthy
+#    and be dead — an entry shadowed by an earlier branch, killed by a
+#    negator, or with a stem too short to ever match (R23: Hindi "बदल" is
+#    three codepoints and can never reach "बदलना"). Only driving the matcher
+#    answers the question the patient cares about.
+#
+# 2. The registry is EXPLICIT, not a name prefix. The toolkit's
+#    INBOUND_PREFIXES is itself a hand-maintained list — the same defect one
+#    level up — and measured against this file it matched 26 of 49 string
+#    collections. A new list with an unanticipated name is invisible to a
+#    prefix scan and visible here only if somebody adds a probe, which is a
+#    line of code in a diff rather than a silence.
+#
+# 3. Required registers are declared PER FEATURE. A global required=("ta","hi")
+#    is precisely what hid R25-C1 for twenty-four rounds: _HUMAN_KW had Tamil
+#    AND Hindi and zero romanised Tamil, so it passed every check while a
+#    Thanglish patient could not reach a human at all. Note this covers
+#    INBOUND lists only — reply-side guard lists are deliberately out of
+#    scope, because the model writes Tamil script or English and R8-M1 pins
+#    it to the patient's language, so demanding "tg" there would be noise.
+_INBOUND_PROBES = (
+    # (feature, what this patient loses, {register: one real patient sentence})
+    ("emergency", "report a medical emergency", {
+        "en": "i have severe chest pain",
+        "ta": "எனக்கு நெஞ்சு வலி ரொம்ப அதிகமா இருக்கு",
+        "hi": "मुझे सीने में दर्द हो रहा है",
+        "tg": "enakku romba nenju vali irukku",
+    }),
+    ("human", "reach a human being", {
+        "en": "i want to talk to a human",
+        "ta": "டாக்டர் கிட்ட பேசணும்",
+        "hi": "मुझे डॉक्टर से बात करनी है",
+        "tg": "doctor kitta pesanum",
+    }),
+    ("book", "book an appointment", {
+        "en": "i want to book an appointment",
+        "ta": "எனக்கு அப்பாயின்ட்மென்ட் புக் பண்ணணும்",
+        "hi": "मुझे अपॉइंटमेंट बुक करना है",
+        "tg": "enakku appointment book pannanum",
+    }),
+    ("cancel", "cancel an appointment", {
+        "en": "please cancel my appointment",
+        "ta": "என் அப்பாயின்ட்மென்ட் ரத்து செய்யுங்க",
+        "hi": "मेरा अपॉइंटमेंट रद्द कर दीजिए",
+        "tg": "en appointment cancel pannunga",
+    }),
+    ("reschedule", "move an appointment", {
+        "en": "can i reschedule my appointment",
+        "ta": "என் அப்பாயின்ட்மென்ட் நேரம் மாற்றணும்",
+        "hi": "मेरा अपॉइंटमेंट का समय बदलना है",
+        "tg": "en appointment time maathanum",
+    }),
+    # v28.0 · FIX R28-S1. THE CONTROL ITSELF WAS THE GAP. R25-S1 probes six
+    # features; opt-out is a seventh patient-inbound route and had no probe,
+    # so R28-C1 (hi 0/7) sat under a boot line reading "all 6 features
+    # reachable in en/ta/hi/tg" for two rounds. Mutation-tested the R25
+    # control first: emptying each of the six features' own lists makes every
+    # one of its 24 (feature, register) probes go dead — zero survivors, so
+    # the control is sound ON ITS REGISTRY. Its weakness is the registry's
+    # EDGE, which is the failure mode any explicit registry has and the price
+    # design choice 2 knowingly pays. Adding the seventh route is the fix;
+    # the general lesson is that a new inbound feature must arrive with its
+    # probe in the same diff.
+    ("optout", "stop receiving messages", {
+        "en": "stop sending messages",
+        "ta": "\u0b9a\u0bc6\u0baf\u0ba4\u0bbf \u0bb5\u0bc7\u0ba3\u0bcd\u0b9f\u0bbe\u0bae\u0bcd",
+        "hi": "\u092e\u0948\u0938\u0947\u091c \u092d\u0947\u091c\u0928\u093e \u092c\u0902\u0926 \u0915\u0930\u094b",
+        "tg": "message anuppadheenga",
+    }),
+    ("status", "check an appointment", {
+        "en": "when is my appointment",
+        "ta": "என் அப்பாயின்ட்மென்ட் எப்போது",
+        "hi": "मेरा अपॉइंटमेंट कब है",
+        "tg": "en appointment eppo",
+    }),
+)
+
+
+def _probe_fires(feature: str, text: str) -> bool:
+    """Drive ONE probe through the REAL production matcher — no parallel
+    implementation, because a parallel implementation is a thing that can
+    agree with itself while the engine disagrees with both. healthcare=True:
+    that is the launch market and the strictest emergency list."""
+    if feature in ("emergency", "human"):
+        return bool(classify_message(text, healthcare=True).get(feature))
+    if feature == "optout":
+        # v28.0 R28-S1: opt-out does NOT go through detect_booking_intent. It
+        # is exact whole-message membership (#201) — the real consumer at
+        # /chat, the WhatsApp webhook and the Instagram webhook is this same
+        # expression, so the probe drives production, not a copy of it.
+        return _norm_text(text) in _OPT_OUT_KEYWORDS
+    return detect_booking_intent(text) == feature
+
+
+def _assert_inbound_coverage() -> List[str]:
+    """One line per (feature, register) a patient cannot reach at all.
+
+    DELIBERATELY NON-FATAL. A clinic mid-consultation must not lose its
+    receptionist because a keyword list is thin — and the failure this guards
+    against is SILENCE, so the cure is noise, not a crash. It is also wrapped
+    by the caller: a bug in this check must never be what stops a boot.
+    """
+    violations: List[str] = []
+    for feature, loses, probes in _INBOUND_PROBES:
+        dead = sorted(reg for reg, text in probes.items()
+                      if not _probe_fires(feature, text))
+        if dead:
+            violations.append(
+                f"{feature}: no route from {'/'.join(dead)} — "
+                f"those patients cannot {loses}")
+    return violations
+
+
 def startup() -> None:
     global _db_pool, _startup_done
     with _startup_lock:
@@ -13163,10 +13603,27 @@ def startup() -> None:
         log.warning("  🚨  Running under gunicorn but WEB_CONCURRENCY is unset/1 "
                     "— if you run more than 1 worker, set WEB_CONCURRENCY to "
                     "the same number so rate-limit and DB-pool math stay true.")
+    # ── v25.0 · FIX R25-S1: the inbound-coverage invariant, at every boot ───
+    try:
+        _cov = _assert_inbound_coverage()
+    except Exception as _cov_exc:          # never let the check break a boot
+        _cov = []
+        log.error(f"❌ R25-S1 inbound-coverage check failed to run: {_cov_exc}")
+    if _cov:
+        log.critical("  🛑  R25-S1 INBOUND COVERAGE — %d feature/register "
+                     "pair(s) a patient CANNOT REACH. This fails SILENTLY: "
+                     "nothing logs when a patient is not understood.",
+                     len(_cov))
+        for _v in _cov:
+            log.critical("      🛑  %s", _v)
+    else:
+        log.info("  ✅  R25-S1 INBOUND COVERAGE — all %d features reachable "
+                 "in en/ta/hi/tg.", len(_INBOUND_PROBES))
     log.info("=" * 76)
-    log.info(f"  🦅  {ENGINE_VERSION} {ENGINE_GEN} — R23 · a Tamil or Hindi "
-             f"patient can now cancel, reschedule and check an appointment "
-             f"(booking intent triggers were 100% Latin: 0/5 ta, 0/5 hi)")
+    log.info(f"  🦅  {ENGINE_VERSION} {ENGINE_GEN} — R27 · every defensive log "
+             f"line now reaches STDOUT as _build_logger always claimed "
+             f"(measured v26: stdout 0, stderr 2) · 8 suites / 243 tests / "
+             f"373 assertions green on one build for the first time")
     log.info("=" * 76)
     _startup_ready.set()   # v16g4 FIX L4: boot genuinely complete
 
