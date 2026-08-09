@@ -1246,7 +1246,7 @@ cfg = Config()
 # said GEN-4, /health said GEN-3, the shutdown log said GEN-3, the startup
 # banner said GEN-5). After a hotfix night, /health is the one thing that
 # must be trusted to say which build is live. One constant; all derive.
-ENGINE_VERSION = "v30.0"   # R30
+ENGINE_VERSION = "v31.0"   # R31
 ENGINE_GEN     = "GEN-6"
 ENGINE_BANNER  = (f"HEONIX ULTRA ENGINE {ENGINE_VERSION} {ENGINE_GEN} "
                   f"(Usernames/BSUID · 182 audit fixes)")
@@ -1723,6 +1723,26 @@ analytics = AnalyticsEngine()
 # 🏊  DATABASE LAYER  — Primary write pool + optional read-replica pool
 #     v8 FIX #4: read replicas for horizontal read scaling
 # ─────────────────────────────────────────────────────────────────────────────
+def _pg_conn_alive(conn) -> bool:
+    """v31.0 R31-C1: cheap liveness probe for a pooled Postgres handle.
+
+    Deliberately catches EVERYTHING. A handle that cannot answer SELECT 1 for
+    ANY reason is unusable, and the whole point is to fail here — cheaply,
+    before the caller's real work — rather than in the middle of it."""
+    if getattr(conn, "closed", 0):
+        return False
+    try:
+        _prev = conn.autocommit
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            cur.fetchone()
+        conn.autocommit = _prev
+        return True
+    except Exception:
+        return False
+
+
 class PostgreSQLPool:
     """
     Production PostgreSQL pool via psycopg2.
@@ -1755,7 +1775,45 @@ class PostgreSQLPool:
     @contextmanager
     def get(self, read_only: bool = False) -> Generator:
         pool = (self._read or self._write) if read_only else self._write
-        conn = pool.getconn()
+        # ── v31.0 · FIX R31-C1 — VALIDATE ON CHECKOUT ────────────────────
+        # The v16g4 FIX H5 self-heal below discards a poisoned handle AFTER
+        # the caller has already failed on it. That is one round too late for
+        # anything that does not retry, and _process_outbox does not retry —
+        # it logs "Outbox claim error" and returns, so a single dead handle
+        # costs the whole tick and the outbox never drains.
+        #
+        # Managed Postgres (Render free tier) ends idle SESSIONS server-side.
+        # TCP keepalives, which this pool already sets, keep the SOCKET alive
+        # and cannot prevent that; the pool then hands out handles the backend
+        # has forgotten. Reproduced deterministically with
+        # pg_terminate_backend: with min_conn=2, the first TWO checkouts raise
+        # and the third succeeds — which is exactly the production signature,
+        # two failures ~1s apart inside one janitor tick, then silence until
+        # the next tick 19-20s later.
+        #
+        # So: ping before yielding, and replace anything that does not answer.
+        # One extra round-trip per checkout, ~1ms on the same host. Bounded to
+        # three attempts so a genuinely unreachable database still surfaces its
+        # real error to the caller instead of spinning here.
+        conn = None
+        for _ping_try in range(3):
+            _cand = pool.getconn()
+            if _pg_conn_alive(_cand):
+                conn = _cand
+                break
+            log.info("\u267b\ufe0f  PG pool: dead handle replaced on checkout "
+                     "(server-side session ended).")
+            try:
+                pool.putconn(_cand, close=True)
+            except Exception:
+                try:
+                    _cand.close()
+                except Exception:
+                    pass
+        if conn is None:
+            # Every candidate failed the ping. Do not swallow it — hand the
+            # caller a real connection attempt so the true error is raised.
+            conn = pool.getconn()
         # v14g5 FIX 41: read paths use autocommit so pure SELECTs don't churn an
         # empty COMMIT every call; write paths keep explicit transaction control.
         conn.autocommit = bool(read_only)
