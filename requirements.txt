@@ -1,74 +1,132 @@
-# HEONIX Ultra Engine v11.0 — Requirements
-# PRODUCTION-HARDENED EDITION (all 15 v10 gaps closed)
+# HEONIX Ultra Engine — requirements.txt
+# Built for ENGINE_VERSION v30.0 (R30), 13,656 lines.
+#
+# Derived by AST-walking every import in the engine and separating them by
+# what actually happens when the package is absent. Versions below are the
+# ones v30 was booted and driven on against real PostgreSQL 16.14.
+#
+# THREE TIERS, AND THE MIDDLE ONE IS THE DANGEROUS ONE.
 
-# ══════════════════════════════════════════════════════
-# CORE FRAMEWORK
-# ══════════════════════════════════════════════════════
-flask>=3.0.0
+# ══════════════════════════════════════════════════════════════
+# TIER 1 — HARD. Absent = ImportError, the process does not start.
+# ══════════════════════════════════════════════════════════════
+flask>=3.0.0,<4.0.0
 flask-cors>=4.0.0
 flask-limiter>=3.5.0
-pydantic>=2.5.0
+pydantic>=2.5.0,<3.0.0
 requests>=2.31.0
 gunicorn>=21.2.0
 
-# ══════════════════════════════════════════════════════
-# DATABASE / CACHE / RAG
-# ══════════════════════════════════════════════════════
+# Imported DIRECTLY by the engine, not just pulled in by Flask/requests.
+# v11's file left these unpinned and relied on whatever came along for the
+# ride. That works until a transitive bump changes them, and then the engine
+# breaks with no warning and nothing in this file to blame.
+werkzeug>=3.0.0,<4.0.0
+urllib3>=2.0.0,<3.0.0
+
+# ══════════════════════════════════════════════════════════════
+# TIER 2 — GUARDED IN CODE, MANDATORY IN PRODUCTION.
+#
+# Every one of these sits behind try/except ImportError and sets an
+# *_AVAILABLE = False flag. The engine still BOOTS without them. That is
+# the R18-H1 failure shape: a green process that quietly lost a control.
+#
+#   psycopg2-binary absent -> POSTGRES_AVAILABLE False -> SQLite fallback.
+#                             R30 measured what that costs: with
+#                             booking_create's guard bypassed, Postgres
+#                             raises 23P01 and SQLite writes BOTH
+#                             overlapping rows. No bk_no_overlap on SQLite.
+#   cryptography    absent -> CRYPTO_AVAILABLE False -> patient phone
+#                             numbers and names stop being encrypted at rest.
+#   PyJWT           absent -> JWT_AVAILABLE False -> the authenticated
+#                             admin/CRM surface loses its token layer.
+#   bcrypt          absent -> BCRYPT_AVAILABLE False -> password hashing.
+#   redis           absent -> REDIS_AVAILABLE False -> dedupe, ghost-mute
+#                             and cache fall back in-process, so anything
+#                             above 1 gunicorn worker double-replies.
+#
+# Do not treat these as optional because the import is wrapped.
+# ══════════════════════════════════════════════════════════════
 psycopg2-binary>=2.9.9
-redis>=5.0.0                 # dedupe + ghost-mute + cache shared across workers
-qdrant-client>=1.9.0         # RAG memory — free 1GB at https://cloud.qdrant.io
-
-# ══════════════════════════════════════════════════════
-# AI PROVIDERS
-# ══════════════════════════════════════════════════════
-google-generativeai>=0.7.0   # Gemini 3.1 Flash-Lite default ($0.25/$1.50 per 1M)
-openai>=1.35.0               # GPT fallback + Whisper voice fallback
-anthropic>=0.29.0            # Claude fallback
-
-# ══════════════════════════════════════════════════════
-# SECURITY
-# ══════════════════════════════════════════════════════
 cryptography>=42.0.0
 PyJWT>=2.8.0
 bcrypt>=4.1.0
+redis>=5.0.0
 
-# ══════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════
+# TIER 3 — GENUINELY OPTIONAL. Absent = a named feature is off, and the
+# engine says so at boot. Safe to remove to cut build time and image size.
+# ══════════════════════════════════════════════════════════════
+google-generativeai>=0.7.0   # GEMINI_AVAILABLE — the only live AI provider today
+openai>=1.35.0               # OPENAI_AVAILABLE — fallback + voice transcription
+anthropic>=0.29.0            # CLAUDE_AVAILABLE — fallback
+qdrant-client>=1.9.0         # QDRANT_AVAILABLE — RAG recall, currently OFF
+
+# ══════════════════════════════════════════════════════════════
 # DEPLOYMENT — Render
-# ══════════════════════════════════════════════════════
-# Start command:
-#   gunicorn heonix_ultra_engine_v11:app --workers 2 --threads 4 --bind 0.0.0.0:$PORT --timeout 90 --graceful-timeout 30 --access-logfile - --log-level info
+# ══════════════════════════════════════════════════════════════
+# START COMMAND. The repo file is app.py, so the module is `app`:
 #
-# ── REQUIRED env vars ──────────────────────────────────
-#   DATABASE_URL            postgres://...   (Render PostgreSQL)
+#   gunicorn app:app --workers 1 --threads 8 --bind 0.0.0.0:$PORT \
+#            --timeout 120 --graceful-timeout 30 --access-logfile - \
+#            --log-level info
+#
+#   WORKERS 1 UNTIL REDIS IS ON. With REDIS_AVAILABLE False the dedupe and
+#   ghost-mute caches are per-process, so two workers answer the same patient
+#   twice. v11's file suggested --workers 2, which is unsafe in the current
+#   configuration.
+#
+#   --timeout 120 matters: R9's "SQL injection crash" was never injection.
+#   gunicorn's default 30s reaper was racing the AI budget, killing the
+#   worker and dropping the socket.
+#
+#   DO NOT set preload_app until the outbox SSL loop is diagnosed. If the
+#   pool is built before fork(), parent and child share the SSL sockets and
+#   libpq's record layer desynchronises — which is exactly the pair of
+#   errors in the live logs ("decryption failed or bad record mac",
+#   "SSL SYSCALL error: EOF detected").
+#
+# ── REQUIRED env vars (names verified against v30 source) ─────
+#   DATABASE_URL            postgres://...   Render PostgreSQL
 #   DATABASE_MODE           postgres
-#   REDIS_URL               redis://...      (Upstash free tier OK)
-#                           ★ v11 will log CRITICAL on Render without these two —
-#                             SQLite/in-process fallback double-replies under 2 workers
 #   ENCRYPTION_KEY          python -c "import secrets; print(secrets.token_hex(32))"
 #   JWT_SECRET_KEY          long random string
 #   SECRET_KEY              long random string
 #   GENAI_API_KEY           Gemini key (chat + embeddings + voice)
-#   WHATSAPP_TOKEN          Meta permanent token  ← regenerate, this is THE blocker
+#   WHATSAPP_TOKEN          Meta permanent token
 #   WHATSAPP_PHONE_ID       Meta phone number ID
 #   WHATSAPP_VERIFY_TOKEN   your webhook verify string
-#   WHATSAPP_APP_SECRET     Meta App → Settings → Basic (signature check OFF without it)
+#   WHATSAPP_APP_SECRET     Meta App -> Settings -> Basic
 #
-# ── NEW in v11 (recommended) ───────────────────────────
-#   OWNER_ALERT_TEMPLATE        name of an approved Meta utility template whose
-#                               body is just "{{1}}". Without it, owner alerts
-#                               (emergency/handoff/VIP) DIE SILENTLY whenever the
-#                               owner hasn't messaged the bot in 24h (error 131047).
-#                               5-min job: Meta Business → WhatsApp → Message
-#                               Templates → Create (category: Utility).
-#   OWNER_ALERT_TEMPLATE_LANG   default en
-#   STRICT_PROD=1               refuse to boot without Postgres+Redis (set once live)
-#   WORKER_THREADS              background pool size, default 8
-#   GEMINI_MODEL                default gemini-3.1-flash-lite (GA, $0.25/$1.50/1M —
-#                               chatbot-tuned, 6x cheaper than 3.5-flash)
-#   GEMINI_MODEL_PREMIUM        default gemini-3.5-flash (only for tool-heavy clients)
+#   ★ SET REQUIRE_WEBHOOK_SIGNATURE=true TODAY. ★
+#     Without an app secret the webhook accepts ANY payload, and the route is
+#     rate-limit exempt because the signature was meant to be the gatekeeper.
+#     Verified on v30: secret set -> unsigned and forged both 401, valid 200.
+#     Secret unset + REQUIRE_WEBHOOK_SIGNATURE=true -> still 401. This flag
+#     works WITHOUT Redis, unlike STRICT_PROD.
 #
-# ── OPTIONAL ───────────────────────────────────────────
-#   INSTAGRAM_TOKEN / INSTAGRAM_ID / INSTAGRAM_APP_SECRET
+# ── RECOMMENDED ──────────────────────────────────────────────
+#   REQUIRE_WEBHOOK_SIGNATURE=true   fail closed, Redis-independent
+#   REDIS_URL                        Upstash free tier; unlocks workers > 1
+#   OWNER_ALERT_TEMPLATE             an approved Meta utility template whose
+#                                    body is "{{1}}". Without it, owner alerts
+#                                    for emergency / handoff / VIP DIE SILENTLY
+#                                    when the owner has not messaged in 24h
+#                                    (Meta error 131047).
+#   OWNER_ALERT_TEMPLATE_LANG        default en
+#   STRICT_PROD=1                    refuse to boot without Postgres AND Redis.
+#                                    Cannot be used until Redis is on.
+#   WORKER_THREADS                   background pool size, default 8
+#   GEMINI_MODEL                     default gemini-3.1-flash-lite
+#   GEMINI_MODEL_PREMIUM             default gemini-3.5-flash
+#
+# ── OPTIONAL ─────────────────────────────────────────────────
+#   INSTAGRAM_TOKEN / INSTAGRAM_ID / INSTAGRAM_APP_SECRET / INSTAGRAM_VERIFY_TOKEN
 #   OPENAI_API_KEY / ANTHROPIC_API_KEY
-#   QDRANT_URL / QDRANT_API_KEY     (RAG memory ON)
-#   GRAPH_API_VERSION               default v21.0
+#   QDRANT_URL / QDRANT_API_KEY
+#   GRAPH_API_VERSION                default v21.0
+#   ADMIN_API_KEY / METRICS_TOKEN / TALLY_WEBHOOK_SECRET / ADMIN_ALERT_PHONE
+#
+# ── NOT a dependency ─────────────────────────────────────────
+#   prod_smoke.py is stdlib-only and runs from your laptop against the live
+#   URL. It needs nothing from this file.
