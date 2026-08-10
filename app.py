@@ -658,7 +658,7 @@
 ║                                                                              ║
 ║  RETAINED FROM v7 (all working):                                             ║
 ║  ◆ PostgreSQL + Redis + SQLite fallback                                     ║
-║  ◆ AES-256-GCM PII encryption (DPDP/HIPAA)                                 ║
+║  ◆ AES-256-GCM PII encryption at rest                                      ║
 ║  ◆ JWT + RBAC (superadmin / admin / viewer)                                 ║
 ║  ◆ Multi-AI fallback: Gemini → OpenAI → Claude                             ║
 ║  ◆ Official Meta WhatsApp Cloud API                                          ║
@@ -1252,7 +1252,7 @@ cfg = Config()
 # said GEN-4, /health said GEN-3, the shutdown log said GEN-3, the startup
 # banner said GEN-5). After a hotfix night, /health is the one thing that
 # must be trusted to say which build is live. One constant; all derive.
-ENGINE_VERSION = "v32.0"   # R32
+ENGINE_VERSION = "v33.0"   # R33
 ENGINE_GEN     = "GEN-6"
 ENGINE_BANNER  = (f"HEONIX ULTRA ENGINE {ENGINE_VERSION} {ENGINE_GEN} "
                   f"(Usernames/BSUID · 182 audit fixes)")
@@ -1315,7 +1315,9 @@ class PIIVault:
     """
     AES-256-GCM authenticated encryption for PII fields.
     Each field gets a unique 96-bit nonce so identical values encrypt differently.
-    Compliant: DPDP Act (India), HIPAA (USA), GDPR (EU).
+    Designed with DPDP-style controls (encryption at rest, opt-out,
+    right-to-erasure endpoints). v33 R33-C1: this is a description of
+    implemented CONTROLS, not a claim of certification under any law.
     """
 
     def __init__(self, hex_key: str):
@@ -4551,7 +4553,26 @@ BUSINESS_TEMPLATES: Dict[str, Dict] = {
             "you cannot advise on it, tell them to raise it with the doctor "
             "(and their specialist where relevant), and offer to book. "
             "Always recommend a licensed professional for serious concerns. "
-            "All data is handled per DPDP Act / HIPAA compliance. "
+            # v33.0 FIX R33-C1. This line used to read "All data is handled
+            # per DPDP Act / HIPAA compliance." and every healthcare tenant
+            # said it to patients, in writing, at scale. HIPAA is a US statute
+            # binding US covered entities and their business associates; an
+            # Indian clinic is not one, so the claim was simply false. DPDP was
+            # asserted just as flatly — a factual claim about how this SYSTEM
+            # operates, which is not a chatbot's to make on the clinic's behalf.
+            # The whole engine exists to stop the model asserting things it
+            # cannot back; here the prompt was ORDERING it to. So the order is
+            # removed rather than guarded, and replaced with what is true and
+            # checkable, plus an explicit prohibition. R33-S1 is the code
+            # control behind this request, because a prompt rule is a request.
+            "On privacy: you may say that messages are handled privately for "
+            "this clinic only and that the patient can ask to stop messages at "
+            "any time. NEVER claim compliance with, or certification under, any "
+            "law, standard or framework — not HIPAA, GDPR, DPDP, ISO or any "
+            "other. You cannot verify it and it is not yours to promise. For "
+            "any question about policy, consent, data handling or legal "
+            "obligations, say plainly that the clinic answers that directly and "
+            "offer to pass the question on. "
             "Always respond in the same language the user writes in."
         ),
     },
@@ -5624,6 +5645,58 @@ def _brain_is_health(brain: Dict) -> bool:
     return flag
 
 
+# v33.0 · FIX R33-C2 — asking ABOUT emergencies is not an emergency.
+# Measured on v32: "do you handle emergency cases?", "what is your emergency
+# number?", "is there an emergency contact after 9pm" and "neenga emergency
+# case paapingala?" ALL paged the doctor. Every one is an ordinary question a
+# patient asks BEFORE booking. Same class as R16-C3, where "not responding"
+# matched "doctor is not responding to my calls" — fixed once, back under a
+# different word.
+#
+# Why this matters more than it looks: owner alerts already die silently after
+# 24h without an approved Meta template (error 131047). A doctor paged for
+# "do you handle emergencies?" learns to ignore the alerts, and then the real
+# chest-pain page is ignored too. Alert fatigue is how an emergency layer dies.
+#
+# THE SCOPE IS ONE WORD. The census showed every genuine phrase fires on its
+# OWN entry — "chest pain", "bleeding wont stop", "மூச்சு வாங்க". Only the bare
+# category noun "emergency" was doing meta duty. So suppression is allowed ONLY
+# when every emergency hit is a bare category noun; if any symptom term hit,
+# nothing is suppressed and the guard is structurally incapable of silencing a
+# real emergency. That is a proof, not a measurement.
+_EMERGENCY_GENERIC = frozenset({
+    "emergency", "emergencies", "emergency case", "emergency cases",
+    "\u0b85\u0bb5\u0b9a\u0bb0\u0bae\u0bcd", "\u0b85\u0bb5\u0b9a\u0bb0",
+    "\u0906\u092a\u093e\u0924\u0915\u093e\u0932", "\u0907\u092e\u0930\u091c\u0947\u0902\u0938\u0940",
+})
+# Asking about the SERVICE: interrogative + second person + no first-person
+# distress. All three required, because the cost of a wrong suppression is a
+# patient in trouble being ignored and the cost of a wrong page is one buzz.
+_META_QUESTION  = ("do you", "does your", "do u", "is there", "are there",
+                   "what is your", "whats your", "what's your", "how do i",
+                   "can i get", "you have any", "neenga", "ungaluku",
+                   "ungalukku", "irukka", "paapingala", "pakuringala",
+                   "kya aap", "\u0915\u094d\u092f\u093e \u0906\u092a", "\u0928\u0940\u0902\u0917",
+                   "\u0b89\u0b99\u0bcd\u0b95\u0bb3\u0bcd", "\u0b87\u0bb0\u0bc1\u0b95\u0bcd\u0b95\u0bbe")
+_SELF_DISTRESS  = ("i have", "i am", "im ", "i'm ", "my ", "me ", "help",
+                   "urgent", "now", "please", "enaku", "enakku", "\u0b8e\u0ba9\u0b95\u0bcd\u0b95\u0bc1",
+                   "\u0b8e\u0ba9\u0bcd", "mujhe", "\u092e\u0941\u091d\u0947", "\u092e\u0947\u0930\u0947", "mera", "meri")
+
+
+def _emergency_hit(norm: str, ekw) -> bool:
+    """True if this is a real emergency. See R33-C2 above for the scope proof."""
+    hits = [k for k in ekw if _kw_hit(norm, k, pre_w=1)]
+    if not hits:
+        return False
+    if any(h.lower() not in _EMERGENCY_GENERIC for h in hits):
+        return True                      # a symptom fired — never suppress
+    if any(d in norm for d in _SELF_DISTRESS):
+        return True                      # first-person distress wins
+    if any(q in norm for q in _META_QUESTION):
+        return False                     # asking about the service
+    return True                          # ambiguous -> fire. Fail LOUD.
+
+
 def classify_message(text, healthcare: bool = False):
     """Returns {'emergency','human','vip'} booleans. Pure, instant, free.
     v11 #9: word-boundary + negation aware (was naive substring matching).
@@ -5639,7 +5712,7 @@ def classify_message(text, healthcare: bool = False):
         # the sentence must never suppress a genuine life-threat keyword. The
         # human list gets pre_w=3 so "i don't want to talk to the doctor" no
         # longer pages the owner + mutes the bot for 5 minutes.
-        "emergency": any(_kw_hit(norm, k, pre_w=1) for k in ekw),
+        "emergency": _emergency_hit(norm, ekw),   # v33 R33-C2
         "human":     any(_kw_hit(norm, k, pre_w=3) for k in _HUMAN_KW),
         "vip":       (False if healthcare else                     # v15g4 FIX A5
                       (any(_kw_hit(norm, k) for k in _VIP_KW)
@@ -7102,6 +7175,71 @@ _CLINICAL_REFERRAL_LINES = {
 }
 
 
+# v33.0 · FIX R33-S1 — REGULATORY-CLAIM GUARD
+# Fourth appearance of one class: the reply asserts a fact the system cannot
+# back. R7/R15/R17 was WHO the clinic is, R8-C2 was an action that never
+# happened, R14-C2 was a clinical verdict, and now R33-C1 is a legal one. The
+# escalation law says stop patching instances at three; this is the control.
+#
+# Scope is deliberately narrow. It fires on DATA-PROTECTION frameworks — claims
+# about how this SYSTEM handles data — and not on clinical accreditation, so a
+# clinic that really is NABH accredited can still say so. And it stands down
+# entirely when the clinic's OWN saved details contain the term: if the clinic
+# put it there, the claim is the clinic's to make and the bot is only relaying
+# it. Guarding the clinic's own words would be the R15/R16 mistake all over
+# again — refusing ordinary, truthful sentences.
+_REG_FRAMEWORKS = (
+    "hipaa", "gdpr", "dpdp", "ccpa", "iso 27001", "iso27001", "soc 2", "soc2",
+    "pci dss", "pci-dss", "hitech",
+)
+_REG_CLAIM_VERBS = (
+    "compliant", "compliance", "complies", "certified", "certification",
+    "accredited", "as per", "per the", "in accordance", "adheres", "adhering",
+    "meets", "conforms", "regulated under", "\u0b9a\u0b9f\u0bcd\u0b9f\u0ba4\u0bcd\u0ba4\u0bbf\u0ba9\u0bcd\u0baa\u0b9f\u0bbf",
+    "\u0bb5\u0bbf\u0ba4\u0bbf\u0bae\u0bc1\u0bb1\u0bc8", "\u0915\u0947 \u0905\u0928\u0941\u0938\u093e\u0930", "\u0905\u0928\u0941\u092a\u093e\u0932\u0928",
+)
+_REG_REFUSAL = {
+    "en": "I can't speak for the clinic on legal or data-protection matters. "
+          "Please ask the clinic directly and they'll answer it properly.",
+    "ta": "\u0b9a\u0b9f\u0bcd\u0b9f \u0bb0\u0bc0\u0ba4\u0bbf\u0baf\u0bbe\u0ba9 \u0b85\u0bb2\u0bcd\u0bb2\u0ba4\u0bc1 \u0ba4\u0bb0\u0bb5\u0bc1 \u0baa\u0bbe\u0ba4\u0bc1\u0b95\u0bbe\u0baa\u0bcd\u0baa\u0bc1 \u0b95\u0bc7\u0bb3\u0bcd\u0bb5\u0bbf\u0b95\u0bb3\u0bc1\u0b95\u0bcd\u0b95\u0bc1 \u0ba8\u0bbe\u0ba9\u0bcd "
+          "\u0baa\u0ba4\u0bbf\u0bb2\u0bb3\u0bbf\u0b95\u0bcd\u0b95 \u0bae\u0bc1\u0b9f\u0bbf\u0baf\u0bbe\u0ba4\u0bc1. \u0b95\u0bbf\u0bb3\u0bbf\u0ba9\u0bbf\u0b95\u0bcd\u0b95\u0bbf\u0b9f\u0bcd\u0b9f \u0ba8\u0bc7\u0bb0\u0b9f\u0bbf\u0baf\u0bbe\u0b95\u0bcd \u0b95\u0bc7\u0b9f\u0bcd\u0b9f\u0bbe\u0bb2\u0bcd "
+          "\u0b9a\u0bb0\u0bbf\u0baf\u0bbe\u0ba9 \u0baa\u0ba4\u0bbf\u0bb2\u0bcd \u0b95\u0bbf\u0b9f\u0bc8\u0b95\u0bcd\u0b95\u0bc1\u0bae\u0bcd.",
+    "hi": "\u092e\u0948\u0902 \u0915\u093e\u0928\u0942\u0928\u0940 \u092f\u093e \u0921\u0947\u091f\u093e-\u0938\u0941\u0930\u0915\u094d\u0937\u093e \u0938\u0902\u092c\u0902\u0927\u0940 \u092c\u093e\u0924\u094b\u0902 \u092a\u0930 \u0915\u094d\u0932\u093f\u0928\u093f\u0915 "
+          "\u0915\u0940 \u0913\u0930 \u0938\u0947 \u0928\u0939\u0940\u0902 \u092c\u094b\u0932 \u0938\u0915\u0924\u093e\u0964 \u0915\u0943\u092a\u092f\u093e \u0938\u0940\u0927\u0947 \u0915\u094d\u0932\u093f\u0928\u093f\u0915 \u0938\u0947 \u092a\u0942\u091b\u0947\u0902\u0964",
+}
+
+
+def _guard_regulatory_claim(reply: str, brain: Dict) -> Tuple[str, bool]:
+    """Refuse a reply that claims compliance with a data-protection framework.
+
+    Returns (reply, blocked). Like every other guard here it REPLACES the reply
+    rather than editing it — a half-corrected legal claim is still a legal
+    claim."""
+    low = (reply or "").lower()
+    fw = next((f for f in _REG_FRAMEWORKS if f in low), None)
+    if not fw:
+        return reply, False
+    if not any(v in low for v in _REG_CLAIM_VERBS):
+        return reply, False
+    # Stand down if the clinic itself put the term in its own details.
+    own = " ".join(str(brain.get(k, "") or "") for k in
+                   ("system_prompt", "business_type", "customer_name")).lower()
+    if fw in own:
+        return reply, False
+    lang = "en"
+    if any("\u0b80" <= c <= "\u0bff" for c in reply):
+        lang = "ta"
+    elif any("\u0900" <= c <= "\u097f" for c in reply):
+        lang = "hi"
+    log.warning(f"\U0001f6e1\ufe0f  R33-S1: regulatory claim refused ({fw!r}) \u2014 "
+                f"the bot cannot certify the clinic under any law.")
+    try:
+        analytics.inc("guard.regulatory_claim")
+    except Exception:
+        pass
+    return _REG_REFUSAL[lang], True
+
+
 def _guard_clinical_safety_verdict(reply: str, brain: Dict, user_text: str,
                                    history: Optional[List[Dict]] = None
                                    ) -> Tuple[str, bool]:
@@ -7215,7 +7353,9 @@ def ai_reply_pipeline(brain: Dict, history: List[Dict], user_text: str, *,
     reply, _action_blocked = _guard_unbacked_action_claim(reply, user_text)  # R8-C2
     reply, _safety_blocked = _guard_clinical_safety_verdict(
         reply, brain, user_text, history)                 # R14-C2 / R15-C3
-    _identity_blocked = _identity_blocked or _action_blocked or _safety_blocked
+    reply, _reg_blocked = _guard_regulatory_claim(reply, brain)   # v33 R33-S1
+    _identity_blocked = (_identity_blocked or _action_blocked
+                         or _safety_blocked or _reg_blocked)
     if _identity_blocked and _wanted_escalation and ESCALATE_TOKEN not in reply:
         reply = ESCALATE_TOKEN + " " + reply
 
