@@ -1067,6 +1067,12 @@ class Config:
     # like Gen-3. Turn features on one at a time, after testing each live.
     #  Appointment booking + reminders
     ENABLE_BOOKING: bool        = _env_bool("ENABLE_BOOKING", False)    # v16g4 FIX M1
+    # v32.0 R32-C1: the demo door, separate from every production door.
+    # OFF by default — a public brain-minting path must be opted into, never
+    # inherited. See /demo/provision for why this exists at all.
+    ENABLE_DEMO_PROVISION: bool = _env_bool("ENABLE_DEMO_PROVISION", False)
+    DEMO_RATE_LIMIT: str        = os.getenv("DEMO_RATE_LIMIT", "6 per hour")
+    DEMO_TTL_HOURS: int         = _env_int("DEMO_TTL_HOURS", 48)
     BOOKING_SLOT_MINUTES: int   = _env_int("BOOKING_SLOT_MINUTES", "30")
     BOOKING_OPEN_HOUR: int      = _env_int("BOOKING_OPEN_HOUR", "9")    # local clinic hour
     BOOKING_CLOSE_HOUR: int     = _env_int("BOOKING_CLOSE_HOUR", "18")  # local clinic hour
@@ -1246,7 +1252,7 @@ cfg = Config()
 # said GEN-4, /health said GEN-3, the shutdown log said GEN-3, the startup
 # banner said GEN-5). After a hotfix night, /health is the one thing that
 # must be trusted to say which build is live. One constant; all derive.
-ENGINE_VERSION = "v31.0"   # R31
+ENGINE_VERSION = "v32.0"   # R32
 ENGINE_GEN     = "GEN-6"
 ENGINE_BANNER  = (f"HEONIX ULTRA ENGINE {ENGINE_VERSION} {ENGINE_GEN} "
                   f"(Usernames/BSUID · 182 audit fixes)")
@@ -10898,6 +10904,108 @@ def root():
             request.headers.get("X-Metrics-Token", ""), cfg.METRICS_TOKEN)):
         body["engine"] = ENGINE_BANNER
     return jsonify(body), 200
+
+
+# ── v32.0 · FIX R32-C1 — the demo provisioning door ──────────────────────────
+@app.route("/demo/provision", methods=["POST"])
+@limiter.limit(lambda: cfg.DEMO_RATE_LIMIT)
+def demo_provision():
+    """Mint a SANDBOXED brain for the browser demo.
+
+    WHY THIS EXISTS
+    ---------------
+    The demo used to mint brains through /tally-webhook. That endpoint is a
+    WEBHOOK — Tally to server, HMAC-signed — and v16g4 FIX H4 deliberately
+    made it fail closed under REQUIRE_WEBHOOK_SIGNATURE, because it also
+    chooses the outbound welcome target and was "open to anyone who found the
+    URL". Correct decision. But it means the moment WhatsApp signature
+    enforcement is switched on, the demo dies with a 401.
+
+    The wrong fixes, and why:
+      * turn REQUIRE_WEBHOOK_SIGNATURE off — trades a real control on the
+        WhatsApp door for a demo convenience. The whole product is the claim
+        that code checks beat prompt rules; reopening a door to demo that
+        claim is self-defeating.
+      * put TALLY_WEBHOOK_SECRET in the demo page — the demo is public HTML.
+        A secret in a browser is a published secret.
+
+    So: a different door, with different properties.
+
+    WHAT MAKES IT SAFE — structurally, not by promise
+    -------------------------------------------------
+    1. OFF unless ENABLE_DEMO_PROVISION is set. Fails closed like everything
+       else in this file.
+    2. Rate limited per IP (DEMO_RATE_LIMIT), unlike the Meta webhooks which
+       are limiter-exempt because a signature is their gatekeeper.
+    3. customer_id is FORCED into the DEMO_ namespace. It cannot collide with
+       a real tenant id and it is greppable in every log and table forever.
+    4. It NEVER writes wa_phone_number_id or instagram_id. This is the load-
+       bearing property: routing keys are what let a brain RECEIVE and SEND
+       real messages, so a demo brain is structurally incapable of reaching a
+       real patient — even if the endpoint is abused. The worst case is a junk
+       row, not a message to a stranger's phone.
+    5. No owner phone, so it can never fire an owner alert (v16g5 FIX R5-C1
+       territory).
+    6. No welcome message, no outbox write. /tally-webhook sends one; this
+       must not.
+    7. It refuses to touch a soft-deleted brain (v16g4 FIX L19 rule), and it
+       refuses any id that is not DEMO_-prefixed, so it can never overwrite a
+       live clinic.
+    8. expires_at is stamped in the prompt tail so demo rows are identifiable
+       for collection; DEMO_TTL_HOURS controls it.
+    """
+    if not cfg.ENABLE_DEMO_PROVISION:
+        return jsonify({"error": "demo provisioning disabled",
+                        "detail": "Set ENABLE_DEMO_PROVISION=true to enable "
+                                  "the sandboxed demo door."}), 403
+    body = request.get_json(silent=True) or {}
+    name = str(body.get("clinic") or body.get("customer_name") or "").strip()
+    btype = str(body.get("business_type") or "General Business").strip()
+    notes = str(body.get("details") or body.get("extra_notes") or "").strip()
+    if not name or len(name) > 120:
+        return jsonify({"error": "clinic name required (1-120 chars)"}), 400
+    notes = notes[:2000]
+
+    # DEMO_ + short stable hash of the name, so the same clinic name in the
+    # same demo session lands on the same brain instead of littering rows.
+    _slug = hashlib.sha256(f"demo::{name.lower()}::{btype.lower()}"
+                           .encode()).hexdigest()[:10].upper()
+    customer_id = f"DEMO_{_slug}"
+    if not customer_id.startswith("DEMO_"):          # belt and braces
+        return jsonify({"error": "namespace violation"}), 500
+
+    try:
+        with _db_pool.get(read_only=True) as conn:
+            _cur = _execute(conn, "SELECT is_active FROM customer_brains "
+                                  "WHERE customer_id=?", (customer_id,))
+            _row = _cur.fetchone()
+        if _row is not None and not (_row[0] if isinstance(_row, tuple)
+                                     else _row["is_active"]):
+            return jsonify({"status": "reactivation_blocked",
+                            "customer_id": customer_id}), 200
+    except Exception:
+        pass
+
+    bot_name, sys_prompt = build_system_prompt(name, btype)
+    if notes:
+        sys_prompt += f"\n\nAdditional context: {notes}"
+    _exp = (datetime.now(timezone.utc)
+            + timedelta(hours=cfg.DEMO_TTL_HOURS)).isoformat()
+    sys_prompt += (f"\n\n[SANDBOX DEMO BRAIN — no WhatsApp routing, "
+                   f"no owner alerts, expires {_exp}]")
+    try:
+        save_customer_brain(customer_id, name, btype, sys_prompt,
+                            bot_name=bot_name)      # NO routing keys. Ever.
+    except Exception as e:
+        log.error(f"🛑 demo provision failed for {customer_id}: {e}")
+        return jsonify({"error": "provisioning failed"}), 500
+
+    log.info(f"🧪 Demo brain provisioned {customer_id} ({name}) — sandboxed, "
+             f"no routing keys, expires {_exp}")
+    analytics.inc("demo.provision")
+    return jsonify({"status": "ok", "customer_id": customer_id,
+                    "bot_name": bot_name, "sandbox": True,
+                    "expires_at": _exp}), 200
 
 
 @app.route("/health", methods=["GET"])
