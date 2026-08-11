@@ -693,6 +693,9 @@ ENVIRONMENT VARIABLES:
   ANTHROPIC_API_KEY     = Anthropic Claude API key
   GEMINI_MODEL          = gemini-3.1-flash-lite
   OPENAI_MODEL          = gpt-4o-mini
+  OPENAI_BASE_URL       = (blank = real OpenAI) any OpenAI-compatible endpoint.
+                          Groq: https://api.groq.com/openai/v1  — then
+                          OPENAI_MODEL MUST be a model that endpoint serves.
   ANTHROPIC_MODEL       = claude-haiku-4-5-20251001
   AI_MAX_TOKENS         = 1000
   AI_TIMEOUT_SECS       = 30
@@ -952,6 +955,16 @@ class Config:
     # Per-customer premium model: pass plan_tier="premium" → uses GEMINI_MODEL_PREMIUM.
     GEMINI_MODEL_PREMIUM: str   = os.getenv("GEMINI_MODEL_PREMIUM", "gemini-3.5-flash")   # only worth it for tool-heavy/agentic clients
     OPENAI_MODEL: str           = os.getenv("OPENAI_MODEL",    "gpt-4o-mini")
+    # r35 FIX: the OpenAI slot was hard-wired to api.openai.com — the only way to
+    # fill fallback #1 was an OpenAI account, i.e. another card + another billing
+    # verification, the SAME failure mode that is currently killing the Gemini
+    # primary. Blank = real OpenAI (unchanged default). Set it and this slot
+    # accepts ANY OpenAI-compatible endpoint (Groq, DeepSeek, Together,
+    # OpenRouter, a local vLLM), several of which need no card at all.
+    #   Groq   → https://api.groq.com/openai/v1
+    # ⚠️ Changing the endpoint WITHOUT changing OPENAI_MODEL = guaranteed 404 at
+    #    the worst possible moment. The startup guard below shouts about it.
+    OPENAI_BASE_URL: str        = os.getenv("OPENAI_BASE_URL", "").strip()
     ANTHROPIC_MODEL: str        = os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
     AI_MAX_TOKENS: int          = _env_int("AI_MAX_TOKENS", "1000")
     # v16.3 FIX R9-C2 (ROOT CAUSE). gunicorn's DEFAULT worker timeout is 30s
@@ -1252,7 +1265,7 @@ cfg = Config()
 # said GEN-4, /health said GEN-3, the shutdown log said GEN-3, the startup
 # banner said GEN-5). After a hotfix night, /health is the one thing that
 # must be trusted to say which build is live. One constant; all derive.
-ENGINE_VERSION = "v34.0"   # R34
+ENGINE_VERSION = "v34.0"   # R35
 ENGINE_GEN     = "GEN-6"
 ENGINE_BANNER  = (f"HEONIX ULTRA ENGINE {ENGINE_VERSION} {ENGINE_GEN} "
                   f"(Usernames/BSUID · 182 audit fixes)")
@@ -3320,11 +3333,38 @@ def _init_ai_providers() -> None:
         log.warning("⚠️  Gemini not configured.")
 
     if cfg.OPENAI_API_KEY and OPENAI_AVAILABLE:
-        _openai_client = openai_lib.OpenAI(api_key=cfg.OPENAI_API_KEY)
+        # r35 FIX: base_url=None keeps the historic behaviour byte-for-byte
+        # (SDK default = api.openai.com); set OPENAI_BASE_URL and this same slot
+        # serves any OpenAI-compatible provider.
+        _openai_client = openai_lib.OpenAI(
+            api_key=cfg.OPENAI_API_KEY,
+            base_url=cfg.OPENAI_BASE_URL or None,
+        )
         AI_PROVIDERS_ACTIVE["openai"] = True
-        log.info("✅ OpenAI GPT ready (Fallback #1)")
+        if cfg.OPENAI_BASE_URL:
+            log.info(f"✅ OpenAI-compatible AI ready (Fallback #1) "
+                     f"→ {cfg.OPENAI_BASE_URL} · model={cfg.OPENAI_MODEL}")
+            # A custom endpoint still serving an OpenAI-only model name is the
+            # single likeliest r35 misconfiguration, and it fails silently until
+            # the primary is ALREADY down. Fail loudly now, at boot, instead.
+            if cfg.OPENAI_MODEL.startswith(("gpt-", "o1", "o3", "o4", "chatgpt")):
+                log.error(
+                    "❌ OPENAI_BASE_URL is set to a non-OpenAI endpoint but "
+                    f"OPENAI_MODEL is still '{cfg.OPENAI_MODEL}'. That model "
+                    "almost certainly does not exist there — fallback #1 will "
+                    "404 the moment Gemini fails. Set OPENAI_MODEL to a model "
+                    "the endpoint actually serves."
+                )
+        else:
+            log.info(f"✅ OpenAI GPT ready (Fallback #1) · model={cfg.OPENAI_MODEL}")
     else:
         AI_PROVIDERS_ACTIVE["openai"] = False
+        # r35: silence here used to be indistinguishable between "no key set"
+        # and "key set but the openai package is missing from requirements.txt".
+        if cfg.OPENAI_API_KEY and not OPENAI_AVAILABLE:
+            log.error("❌ OPENAI_API_KEY is set but the 'openai' package is NOT "
+                      "installed — fallback #1 is SILENTLY DISABLED. Add "
+                      "'openai' to requirements.txt.")
 
     if cfg.ANTHROPIC_API_KEY and CLAUDE_AVAILABLE:
         _claude_client = anthropic_lib.Anthropic(api_key=cfg.ANTHROPIC_API_KEY)
@@ -3332,6 +3372,10 @@ def _init_ai_providers() -> None:
         log.info("✅ Anthropic Claude ready (Fallback #2)")
     else:
         AI_PROVIDERS_ACTIVE["claude"] = False
+        if cfg.ANTHROPIC_API_KEY and not CLAUDE_AVAILABLE:
+            log.error("❌ ANTHROPIC_API_KEY is set but the 'anthropic' package "
+                      "is NOT installed — fallback #2 is SILENTLY DISABLED. "
+                      "Add 'anthropic' to requirements.txt.")
 
     active = [k for k, v in AI_PROVIDERS_ACTIVE.items() if v]
     if not active:
