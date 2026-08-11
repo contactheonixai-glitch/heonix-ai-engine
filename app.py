@@ -1252,7 +1252,7 @@ cfg = Config()
 # said GEN-4, /health said GEN-3, the shutdown log said GEN-3, the startup
 # banner said GEN-5). After a hotfix night, /health is the one thing that
 # must be trusted to say which build is live. One constant; all derive.
-ENGINE_VERSION = "v33.0"   # R33
+ENGINE_VERSION = "v34.0"   # R34
 ENGINE_GEN     = "GEN-6"
 ENGINE_BANNER  = (f"HEONIX ULTRA ENGINE {ENGINE_VERSION} {ENGINE_GEN} "
                   f"(Usernames/BSUID · 182 audit fixes)")
@@ -4568,8 +4568,8 @@ BUSINESS_TEMPLATES: Dict[str, Dict] = {
             "On privacy: you may say that messages are handled privately for "
             "this clinic only and that the patient can ask to stop messages at "
             "any time. NEVER claim compliance with, or certification under, any "
-            "law, standard or framework — not HIPAA, GDPR, DPDP, ISO or any "
-            "other. You cannot verify it and it is not yours to promise. For "
+            "law, standard, regulation or framework, named or unnamed. You cannot "
+            "verify it and it is not yours to promise. For "
             "any question about policy, consent, data handling or legal "
             "obligations, say plainly that the clinic answers that directly and "
             "offer to pass the question on. "
@@ -7221,9 +7221,28 @@ def _guard_regulatory_claim(reply: str, brain: Dict) -> Tuple[str, bool]:
         return reply, False
     if not any(v in low for v in _REG_CLAIM_VERBS):
         return reply, False
-    # Stand down if the clinic itself put the term in its own details.
-    own = " ".join(str(brain.get(k, "") or "") for k in
-                   ("system_prompt", "business_type", "customer_name")).lower()
+    # Stand down if the CLINIC itself put the term in its own details.
+    #
+    # v34.0 FIX R34-C1: this used to scan the whole system_prompt, which is
+    # BUSINESS_TEMPLATES boilerplate plus the clinic's text. R33-C1 wrote the
+    # new prohibition as "...not HIPAA, GDPR, DPDP, ISO or any other", so every
+    # healthcare tenant's prompt contained all four names and this check stood
+    # the guard down for ALL of them. The control was dead in exactly the
+    # configuration it was built for, and the R33 tests missed it because they
+    # used a stub brain ("You are a clinic receptionist.") instead of the real
+    # template — a fixture that was not the production fixture, which is the
+    # R29-H1 lesson repeating.
+    #
+    # R34 fixes it twice: the prohibition no longer names frameworks, AND the
+    # boilerplate is subtracted here so a future prompt edit cannot re-disarm
+    # the control. Only text the CLINIC supplied is consulted.
+    _sp = str(brain.get("system_prompt", "") or "")
+    for _tpl in BUSINESS_TEMPLATES.values():
+        _base = _tpl.get("prompt", "")
+        if _base and _base in _sp:
+            _sp = _sp.replace(_base, " ")
+    own = " ".join([_sp, str(brain.get("business_type", "") or ""),
+                    str(brain.get("customer_name", "") or "")]).lower()
     if fw in own:
         return reply, False
     lang = "en"
