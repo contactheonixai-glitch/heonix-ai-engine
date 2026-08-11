@@ -1,11 +1,16 @@
 # HEONIX Ultra Engine — requirements.txt
-# Built for ENGINE_VERSION v30.0 (R30), 13,656 lines.
+# Built for ENGINE_VERSION v34.0 (R35), 14,025 lines.
 #
 # Derived by AST-walking every import in the engine and separating them by
 # what actually happens when the package is absent. Versions below are the
-# ones v30 was booted and driven on against real PostgreSQL 16.14.
+# ones the engine was booted and driven on against real PostgreSQL 16.14.
 #
 # THREE TIERS, AND THE MIDDLE ONE IS THE DANGEROUS ONE.
+#
+# R35 CHANGED NOTHING IN THIS FILE'S PACKAGE LIST. It did not need to —
+# openai and anthropic were already here. What R35 changed is that the
+# OpenAI slot is no longer locked to api.openai.com, so `openai` below is
+# now the client for ANY OpenAI-compatible provider. See OPENAI_BASE_URL.
 
 # ══════════════════════════════════════════════════════════════
 # TIER 1 — HARD. Absent = ImportError, the process does not start.
@@ -56,10 +61,22 @@ redis>=5.0.0
 # ══════════════════════════════════════════════════════════════
 # TIER 3 — GENUINELY OPTIONAL. Absent = a named feature is off, and the
 # engine says so at boot. Safe to remove to cut build time and image size.
+#
+# ★ R35: THE AI BLOCK BELOW IS NO LONGER HONESTLY "OPTIONAL". ★
+#   Gemini was the SOLE provider. A Google BILLING suspension — not an
+#   outage, a billing suspension, which is the live risk as of Aug 2026 —
+#   takes the whole engine mute. Keep at least ONE of openai / anthropic
+#   installed AND keyed. The package being here does nothing on its own;
+#   the key is what fills the slot.
 # ══════════════════════════════════════════════════════════════
-google-generativeai>=0.7.0   # GEMINI_AVAILABLE — the only live AI provider today
-openai>=1.35.0               # OPENAI_AVAILABLE — fallback + voice transcription
-anthropic>=0.29.0            # CLAUDE_AVAILABLE — fallback
+google-generativeai>=0.7.0   # GEMINI_AVAILABLE — primary provider
+openai>=1.35.0               # OPENAI_AVAILABLE — fallback #1 + voice transcription.
+                             # >=1.0 is REQUIRED: R35 passes base_url= to the
+                             # client, which the legacy 0.x API cannot accept.
+                             # With OPENAI_BASE_URL set this same package talks
+                             # to Groq / DeepSeek / Together / OpenRouter / vLLM.
+anthropic>=0.29.0            # CLAUDE_AVAILABLE — fallback #2. Needs no code
+                             # change at all; ANTHROPIC_API_KEY alone fills it.
 qdrant-client>=1.9.0         # QDRANT_AVAILABLE — RAG recall, currently OFF
 
 # ══════════════════════════════════════════════════════════════
@@ -86,7 +103,7 @@ qdrant-client>=1.9.0         # QDRANT_AVAILABLE — RAG recall, currently OFF
 #   errors in the live logs ("decryption failed or bad record mac",
 #   "SSL SYSCALL error: EOF detected").
 #
-# ── REQUIRED env vars (names verified against v30 source) ─────
+# ── REQUIRED env vars (names verified against source) ─────────
 #   DATABASE_URL            postgres://...   Render PostgreSQL
 #   DATABASE_MODE           postgres
 #   ENCRYPTION_KEY          python -c "import secrets; print(secrets.token_hex(32))"
@@ -105,6 +122,37 @@ qdrant-client>=1.9.0         # QDRANT_AVAILABLE — RAG recall, currently OFF
 #     Secret unset + REQUIRE_WEBHOOK_SIGNATURE=true -> still 401. This flag
 #     works WITHOUT Redis, unlike STRICT_PROD.
 #
+# ── SECOND AI PROVIDER — promoted out of OPTIONAL in R35 ──────
+#
+#   This is a SINGLE POINT OF FAILURE fix, not a feature. Fill ONE of the
+#   two routes below. Both can be set; the chain is gemini -> openai -> claude.
+#
+#   ROUTE A — OpenAI-compatible slot (no OpenAI account required):
+#     OPENAI_API_KEY        the provider's key
+#     OPENAI_BASE_URL       blank = real OpenAI (unchanged legacy behaviour).
+#                           Groq: https://api.groq.com/openai/v1
+#     OPENAI_MODEL          ★ MUST be a model the chosen endpoint serves.
+#                           The default gpt-4o-mini exists ONLY on OpenAI.
+#                           Point base_url elsewhere and leave this alone and
+#                           fallback #1 404s at the exact moment the primary
+#                           dies. R35 logs a loud ❌ at boot if it catches
+#                           this pairing — read the boot log, do not assume.
+#
+#     Why this route exists: the Gemini primary is at risk from a BILLING
+#     VERIFICATION failure. Filling the fallback with another card-and-KYC
+#     provider reproduces the same failure mode and is not real redundancy.
+#     A no-card provider is immune to precisely what is biting right now.
+#
+#   ROUTE B — Anthropic (zero code change, needs a working card):
+#     ANTHROPIC_API_KEY     key
+#     ANTHROPIC_MODEL       default claude-haiku-4-5-20251001
+#
+#   BOOT LOG IS THE ACCEPTANCE TEST. You want:
+#       ✅ OpenAI-compatible AI ready (Fallback #1) → <url> · model=<model>
+#       🤖 AI Fallback Chain: gemini → openai
+#   R35 also shouts ❌ if a key is set but its package is missing — the old
+#   build failed that case SILENTLY, leaving a keyed-but-dead slot.
+#
 # ── RECOMMENDED ──────────────────────────────────────────────
 #   REQUIRE_WEBHOOK_SIGNATURE=true   fail closed, Redis-independent
 #   REDIS_URL                        Upstash free tier; unlocks workers > 1
@@ -119,10 +167,14 @@ qdrant-client>=1.9.0         # QDRANT_AVAILABLE — RAG recall, currently OFF
 #   WORKER_THREADS                   background pool size, default 8
 #   GEMINI_MODEL                     default gemini-3.1-flash-lite
 #   GEMINI_MODEL_PREMIUM             default gemini-3.5-flash
+#   OPENAI_TRANSCRIBE_MODEL          default whisper-1. Voice falls back
+#                                    Gemini -> Whisper. NOTE: a non-OpenAI
+#                                    OPENAI_BASE_URL may not serve Whisper at
+#                                    all, so voice fallback can be dead even
+#                                    when chat fallback is healthy. Test both.
 #
 # ── OPTIONAL ─────────────────────────────────────────────────
 #   INSTAGRAM_TOKEN / INSTAGRAM_ID / INSTAGRAM_APP_SECRET / INSTAGRAM_VERIFY_TOKEN
-#   OPENAI_API_KEY / ANTHROPIC_API_KEY
 #   QDRANT_URL / QDRANT_API_KEY
 #   GRAPH_API_VERSION                default v21.0
 #   ADMIN_API_KEY / METRICS_TOKEN / TALLY_WEBHOOK_SECRET / ADMIN_ALERT_PHONE
